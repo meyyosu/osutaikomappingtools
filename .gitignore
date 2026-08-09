@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build output
+app/build/
+app/dist/
+
+# Large bundled binaries (not source, don't belong in git history)
+app/ffmpeg.exe
+app/ffprobe.exe
+
+# Per-user config files (if ever run from repo root during dev)
+.osu_taiko_helper_*.txt
+.osu_taiko_helper_*.json
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json

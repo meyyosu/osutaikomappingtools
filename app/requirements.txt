@@ -1,0 +1,6 @@
+Pillow>=10.0
+pyinstaller>=6.0
+python-vlc>=3.0.18   # optional: enables the live video+audio offset preview
+                     # (also requires installing the VLC desktop app — see README)
+pymem>=1.13; sys_platform == "win32"  # optional: enables auto-detecting the
+                     # currently open map from a running osu! stable client
