@@ -57,6 +57,58 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
+APP_VERSION = "1.0"
+UPDATE_REPO = "meyyosu/osutaikomappingtools"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+
+
+def _version_tuple(v: str):
+    """Parses a dotted version string like "1.2.3" (an optional leading
+    "v" is stripped, e.g. GitHub tag "v1.2.3") into a tuple of ints for
+    comparison. A non-numeric segment is treated as 0 rather than raising,
+    so a weird/unexpected tag string degrades to "not newer" instead of
+    crashing the update check."""
+    v = v.strip()
+    if v[:1].lower() == "v":
+        v = v[1:]
+    parts = []
+    for chunk in v.split("."):
+        m = re.match(r"\d+", chunk)
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts)
+
+
+def check_for_update(timeout=6):
+    """Best-effort GitHub "latest release" check. Returns a dict with
+    "version", "url", "is_newer" on success, or None on any failure (no
+    internet, GitHub unreachable, unexpected response shape, ...) — fails
+    closed like osu_memory.py, since this only ever runs silently in the
+    background or behind an explicit button click and never anything the
+    rest of the app depends on."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request(
+            UPDATE_API_URL,
+            headers={
+                "User-Agent": "osu-taiko-mapping-tools",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+        latest = str(data.get("tag_name", "")).strip()
+        if not latest:
+            return None
+        url = data.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest"
+        return {
+            "version": latest,
+            "url": url,
+            "is_newer": _version_tuple(latest) > _version_tuple(APP_VERSION),
+        }
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None
 
 
 def _position_over_window(win, reference_widget, width=None, height=None):
@@ -393,6 +445,32 @@ class App(tk.Tk):
         self._refresh_manual_index_button()
         self.after(1000, self._poll_live_osu_map)
         self.after(200, self._maybe_show_first_time_setup)
+        self.after(1500, self._auto_check_for_update)
+
+    def _check_for_update_async(self, on_done):
+        """Runs check_for_update() on a worker thread, delivering the
+        result back on the main thread via on_done(result). Callers whose
+        own widgets might have closed by the time this returns (e.g. the
+        Settings window) should guard with winfo_exists() inside on_done."""
+        def worker():
+            result = check_for_update()
+            self.after(0, on_done, result)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _auto_check_for_update(self):
+        """Silent startup check — says nothing if already up to date or if
+        the check fails (offline, GitHub unreachable, ...); only surfaces a
+        prompt when a real update is actually available."""
+        self._check_for_update_async(self._on_auto_update_result)
+
+    def _on_auto_update_result(self, result):
+        if result and result["is_newer"]:
+            if messagebox.askyesno(
+                "Update available",
+                f"A new version is available: {result['version']} (you have {APP_VERSION}).\n\n"
+                "Open the download page?",
+            ):
+                webbrowser.open(result["url"])
 
     def _on_close_request(self):
         """The default WM_DELETE_WINDOW handler is overridden so a running
@@ -1024,8 +1102,34 @@ class App(tk.Tk):
             finally:
                 win._closing = False
 
+        def do_check_for_update():
+            check_update_btn.configure(state="disabled", text="Checking...")
+
+            def done(result):
+                if not check_update_btn.winfo_exists():
+                    return
+                check_update_btn.configure(state="normal", text="Check for Update")
+                if result is None:
+                    messagebox.showwarning(
+                        "Check for Update",
+                        "Could not check for updates. Check your internet connection and try again.",
+                    )
+                elif result["is_newer"]:
+                    if messagebox.askyesno(
+                        "Update available",
+                        f"A new version is available: {result['version']} (you have {APP_VERSION}).\n\n"
+                        "Open the download page?",
+                    ):
+                        webbrowser.open(result["url"])
+                else:
+                    messagebox.showinfo("Check for Update", f"You're up to date (v{APP_VERSION}).")
+
+            self._check_for_update_async(done)
+
         btn_row = ttk.Frame(body)
-        btn_row.pack(anchor="e", pady=(16, 0))
+        btn_row.pack(fill="x", pady=(16, 0))
+        check_update_btn = ttk.Button(btn_row, text="Check for Update", command=do_check_for_update)
+        check_update_btn.pack(side="left")
         ttk.Button(btn_row, text="Apply", command=apply_and_notify).pack(side="right")
         ttk.Button(btn_row, text="Restart", command=do_restart).pack(side="right", padx=(0, 6))
 
