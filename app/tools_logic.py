@@ -1016,6 +1016,45 @@ def get_audio_bitrate_kbps(path: str) -> Optional[int]:
     return _probe_audio(path).get("bitrate_kbps")
 
 
+def _replace_locked_safe(tmp_path: str, dest_path: str):
+    """`os.replace(tmp_path, dest_path)`, but turns a `PermissionError`
+    (Windows: WinError 5 "Access is denied") into a clear, actionable
+    message instead of a raw OS error. This specific failure means
+    `dest_path` is currently open in another program — almost always osu!
+    itself, since simply having a map open or selected in song select
+    keeps its audio file locked for preview playback — rather than any
+    real problem with the encode/silence-add that already succeeded into
+    `tmp_path`. Cleans up `tmp_path` on failure so a failed replace
+    doesn't leave a stray `.tmp_*` file behind in the song folder."""
+    try:
+        os.replace(tmp_path, dest_path)
+    except PermissionError as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise RuntimeError(
+            f"Couldn't replace {os.path.basename(dest_path)} — it's open in "
+            "another program (most likely osu! itself, if this map is open "
+            "or selected in song select, or another media player/editor). "
+            "Close whatever has it open and try again."
+        ) from e
+
+
+def _remove_locked_safe(path: str):
+    """`os.remove(path)`, with the same PermissionError -> clear-message
+    treatment as `_replace_locked_safe` — used where a follow-up delete of
+    the *old* file (after a rename to a new filename) can hit the same
+    "still open in osu!" lock."""
+    try:
+        os.remove(path)
+    except PermissionError as e:
+        raise RuntimeError(
+            f"Couldn't remove {os.path.basename(path)} — it's open in "
+            "another program (most likely osu! itself, if this map is open "
+            "or selected in song select, or another media player/editor). "
+            "Close whatever has it open and try again."
+        ) from e
+
+
 def _concat_file_line(path: str) -> str:
     """One `file '...'` line for an ffmpeg concat-demuxer list. Forward
     slashes + an explicit `file:` protocol prefix sidestep ffmpeg's URL
@@ -1056,7 +1095,8 @@ def add_silence_to_audio(folder: str, silence_ms: int = SILENCE_LEAD_IN_MS) -> s
     bitrate (via `get_audio_bitrate_kbps`) so the quality hit from that
     unavoidable single re-encode pass is as small as possible."""
     if not ffmpeg_available():
-        raise RuntimeError("ffmpeg not found on PATH. Install ffmpeg and make sure it's on PATH.")
+        raise RuntimeError("ffmpeg not found. Install it automatically from Settings, or place "
+                            "ffmpeg.exe next to this app — it doesn't need to be on PATH.")
     audio_file = get_audio_filename(folder)
     if not audio_file:
         raise RuntimeError("No audio file found for this map.")
@@ -1090,7 +1130,7 @@ def add_silence_to_audio(folder: str, silence_ms: int = SILENCE_LEAD_IN_MS) -> s
             concat_cmd = [ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
                           "-i", list_path, "-c", "copy", out_path]
             _run_ffmpeg(concat_cmd)
-            os.replace(out_path, src)
+            _replace_locked_safe(out_path, src)
         finally:
             for p in (silence_path, list_path, out_path):
                 if os.path.exists(p):
@@ -1106,7 +1146,7 @@ def add_silence_to_audio(folder: str, silence_ms: int = SILENCE_LEAD_IN_MS) -> s
         cmd += ["-b:a", f"{src_kbps}k"]
     cmd.append(tmp_path)
     _run_ffmpeg(cmd)
-    os.replace(tmp_path, src)
+    _replace_locked_safe(tmp_path, src)
     return audio_file
 
 
@@ -1131,7 +1171,8 @@ def _reencode_audio_file(src: str, bitrate_kbps: int) -> str:
     (in place over the source, or alongside it under a different name;
     see `apply_audio_reencode_to_map`/`apply_audio_reencode_external`)."""
     if not ffmpeg_available():
-        raise RuntimeError("ffmpeg not found on PATH. Install ffmpeg and make sure it's on PATH.")
+        raise RuntimeError("ffmpeg not found. Install it automatically from Settings, or place "
+                            "ffmpeg.exe next to this app — it doesn't need to be on PATH.")
     if not os.path.exists(src):
         raise RuntimeError(f"Audio file not found: {src}")
     folder = os.path.dirname(src)
@@ -1160,15 +1201,15 @@ def apply_audio_reencode_to_map(folder: str, bitrate_kbps: int) -> str:
 
     if target_ext != ext:
         new_filename = base + target_ext
-        os.replace(tmp_path, os.path.join(folder, new_filename))
-        os.remove(src)
+        _replace_locked_safe(tmp_path, os.path.join(folder, new_filename))
+        _remove_locked_safe(src)
         for fname in osu_parser.list_difficulty_files(folder):
             path = os.path.join(folder, fname)
             bm = Beatmap(path)
             bm.set_kv("General", "AudioFilename", new_filename)
             bm.save()
         return new_filename
-    os.replace(tmp_path, src)
+    _replace_locked_safe(tmp_path, src)
     return audio_file
 
 
@@ -1181,7 +1222,7 @@ def apply_audio_reencode_external(src: str, bitrate_kbps: int) -> str:
     target_ext = _reencode_target_ext(ext, bitrate_kbps)
     tmp_path = _reencode_audio_file(src, bitrate_kbps)
     out_path = os.path.join(os.path.dirname(src), f"{base}_{bitrate_kbps}kbps{target_ext}")
-    os.replace(tmp_path, out_path)
+    _replace_locked_safe(tmp_path, out_path)
     return out_path
 
 
@@ -1383,7 +1424,8 @@ def resize_taiko_video(folder: str, video_file: str, blur: bool) -> str:
     the one that actually ends up referenced by the beatmap afterward, so
     leaving the original behind just wastes disk space."""
     if not ffmpeg_available():
-        raise RuntimeError("ffmpeg not found on PATH. Install ffmpeg and make sure it's on PATH.")
+        raise RuntimeError("ffmpeg not found. Install it automatically from Settings, or place "
+                            "ffmpeg.exe next to this app — it doesn't need to be on PATH.")
 
     src = os.path.join(folder, video_file)
     out_name = os.path.splitext(video_file)[0] + "_taiko.avi"

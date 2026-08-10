@@ -58,7 +58,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -642,53 +642,26 @@ class App(tk.Tk):
             webbrowser.open(result["url"])
             return
 
-        cancel_event = threading.Event()
-        # Tracks whether Cancel has already been actioned, so the two
-        # things racing to react to it — the button's own click handler
-        # (runs immediately, on the main thread) and the worker thread
-        # noticing cancel_event and unwinding (runs slightly later, via
-        # its own after(0, finish)) — don't both try to hide the banner /
-        # show a toast a second time.
-        state = {"cancelled": False}
+        def work(cancel_event):
+            # UpdateCancelled (a plain Exception subclass) can bubble out
+            # of this uncaught when the Cancel button fires — harmless,
+            # since run_cancellable_job's own "already cancelled" guard
+            # skips on_error before ever looking at it.
+            download_and_apply_update(asset_url, result.get("asset_size"), cancel_event=cancel_event)
 
-        def on_cancel():
-            if state["cancelled"]:
-                return
-            state["cancelled"] = True
-            cancel_event.set()
-            self.set_busy(False)
-            from screens import show_toast
-            show_toast(self, "Download Failed!", bg="#d32f2f", fg="#ffffff")
+        def on_success(_result):
+            # The new build has already been staged to take over on
+            # relaunch (see download_and_apply_update) — a hard exit here,
+            # same as _relaunch_process, skips Tcl/Tk teardown that a
+            # half-destroyed root window could otherwise get stuck on.
+            os._exit(0)
 
-        self.set_busy(True, "Downloading update... Please wait...", on_cancel=on_cancel)
+        def on_error(err_msg):
+            messagebox.showerror("Update failed", err_msg)
 
-        def work():
-            err_msg = None
-            try:
-                download_and_apply_update(asset_url, result.get("asset_size"),
-                                           cancel_event=cancel_event)
-            except UpdateCancelled:
-                pass  # already handled by on_cancel
-            except Exception as e:
-                err_msg = str(e)
-
-            def finish():
-                if state["cancelled"]:
-                    return
-                self.set_busy(False)
-                if err_msg is not None:
-                    messagebox.showerror("Update failed", err_msg)
-                    return
-                # The new build has already been staged to take over on
-                # relaunch (see download_and_apply_update) — a hard exit
-                # here, same as _relaunch_process, skips Tcl/Tk teardown
-                # that a half-destroyed root window could otherwise get
-                # stuck on.
-                os._exit(0)
-
-            self.after(0, finish)
-
-        threading.Thread(target=work, daemon=True).start()
+        self.run_cancellable_job("Downloading update... Please wait...", work,
+                                  on_success=on_success, on_error=on_error,
+                                  cancelled_toast="Download Failed!")
 
     def _on_close_request(self):
         """The default WM_DELETE_WINDOW handler is overridden so a running
@@ -721,6 +694,72 @@ class App(tk.Tk):
             self._busy_depth = max(0, self._busy_depth - 1)
             if self._busy_depth == 0:
                 self._hide_busy_overlay()
+
+    def run_cancellable_job(self, busy_msg: str, work_fn, on_success=None, on_error=None,
+                             on_cancel=None, cancelled_toast: str = "Cancelled!"):
+        """Runs `work_fn(cancel_event)` on a worker thread under the shared
+        busy overlay with a Cancel button — the common shape behind every
+        "install ffmpeg/VLC" and long-running ffmpeg-encode flow in this
+        app (first-time setup, Settings, Add Silence, Audio Re-encode,
+        the Taiko Video Resizer, the video preview's VLC install).
+
+        Clicking Cancel *always* gives the user their UI back immediately
+        — overlay hidden, a red/white toast shown — even though most of
+        these underlying operations (a winget install, an ffmpeg
+        subprocess call) can't actually be killed mid-flight without
+        risking a corrupted partial install/output. `work_fn` gets
+        `cancel_event` so operations that *can* check it cheaply between
+        steps (e.g. bailing out before starting a second phase) still do,
+        but nothing here forcibly terminates a subprocess. The worker
+        thread's own eventual result is silently ignored if the job was
+        already cancelled — `on_success`/`on_error` never fire for a
+        cancelled job, so this can't pop a second, contradictory dialog
+        on top of the cancellation toast already shown.
+
+        `work_fn(cancel_event)` should return a value (passed to
+        `on_success`) on success, or raise (str(exception) passed to
+        `on_error`) on failure. Both callbacks run on the main thread.
+        `on_cancel`, if given, runs (with no arguments) right after the
+        built-in overlay-hide + toast, so a caller can reset its own UI
+        state (e.g. re-enabling a button that was disabled/relabeled
+        "Installing..." for the duration)."""
+        cancel_event = threading.Event()
+        state = {"cancelled": False}
+
+        def handle_cancel_click():
+            if state["cancelled"]:
+                return
+            state["cancelled"] = True
+            cancel_event.set()
+            self.set_busy(False)
+            from screens import show_toast
+            show_toast(self, cancelled_toast, bg="#d32f2f", fg="#ffffff")
+            if on_cancel is not None:
+                on_cancel()
+
+        self.set_busy(True, busy_msg, on_cancel=handle_cancel_click)
+
+        def worker():
+            result = None
+            err_msg = None
+            try:
+                result = work_fn(cancel_event)
+            except Exception as e:
+                err_msg = str(e)
+
+            def finish():
+                if state["cancelled"]:
+                    return
+                self.set_busy(False)
+                if err_msg is not None:
+                    if on_error is not None:
+                        on_error(err_msg)
+                elif on_success is not None:
+                    on_success(result)
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _show_busy_overlay(self, message: str, on_cancel=None):
         existing = self._busy_win
@@ -1182,9 +1221,7 @@ class App(tk.Tk):
 
             download_btn.configure(state="disabled", text="Installing...")
 
-            def work():
-                self.after(0, self.set_busy, True,
-                           "Installing ffmpeg + ffprobe and VLC (may take a few minutes)... Please wait...")
+            def work(cancel_event):
                 errors = []
                 installed = []
                 if need_ffmpeg_bin or need_ffprobe_bin:
@@ -1194,26 +1231,37 @@ class App(tk.Tk):
                         installed.append(" + ".join(names))
                     except Exception as e:
                         errors.append(f"FFmpeg: {e}")
-                if need_vlc:
+                if need_vlc and not cancel_event.is_set():
                     try:
                         logic.install_vlc_bundled()
                         installed.append("VLC")
                     except Exception as e:
                         errors.append(f"VLC: {e}")
-                self.after(0, self.set_busy, False)
+                return installed, errors
 
-                def finish():
-                    if download_btn.winfo_exists():
-                        download_btn.configure(state="normal", text=original_text)
-                    if win.winfo_exists():
-                        if errors:
-                            messagebox.showerror("Download resources", "\n\n".join(errors))
-                        else:
-                            messagebox.showinfo("Download resources", f"{' and '.join(installed)} installed successfully.")
+            def reset_button():
+                if download_btn.winfo_exists():
+                    download_btn.configure(state="normal", text=original_text)
 
-                self.after(0, finish)
+            def on_success(result):
+                installed, errors = result
+                reset_button()
+                if win.winfo_exists():
+                    if errors:
+                        messagebox.showerror("Download resources", "\n\n".join(errors))
+                    else:
+                        messagebox.showinfo("Download resources", f"{' and '.join(installed)} installed successfully.")
 
-            threading.Thread(target=work, daemon=True).start()
+            def on_error(err_msg):
+                reset_button()
+                if win.winfo_exists():
+                    messagebox.showerror("Download resources", err_msg)
+
+            self.run_cancellable_job(
+                "Installing ffmpeg + ffprobe and VLC (may take a few minutes)... Please wait...",
+                work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
+                cancelled_toast="Installation Cancelled!",
+            )
 
         download_btn.configure(command=do_install_resources)
         download_btn.pack(anchor="w")
@@ -1541,9 +1589,7 @@ class App(tk.Tk):
 
             download_btn.configure(state="disabled", text="Installing...")
 
-            def work():
-                self.after(0, self.set_busy, True,
-                           "Installing ffmpeg + ffprobe and VLC (may take a few minutes)... Please wait...")
+            def work(cancel_event):
                 errors = []
                 installed = []
                 if need_ffmpeg_bin or need_ffprobe_bin:
@@ -1553,26 +1599,37 @@ class App(tk.Tk):
                         installed.append(" + ".join(names))
                     except Exception as e:
                         errors.append(f"FFmpeg: {e}")
-                if need_vlc:
+                if need_vlc and not cancel_event.is_set():
                     try:
                         logic.install_vlc_bundled()
                         installed.append("VLC")
                     except Exception as e:
                         errors.append(f"VLC: {e}")
-                self.after(0, self.set_busy, False)
+                return installed, errors
 
-                def finish():
-                    if download_btn.winfo_exists():
-                        download_btn.configure(state="normal", text=original_text)
-                    if win.winfo_exists():
-                        if errors:
-                            messagebox.showerror("Download resources", "\n\n".join(errors))
-                        else:
-                            messagebox.showinfo("Download resources", f"{' and '.join(installed)} installed successfully.")
+            def reset_button():
+                if download_btn.winfo_exists():
+                    download_btn.configure(state="normal", text=original_text)
 
-                self.after(0, finish)
+            def on_success(result):
+                installed, errors = result
+                reset_button()
+                if win.winfo_exists():
+                    if errors:
+                        messagebox.showerror("Download resources", "\n\n".join(errors))
+                    else:
+                        messagebox.showinfo("Download resources", f"{' and '.join(installed)} installed successfully.")
 
-            threading.Thread(target=work, daemon=True).start()
+            def on_error(err_msg):
+                reset_button()
+                if win.winfo_exists():
+                    messagebox.showerror("Download resources", err_msg)
+
+            self.run_cancellable_job(
+                "Installing ffmpeg + ffprobe and VLC (may take a few minutes)... Please wait...",
+                work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
+                cancelled_toast="Installation Cancelled!",
+            )
 
         download_btn.configure(command=do_install_resources)
         download_btn.pack(anchor="w")

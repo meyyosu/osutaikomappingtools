@@ -226,15 +226,17 @@ def _ask_silence_quality_choice(parent) -> str:
          ("Cancel", "cancel")])
 
 
-def _ask_ffmpeg_required_choice(parent) -> str:
-    """Shown when the Taiko Video Resizer is used but ffmpeg isn't
-    resolvable (see `logic.ffmpeg_available`) — unlike Add Silence there's
-    no degraded-quality fallback to proceed with, resizing just can't
-    happen without it, so this only offers "install" or "cancel". Returns
-    "install" or "cancel"."""
+def _ask_ffmpeg_required_choice(parent, feature_name: str = "This feature") -> str:
+    """Shown when a feature needing ffmpeg (the Taiko Video Resizer, Audio
+    Re-encode) is used but ffmpeg isn't resolvable (see
+    `logic.ffmpeg_available`) — unlike Add Silence there's no degraded-
+    quality fallback to proceed with, so this only offers "install" or
+    "cancel". Returns "install" or "cancel". `feature_name` names whichever
+    feature triggered this, e.g. "The Taiko Video Resizer"/"Audio
+    Re-encode" — read as the start of a sentence."""
     return _ask_choice_dialog(
         parent, "FFmpeg required",
-        "The Taiko Video Resizer needs ffmpeg, which wasn't found on this system.",
+        f"{feature_name} needs ffmpeg, which wasn't found on this system.",
         [("Install automatically", "install"), ("Cancel", "cancel")])
 
 
@@ -331,27 +333,25 @@ def _run_bundled_install(master, win, button, install_fn, tool_name, busy_msg):
     button.configure(state="disabled", text="Installing...")
     original_text = f"Install {tool_name} automatically"
 
-    def work():
-        master.after(0, master.app.set_busy, True, busy_msg)
-        try:
-            install_fn()
-            ok, msg = True, f"{tool_name} installed successfully."
-        except Exception as e:
-            ok, msg = False, str(e)
-        master.after(0, master.app.set_busy, False)
+    def work(cancel_event):
+        install_fn()
 
-        def finish():
-            if button.winfo_exists():
-                button.configure(state="normal", text=original_text)
-            if win.winfo_exists():
-                if ok:
-                    messagebox.showinfo(tool_name, msg)
-                else:
-                    messagebox.showerror(tool_name, msg)
+    def reset_button():
+        if button.winfo_exists():
+            button.configure(state="normal", text=original_text)
 
-        master.after(0, finish)
+    def on_success(_result):
+        reset_button()
+        if win.winfo_exists():
+            messagebox.showinfo(tool_name, f"{tool_name} installed successfully.")
 
-    threading.Thread(target=work, daemon=True).start()
+    def on_error(err_msg):
+        reset_button()
+        if win.winfo_exists():
+            messagebox.showerror(tool_name, err_msg)
+
+    master.app.run_cancellable_job(busy_msg, work, on_success=on_success, on_error=on_error,
+                                    on_cancel=reset_button, cancelled_toast="Installation Cancelled!")
 
 
 class CoordinateEditorWindow(tk.Toplevel):
@@ -1828,42 +1828,55 @@ class OffsetShifterFrame(BaseToolFrame):
         self._start_apply_thread(folder, targets, delta, add_silence, install_first)
 
     def _start_apply_thread(self, folder, targets, delta, add_silence, install_first):
-        def work():
-            need_busy = install_first or add_silence
-            if need_busy:
-                busy_msg = ("Installing ffmpeg + ffprobe (may take a few minutes)... Please wait..."
-                             if install_first else "Processing... Please wait...")
-                self.after(0, self.app.set_busy, True, busy_msg)
-            try:
-                if install_first:
-                    logic.install_ffmpeg_suite_bundled()
-                    self.after(0, lambda: self.notify_done(
-                        "ffmpeg + ffprobe installed — continuing with full quality."))
-                logic.apply_offset(folder, targets, delta, add_silence)
-            except Exception as e:
-                # Capture the message as a plain str now — `e` itself is
-                # implicitly deleted the moment this except block exits
-                # (PEP 3110), but the lambda below only runs later, once
-                # Tkinter gets around to the self.after(0, ...) callback.
-                # Closing over `e` directly means the lambda raises a bare
-                # NameError when it finally runs, which — since Tk's
-                # default exception reporter just prints to stderr, easy
-                # to lose in a windowed/no-console build — looks exactly
-                # like "the busy banner flashes and nothing else happens".
-                err_msg = str(e)
-                self.after(0, lambda: messagebox.showerror("Error", err_msg))
-                return
-            finally:
-                if need_busy:
-                    self.after(0, self.app.set_busy, False)
+        def finish_ok():
             total = delta + (logic.SILENCE_LEAD_IN_MS if add_silence else 0)
             msg = f"Shifted {len(targets)} difficulty file(s) by {total} ms."
             if add_silence:
                 msg += " Added 1000ms of silence to the audio."
-            self.after(0, lambda: self.notify_done(msg))
-            self.after(0, self.refresh)
+            self.notify_done(msg)
+            self.refresh()
 
-        threading.Thread(target=work, daemon=True).start()
+        need_busy = install_first or add_silence
+        if not need_busy:
+            # Plain metadata-only shift — no ffmpeg install, no audio
+            # encode, nothing worth a busy banner (let alone a Cancel
+            # button) over.
+            def work():
+                try:
+                    logic.apply_offset(folder, targets, delta, add_silence)
+                except Exception as e:
+                    # See the matching comment on the cancellable path
+                    # below re: capturing `e` as a string before deferring.
+                    err_msg = str(e)
+                    self.after(0, lambda: messagebox.showerror("Error", err_msg))
+                    return
+                self.after(0, finish_ok)
+
+            threading.Thread(target=work, daemon=True).start()
+            return
+
+        def work(cancel_event):
+            if install_first:
+                logic.install_ffmpeg_suite_bundled()
+                if cancel_event.is_set():
+                    return
+                self.after(0, lambda: self.notify_done(
+                    "ffmpeg + ffprobe installed — continuing with full quality."))
+            logic.apply_offset(folder, targets, delta, add_silence)
+
+        busy_msg = ("Installing ffmpeg + ffprobe (may take a few minutes)... Please wait..."
+                     if install_first else "Processing... Please wait...")
+
+        def on_error(err_msg):
+            # Capture the message as a plain str now — `e` itself is
+            # implicitly deleted the moment its except block exits (PEP
+            # 3110), but this callback only runs later, once Tkinter gets
+            # around to it — run_cancellable_job already does this
+            # capture for us before calling on_error.
+            messagebox.showerror("Error", err_msg)
+
+        self.app.run_cancellable_job(busy_msg, work, on_success=lambda _r: finish_ok(),
+                                      on_error=on_error)
 
     def apply_reencode(self):
         bitrate = int(self.reencode_bitrate_var.get())
@@ -1872,35 +1885,52 @@ class OffsetShifterFrame(BaseToolFrame):
             if not src_path:
                 messagebox.showwarning("No file selected", "Pick an audio file to re-encode first.")
                 return
-            self._start_reencode_thread(bitrate, external_path=src_path)
+            folder, external_path = None, src_path
         else:
             if not self.require_map():
                 return
             folder, _ = self.app.get_diff_files()
-            self._start_reencode_thread(bitrate, folder=folder)
+            external_path = None
 
-    def _start_reencode_thread(self, bitrate, folder=None, external_path=None):
-        def work():
-            self.after(0, self.app.set_busy, True, "Re-encoding audio... Please wait...")
-            try:
-                if external_path:
-                    out_path = logic.apply_audio_reencode_external(external_path, bitrate)
-                else:
-                    new_name = logic.apply_audio_reencode_to_map(folder, bitrate)
-            except Exception as e:
-                err_msg = str(e)
-                self.after(0, self.app.set_busy, False)
-                self.after(0, lambda: messagebox.showerror("Error", err_msg))
+        install_first = False
+        if not logic.ffmpeg_available():
+            choice = _ask_ffmpeg_required_choice(self, "Audio Re-encode")
+            if choice == "cancel":
                 return
-            self.after(0, self.app.set_busy, False)
-            if external_path:
-                self.after(0, lambda: self.notify_done(f"Audio re-encoded to {bitrate}kbps."))
-                self.after(0, lambda: _reveal_in_explorer(out_path))
-            else:
-                self.after(0, lambda: self.notify_done(
-                    f"Audio re-encoded to {bitrate}kbps ({new_name})."))
+            install_first = True  # only "install" remains as a non-cancel choice
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_reencode_thread(bitrate, folder=folder, external_path=external_path,
+                                     install_first=install_first)
+
+    def _start_reencode_thread(self, bitrate, folder=None, external_path=None, install_first=False):
+        def do_reencode():
+            if external_path:
+                return logic.apply_audio_reencode_external(external_path, bitrate)
+            return logic.apply_audio_reencode_to_map(folder, bitrate)
+
+        def work(cancel_event):
+            if install_first:
+                logic.install_ffmpeg_suite_bundled()
+                if cancel_event.is_set():
+                    return None
+                self.after(0, lambda: self.notify_done(
+                    "ffmpeg + ffprobe installed — continuing."))
+            return do_reencode()
+
+        def on_success(result):
+            if external_path:
+                self.notify_done(f"Audio re-encoded to {bitrate}kbps.")
+                _reveal_in_explorer(result)
+            else:
+                self.notify_done(f"Audio re-encoded to {bitrate}kbps ({result}).")
+
+        def on_error(err_msg):
+            messagebox.showerror("Error", err_msg)
+
+        busy_msg = ("Installing ffmpeg + ffprobe (may take a few minutes)... Please wait..."
+                     if install_first else "Re-encoding audio... Please wait...")
+        self.app.run_cancellable_job(busy_msg, work, on_success=on_success, on_error=on_error,
+                                      cancelled_toast="Re-encode Cancelled!")
 
 
 # =============================================================================
@@ -2581,21 +2611,21 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         if choice == "cancel":
             return
 
-        def work():
-            self.after(0, self.app.set_busy, True,
-                       "Installing VLC (may take a few minutes)... Please wait...")
-            try:
-                logic.install_vlc_bundled()
-            except Exception as e:
-                err_msg = str(e)
-                self.after(0, self.app.set_busy, False)
-                self.after(0, lambda: messagebox.showerror("Error", err_msg))
-                return
-            self.after(0, self.app.set_busy, False)
-            self.after(0, lambda: self.notify_done("VLC installed — opening preview."))
-            self.after(0, lambda: self._launch_preview_window(folder))
+        def work(cancel_event):
+            logic.install_vlc_bundled()
 
-        threading.Thread(target=work, daemon=True).start()
+        def on_success(_result):
+            self.notify_done("VLC installed — opening preview.")
+            self._launch_preview_window(folder)
+
+        def on_error(err_msg):
+            messagebox.showerror("Error", err_msg)
+
+        self.app.run_cancellable_job(
+            "Installing VLC (may take a few minutes)... Please wait...",
+            work, on_success=on_success, on_error=on_error,
+            cancelled_toast="Installation Cancelled!",
+        )
 
     def _launch_preview_window(self, folder):
         audio_file = logic.get_audio_filename(folder)
@@ -2630,47 +2660,63 @@ class VideoOffsetShifterFrame(BaseToolFrame):
 
         install_first = False
         if wants_resize and not logic.ffmpeg_available():
-            choice = _ask_ffmpeg_required_choice(self)
+            choice = _ask_ffmpeg_required_choice(self, "The Taiko Video Resizer")
             if choice == "cancel":
                 return
             install_first = True  # only "install" remains as a non-cancel choice
 
-        def work():
-            need_busy = install_first or wants_resize
-            if need_busy:
-                busy_msg = ("Installing ffmpeg + ffprobe (may take a few minutes)... Please wait..."
-                             if install_first else "Processing... Please wait...")
-                self.after(0, self.app.set_busy, True, busy_msg)
-            final_video = video_file
-            try:
-                if install_first:
-                    logic.install_ffmpeg_suite_bundled()
-                    self.after(0, lambda: self.notify_done(
-                        "ffmpeg + ffprobe installed — continuing."))
-                if wants_resize:
-                    final_video = logic.resize_taiko_video(folder, video_file, self.blur_var.get())
-            except Exception as e:
-                # See the matching comment in OffsetShifterFrame._start_apply_thread —
-                # `e` is gone by the time this deferred lambda runs.
-                err_msg = str(e)
-                self.after(0, lambda: messagebox.showerror("ffmpeg error", err_msg))
-                return
-            finally:
-                if need_busy:
-                    self.after(0, self.app.set_busy, False)
-            if wants_sb:
-                logic.apply_video_sb_code(folder, targets, final_video, delta)
-            else:
-                logic.apply_video_offset(folder, targets, final_video, delta)
+        def finish_ok(final_video):
             msg = f"Video offset applied to {len(targets)} difficulty file(s)."
             if final_video != video_file:
                 msg += f"\nResized video saved as {final_video}"
             if wants_sb:
                 msg += "\nTaiko Video SB Code written under the Video event."
-            self.after(0, lambda: self.notify_done(msg))
-            self.after(0, self.refresh)
+            self.notify_done(msg)
+            self.refresh()
 
-        threading.Thread(target=work, daemon=True).start()
+        def apply_offset_step(final_video):
+            if wants_sb:
+                logic.apply_video_sb_code(folder, targets, final_video, delta)
+            else:
+                logic.apply_video_offset(folder, targets, final_video, delta)
+            return final_video
+
+        need_busy = install_first or wants_resize
+        if not need_busy:
+            # No ffmpeg install and no resize — just an .osu edit, nothing
+            # worth a busy banner (let alone a Cancel button) over.
+            def work():
+                try:
+                    final_video = apply_offset_step(video_file)
+                except Exception as e:
+                    err_msg = str(e)
+                    self.after(0, lambda: messagebox.showerror("ffmpeg error", err_msg))
+                    return
+                self.after(0, lambda: finish_ok(final_video))
+
+            threading.Thread(target=work, daemon=True).start()
+            return
+
+        def work(cancel_event):
+            if install_first:
+                logic.install_ffmpeg_suite_bundled()
+                if cancel_event.is_set():
+                    return None
+                self.after(0, lambda: self.notify_done("ffmpeg + ffprobe installed — continuing."))
+            final_video = video_file
+            if wants_resize:
+                final_video = logic.resize_taiko_video(folder, video_file, self.blur_var.get())
+            return apply_offset_step(final_video)
+
+        busy_msg = ("Installing ffmpeg + ffprobe (may take a few minutes)... Please wait..."
+                     if install_first else "Processing... Please wait...")
+
+        def on_error(err_msg):
+            # See the matching comment in OffsetShifterFrame._start_apply_thread —
+            # `e` is gone by the time this deferred callback runs.
+            messagebox.showerror("ffmpeg error", err_msg)
+
+        self.app.run_cancellable_job(busy_msg, work, on_success=finish_ok, on_error=on_error)
 
 
 class PatternCard(tk.Frame):
