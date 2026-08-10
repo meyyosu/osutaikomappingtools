@@ -14,6 +14,7 @@ import glob
 import json
 import shutil
 import subprocess
+import tempfile
 import threading
 import webbrowser
 import tkinter as tk
@@ -57,7 +58,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.0"
+APP_VERSION = "1.2"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -80,11 +81,14 @@ def _version_tuple(v: str):
 
 def check_for_update(timeout=6):
     """Best-effort GitHub "latest release" check. Returns a dict with
-    "version", "url", "is_newer" on success, or None on any failure (no
-    internet, GitHub unreachable, unexpected response shape, ...) — fails
-    closed like osu_memory.py, since this only ever runs silently in the
-    background or behind an explicit button click and never anything the
-    rest of the app depends on."""
+    "version", "url", "is_newer", "asset_url", "asset_size" on success (the
+    latter two are None if the release has no .exe asset attached — an
+    update still shows up as available, just without the option to install
+    it automatically), or None on any failure (no internet, GitHub
+    unreachable, unexpected response shape, ...) — fails closed like
+    osu_memory.py, since this only ever runs silently in the background or
+    behind an explicit button click and never anything the rest of the app
+    depends on."""
     import urllib.request
     import urllib.error
 
@@ -102,13 +106,137 @@ def check_for_update(timeout=6):
         if not latest:
             return None
         url = data.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest"
+        asset_url = None
+        asset_size = None
+        for asset in data.get("assets", []) or []:
+            if str(asset.get("name", "")).lower().endswith(".exe"):
+                asset_url = asset.get("browser_download_url")
+                asset_size = asset.get("size")
+                break
         return {
             "version": latest,
             "url": url,
             "is_newer": _version_tuple(latest) > _version_tuple(APP_VERSION),
+            "asset_url": asset_url,
+            "asset_size": asset_size,
         }
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return None
+
+
+class UpdateCancelled(Exception):
+    """Raised by _download_update_asset when cancel_event gets set
+    mid-download — a deliberate user action, not a real error, so callers
+    should catch it separately from the RuntimeErrors download_and_apply_
+    update raises for genuine failures."""
+
+
+def _download_update_asset(url: str, dest_path: str, cancel_event, timeout: int = 300,
+                            chunk_size: int = 1 << 16):
+    """Like tools_logic._download_to_file, but reads the response in
+    chunks and checks `cancel_event` between each one, so a user-initiated
+    cancel takes effect within a fraction of a second instead of only
+    after the whole (30+ MB) body has already downloaded. Doesn't need
+    _download_to_file's "meta refresh" HTML-redirect handling — GitHub
+    release assets redirect via a normal HTTP Location header, which
+    urlopen already follows on its own."""
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open(dest_path, "wb") as f:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise UpdateCancelled()
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
+def download_and_apply_update(asset_url: str, expected_size=None, timeout: int = 300,
+                               cancel_event=None):
+    """Downloads `asset_url` (a GitHub release's .exe asset) and arranges
+    for it to replace the currently-running exe and relaunch once this
+    process exits — Windows won't let a running .exe's own file be
+    replaced while it's still executing, so the swap has to happen from a
+    separate process that outlives this one. Meant to run on a worker
+    thread; on success, the caller is responsible for actually exiting
+    (os._exit(0), same as _relaunch_process) once back on the main thread
+    — this function only downloads and stages things, it never tears down
+    the running app itself.
+
+    Only meaningful for the actual built/frozen exe — there's no single
+    "the app" file to replace when running from source (just a folder of
+    .py files), so this raises RuntimeError up front in that case and
+    callers should fall back to the plain "open the download page" flow.
+    Also raises RuntimeError on any download failure or if the downloaded
+    file's size doesn't match what GitHub reported for it (a partial or
+    corrupted download) — in every failure case, nothing has touched the
+    currently-running exe, only a separate temp copy alongside it, so the
+    running app is left completely unaffected. Raises UpdateCancelled
+    (left for the caller to catch separately) if `cancel_event` gets set
+    partway through — the partial download is cleaned up the same as any
+    other failure."""
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError("Automatic update is only available in the built app — "
+                            "you're running from source. Download the new version "
+                            "manually from the releases page instead.")
+
+    exe_path = os.path.abspath(sys.executable)
+    exe_dir = os.path.dirname(exe_path)
+    tmp_path = exe_path + ".new"
+
+    try:
+        _download_update_asset(asset_url, tmp_path, cancel_event, timeout=timeout)
+    except UpdateCancelled:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    except (OSError, RuntimeError) as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise RuntimeError(f"Couldn't download the update ({e}).")
+
+    downloaded_size = os.path.getsize(tmp_path)
+    if downloaded_size < 1_000_000 or (expected_size and downloaded_size != expected_size):
+        os.remove(tmp_path)
+        raise RuntimeError("The downloaded update looked incomplete or corrupted "
+                            "— nothing was changed. Please try again.")
+
+    # A .bat that waits for this process to actually exit, then swaps the
+    # new build into place and relaunches it — written to a temp file
+    # (not exe_dir) so it doesn't linger next to the app if its own
+    # self-delete somehow doesn't run. tmp_path sits directly alongside
+    # exe_path (not in a generic temp dir) specifically so `move` is a
+    # same-volume rename rather than a cross-volume copy.
+    pid = os.getpid()
+    bat_fd, bat_path = tempfile.mkstemp(suffix=".bat")
+    os.close(bat_fd)
+    bat_contents = (
+        "@echo off\r\n"
+        ":wait\r\n"
+        f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\r\n'
+        'if "%ERRORLEVEL%"=="0" (\r\n'
+        "    timeout /t 1 /nobreak >NUL\r\n"
+        "    goto wait\r\n"
+        ")\r\n"
+        # A short extra pause after the process disappears from tasklist —
+        # the OS can take a moment to fully release the file handle.
+        "timeout /t 1 /nobreak >NUL\r\n"
+        f'move /y "{tmp_path}" "{exe_path}" >NUL\r\n'
+        f'start "" "{exe_path}"\r\n'
+        'del "%~f0"\r\n'
+    )
+    with open(bat_path, "w", encoding="utf-8") as f:
+        f.write(bat_contents)
+
+    DETACHED_PROCESS = 0x00000008
+    subprocess.Popen(
+        ["cmd", "/c", bat_path],
+        creationflags=DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+        cwd=exe_dir,
+    )
 
 
 def _position_over_window(win, reference_widget, width=None, height=None):
@@ -402,6 +530,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
+        self.app_version = APP_VERSION
         # Restores wherever the window was sized/positioned last time it
         # closed (see save_window_geometry_config in _on_close_request);
         # DEFAULT_WINDOW_GEOMETRY only applies on first run or if that
@@ -432,6 +561,7 @@ class App(tk.Tk):
         self._busy_win = None
         self._busy_configure_binding = None
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+        self.bind_all("<Button-1>", self._on_global_click_unfocus, add="+")
 
         self._build_titlebar()
         self._build_body()
@@ -446,6 +576,21 @@ class App(tk.Tk):
         self.after(1000, self._poll_live_osu_map)
         self.after(200, self._maybe_show_first_time_setup)
         self.after(1500, self._auto_check_for_update)
+
+    _UNFOCUS_EXEMPT_TYPES = (tk.Entry, tk.Spinbox, tk.Text, ttk.Entry, ttk.Spinbox, ttk.Combobox)
+
+    def _on_global_click_unfocus(self, event):
+        """Clicking anywhere that isn't itself a text-entry-like widget
+        clears focus off whatever entry/spinbox/text field currently has
+        it, so a click elsewhere in the window doesn't leave a field
+        looking focused (blinking cursor, selection highlight, etc.)."""
+        widget = event.widget
+        if isinstance(widget, self._UNFOCUS_EXEMPT_TYPES):
+            return
+        try:
+            widget.focus_set()
+        except tk.TclError:
+            pass
 
     def _check_for_update_async(self, on_done):
         """Runs check_for_update() on a worker thread, delivering the
@@ -465,12 +610,85 @@ class App(tk.Tk):
 
     def _on_auto_update_result(self, result):
         if result and result["is_newer"]:
-            if messagebox.askyesno(
+            self._offer_update_install(result)
+
+    def _offer_update_install(self, result):
+        """Shared "an update is available" prompt for both the silent
+        startup check and the Settings "Check for Update" button. Offers
+        to download and install it automatically (see
+        download_and_apply_update — only actually works in the built app)
+        alongside the existing "just open the download page" fallback."""
+        from screens import _ask_choice_dialog
+        choice = _ask_choice_dialog(
+            self, "Update available",
+            f"A new version is available: {result['version']} (you have {self.app_version}).",
+            [("Download and Install", "install"),
+             ("Open Download Page", "browser"),
+             ("Cancel", "cancel")],
+        )
+        if choice == "browser":
+            webbrowser.open(result["url"])
+        elif choice == "install":
+            self._download_and_install_update(result)
+
+    def _download_and_install_update(self, result):
+        asset_url = result.get("asset_url")
+        if not asset_url:
+            messagebox.showwarning(
                 "Update available",
-                f"A new version is available: {result['version']} (you have {APP_VERSION}).\n\n"
-                "Open the download page?",
-            ):
-                webbrowser.open(result["url"])
+                "This release doesn't have a downloadable build attached — "
+                "opening the download page instead.",
+            )
+            webbrowser.open(result["url"])
+            return
+
+        cancel_event = threading.Event()
+        # Tracks whether Cancel has already been actioned, so the two
+        # things racing to react to it — the button's own click handler
+        # (runs immediately, on the main thread) and the worker thread
+        # noticing cancel_event and unwinding (runs slightly later, via
+        # its own after(0, finish)) — don't both try to hide the banner /
+        # show a toast a second time.
+        state = {"cancelled": False}
+
+        def on_cancel():
+            if state["cancelled"]:
+                return
+            state["cancelled"] = True
+            cancel_event.set()
+            self.set_busy(False)
+            from screens import show_toast
+            show_toast(self, "Download Failed!", bg="#d32f2f", fg="#ffffff")
+
+        self.set_busy(True, "Downloading update... Please wait...", on_cancel=on_cancel)
+
+        def work():
+            err_msg = None
+            try:
+                download_and_apply_update(asset_url, result.get("asset_size"),
+                                           cancel_event=cancel_event)
+            except UpdateCancelled:
+                pass  # already handled by on_cancel
+            except Exception as e:
+                err_msg = str(e)
+
+            def finish():
+                if state["cancelled"]:
+                    return
+                self.set_busy(False)
+                if err_msg is not None:
+                    messagebox.showerror("Update failed", err_msg)
+                    return
+                # The new build has already been staged to take over on
+                # relaunch (see download_and_apply_update) — a hard exit
+                # here, same as _relaunch_process, skips Tcl/Tk teardown
+                # that a half-destroyed root window could otherwise get
+                # stuck on.
+                os._exit(0)
+
+            self.after(0, finish)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_close_request(self):
         """The default WM_DELETE_WINDOW handler is overridden so a running
@@ -483,23 +701,28 @@ class App(tk.Tk):
         save_window_geometry_config(self.geometry())
         self.destroy()
 
-    def set_busy(self, busy: bool, message: str = "Processing... Please wait..."):
+    def set_busy(self, busy: bool, message: str = "Processing... Please wait...", on_cancel=None):
         """Shows/hides the fading busy banner and blocks all input to the
         rest of the app while a long-running background job (currently:
-        ffmpeg encodes for Add Silence / the taiko video resizer) is in
-        flight. Depth-counted so nested/overlapping calls can't hide the
-        banner out from under a still-running job. Must be called from the
-        main thread — worker threads should route through self.after(0, ...)."""
+        ffmpeg encodes for Add Silence / the taiko video resizer, or
+        downloading an update) is in flight. Depth-counted so nested/
+        overlapping calls can't hide the banner out from under a still-
+        running job. Must be called from the main thread — worker threads
+        should route through self.after(0, ...). `on_cancel`, if given,
+        adds a Cancel button to the banner (only meaningful for the call
+        that actually creates it, i.e. when this is the first nested
+        call) — most jobs using this banner aren't actually cancellable,
+        so it's opt-in per call rather than always shown."""
         if busy:
             self._busy_depth += 1
             if self._busy_depth == 1:
-                self._show_busy_overlay(message)
+                self._show_busy_overlay(message, on_cancel)
         else:
             self._busy_depth = max(0, self._busy_depth - 1)
             if self._busy_depth == 0:
                 self._hide_busy_overlay()
 
-    def _show_busy_overlay(self, message: str):
+    def _show_busy_overlay(self, message: str, on_cancel=None):
         existing = self._busy_win
         if existing is not None and existing.winfo_exists():
             return
@@ -509,8 +732,12 @@ class App(tk.Tk):
         win.attributes("-alpha", 0.0)
         bg = "#ffc107"
         win.configure(bg=bg)
-        tk.Label(win, text=message, bg=bg, fg="#000000",
-                 font=("Segoe UI", 14, "bold"), pady=8).pack(fill="x")
+        row = tk.Frame(win, bg=bg)
+        row.pack(fill="x")
+        tk.Label(row, text=message, bg=bg, fg="#000000",
+                 font=("Segoe UI", 14, "bold")).pack(side="left", expand=True, pady=8, padx=(12, 0))
+        if on_cancel is not None:
+            ttk.Button(row, text="Cancel", command=on_cancel).pack(side="right", padx=12, pady=6)
         self._busy_win = win
         self._position_busy_overlay()
         self._busy_configure_binding = self.bind(
@@ -717,8 +944,10 @@ class App(tk.Tk):
         style.configure("Icon.TButton", font=icon_font)
 
         title_lbl = ttk.Label(bar, textvariable=self.now_selecting_var, anchor="w",
-                               relief="sunken", padding=4)
+                               relief="sunken", padding=4, justify="left")
         title_lbl.pack(side="left", fill="x", expand=True, padx=4)
+        self._titlebar = bar
+        self._now_selecting_label = title_lbl
 
         romanise_btn = ttk.Button(bar, text="あ", width=3, command=self.toggle_metadata_display)
         romanise_btn.pack(side="left", padx=(0, 4))
@@ -741,6 +970,44 @@ class App(tk.Tk):
         # No custom minimize/maximize/close buttons — the OS window chrome
         # already provides these; duplicating them here was redundant.
 
+        # Keeps the "Now Selecting" label from pushing every button to its
+        # right out of the visible window once a map's title is long — the
+        # window already has an explicit .geometry() set (see __init__),
+        # so it won't auto-grow to fit an over-wide label the way an
+        # un-sized Tk window would; the label would just overflow off the
+        # right edge instead, taking the romanise/folder/link/settings
+        # buttons with it. bar's own <Configure> catches a window resize;
+        # index_status_frame's catches its own width changing as the
+        # indexing progress bar/buttons inside it come and go (that alone
+        # doesn't change bar's outer size, so bar's own Configure wouldn't
+        # otherwise fire for it).
+        bar.bind("<Configure>", self._update_now_selecting_wraplength)
+        self.index_status_frame.bind("<Configure>", self._update_now_selecting_wraplength)
+        self._update_now_selecting_wraplength()
+
+    def _update_now_selecting_wraplength(self, _event=None):
+        """Recomputes and applies the "Now Selecting" label's wraplength so
+        its text wraps onto extra lines instead of demanding more width
+        than is actually left over in the title bar. Deferred via
+        after_idle rather than applied synchronously from the <Configure>
+        handler that triggers it — setting wraplength directly inside a
+        Configure callback firing as *part of* the very pack computation
+        it's reacting to corrupted the layout of every widget packed after
+        the label (confirmed empirically: they collapsed to 0-1px wide)."""
+        def _apply():
+            if not self.winfo_exists():
+                return
+            siblings = [w for w in self._titlebar.winfo_children()
+                        if w is not self._now_selecting_label and w.winfo_ismapped()]
+            # winfo_reqwidth() doesn't include each sibling's own padx from
+            # its pack() call — a flat per-widget allowance covers that
+            # (and the label's own internal padding) without having to
+            # track each one's actual padx individually.
+            reserved = sum(w.winfo_reqwidth() for w in siblings) + 12 * len(siblings) + 20
+            available = max(150, self._titlebar.winfo_width() - reserved)
+            self._now_selecting_label.configure(wraplength=available)
+        self.after_idle(_apply)
+
     def open_settings(self):
         if getattr(self, "_settings_win", None) is not None and self._settings_win.winfo_exists():
             self._settings_win.lift()
@@ -761,8 +1028,9 @@ class App(tk.Tk):
             "live_sync": self.live_sync_enabled,
         }
 
-        body = ttk.Frame(win)
-        body.pack(fill="both", expand=True, padx=16, pady=16)
+        from screens import make_scrollable_toplevel_body
+        body = make_scrollable_toplevel_body(win)
+        body.configure(padding=16)
 
         # ------------------------------------------------------------------
         # 1. Set osu! Song Folder
@@ -1115,12 +1383,7 @@ class App(tk.Tk):
                         "Could not check for updates. Check your internet connection and try again.",
                     )
                 elif result["is_newer"]:
-                    if messagebox.askyesno(
-                        "Update available",
-                        f"A new version is available: {result['version']} (you have {APP_VERSION}).\n\n"
-                        "Open the download page?",
-                    ):
-                        webbrowser.open(result["url"])
+                    self._offer_update_install(result)
                 else:
                     messagebox.showinfo("Check for Update", f"You're up to date (v{APP_VERSION}).")
 
@@ -1133,33 +1396,21 @@ class App(tk.Tk):
         ttk.Button(btn_row, text="Apply", command=apply_and_notify).pack(side="right")
         ttk.Button(btn_row, text="Restart", command=do_restart).pack(side="right", padx=(0, 6))
 
-        # ------------------------------------------------------------------
-        # Footer credit
-        # ------------------------------------------------------------------
-        footer = ttk.Frame(body)
-        footer.pack(fill="x", pady=(12, 0))
-        tk.Label(footer, text="From Amasugi.", font=("Segoe UI", 8)).pack(anchor="center")
-        credit_link = tk.Label(footer, text="App Icon", font=("Segoe UI", 8, "underline"),
-                                fg="#3366cc", cursor="hand2")
-        credit_link.pack(anchor="center")
-        credit_link.bind(
-            "<Button-1>",
-            lambda e: webbrowser.open(
-                "https://www.deviantart.com/shingaishima/art/Taiko-no-Tatsujin-Don-and-Katsu-618160106"
-            ),
-        )
-
         # Re-position/re-size using the body's *actual* required height now
         # that every section is built, instead of the rough guess passed
         # above — a hand-picked pixel height silently clips whichever
         # section ends up at the bottom (the footer) as content is added or
-        # font metrics change, since this window is fixed-size/non-scrolling.
-        # A small buffer is added on top of the raw requested height since
-        # it can otherwise land a couple pixels short of what's actually
-        # needed once the window manager's own border/title-bar chrome is
-        # accounted for, clipping the last widget packed (the footer link).
+        # font metrics change. Measured off `body` itself (not `win`) since
+        # `body` now sits inside a canvas (see make_scrollable_toplevel_body)
+        # whose own reqheight doesn't follow its embedded content the way a
+        # plain Frame's would. Capped to the screen height minus a little
+        # margin — if content still doesn't fit even at that cap (e.g. the
+        # font-size setting above is cranked way up), the canvas's own
+        # scrollbar takes over rather than the window extending off-screen
+        # with the Apply/Restart row unreachable.
         win.update_idletasks()
-        _position_over_window(win, self, width=560, height=win.winfo_reqheight() + 16)
+        target_h = min(body.winfo_reqheight() + 16, win.winfo_screenheight() - 80)
+        _position_over_window(win, self, width=560, height=target_h)
 
         win.protocol("WM_DELETE_WINDOW", on_close)
         win.bind("<Escape>", lambda e: on_close())
@@ -1188,8 +1439,9 @@ class App(tk.Tk):
 
         pending = {"folder": self.osu_songs_folder or ""}
 
-        body = ttk.Frame(win)
-        body.pack(fill="both", expand=True, padx=20, pady=20)
+        from screens import make_scrollable_toplevel_body
+        body = make_scrollable_toplevel_body(win)
+        body.configure(padding=20)
 
         ttk.Label(body, text="First time setup", font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(0, 16))
 
@@ -1353,7 +1605,8 @@ class App(tk.Tk):
         ttk.Button(body, text="All set!", command=do_all_set).pack(anchor="center")
 
         win.update_idletasks()
-        _position_over_window(win, self, width=600, height=win.winfo_reqheight() + 16)
+        target_h = min(body.winfo_reqheight() + 16, win.winfo_screenheight() - 80)
+        _position_over_window(win, self, width=600, height=target_h)
 
         win.transient(self)
         win.lift()

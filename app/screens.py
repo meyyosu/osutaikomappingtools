@@ -558,6 +558,82 @@ def show_troubleshoot_window(master):
     win.grab_set()
 
 
+def make_scrollable_toplevel_body(win):
+    """Wraps a Toplevel's content in a vertically-scrolling canvas — for a
+    window whose content can end up taller than the screen (most notably
+    Settings, once the font-size option is cranked way up — see Settings
+    section 3), so whatever's below the fold (often the Apply/Restart row)
+    stays reachable via scrollbar/mouse wheel instead of running off-screen
+    with no way back. The scrollbar only appears once content actually
+    overflows the window, so a window that already fits looks exactly as
+    it did before. Returns a `ttk.Frame` to parent content into, as a
+    drop-in replacement for a plain `ttk.Frame(win)` — including a
+    `padding` option to reproduce whatever padx/pady margin the caller
+    used to apply on the old frame's own `.pack()` call, since that now
+    has to live on the frame itself rather than on how it's packed into
+    `win`. Mouse wheel is bound only while the pointer is over `win` (the
+    same Enter/Leave-toggled bind_all trick as SongSearchResultsWindow —
+    needed since the canvas itself ends up almost entirely covered by
+    embedded content, so binding wheel scroll on the bare canvas alone
+    doesn't work in practice)."""
+    outer = ttk.Frame(win)
+    outer.pack(fill="both", expand=True)
+
+    canvas = tk.Canvas(outer, highlightthickness=0,
+                        bg=ttk.Style().lookup("TFrame", "background") or None)
+    scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+
+    body = ttk.Frame(canvas)
+    window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+    def _update_scroll_state(_event=None):
+        bbox = canvas.bbox("all")
+        canvas.configure(scrollregion=bbox if bbox else (0, 0, 0, 0))
+        content_h = bbox[3] if bbox else 0
+        if content_h > canvas.winfo_height():
+            if not scrollbar.winfo_ismapped():
+                scrollbar.pack(side="right", fill="y")
+        elif scrollbar.winfo_ismapped():
+            scrollbar.pack_forget()
+
+    def _on_canvas_configure(event):
+        canvas.itemconfig(window_id, width=event.width)
+        _update_scroll_state()
+
+    body.bind("<Configure>", _update_scroll_state)
+    canvas.bind("<Configure>", _on_canvas_configure)
+
+    def _on_wheel(event):
+        # Nothing to scroll if content already fits — recomputed fresh
+        # rather than trusting the last Configure-triggered state (see the
+        # matching guard in BaseToolFrame for why).
+        _update_scroll_state()
+        if not scrollbar.winfo_ismapped():
+            return
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            canvas.yview_scroll(-3, "units")
+        elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+            canvas.yview_scroll(3, "units")
+
+    def _bind_wheel(_event=None):
+        win.bind_all("<MouseWheel>", _on_wheel)
+        win.bind_all("<Button-4>", _on_wheel)
+        win.bind_all("<Button-5>", _on_wheel)
+
+    def _unbind_wheel(_event=None):
+        win.unbind_all("<MouseWheel>")
+        win.unbind_all("<Button-4>")
+        win.unbind_all("<Button-5>")
+
+    win.bind("<Enter>", _bind_wheel)
+    win.bind("<Leave>", _unbind_wheel)
+    win.bind("<Destroy>", _unbind_wheel)
+
+    return body
+
+
 def add_apply_row(parent, command, button_text="Apply"):
     """Packs a right-anchored row with a 'The tool is not working?' help
     link next to the Apply button — the standard pattern at the bottom of
@@ -799,13 +875,101 @@ class DiffRadioList(ttk.LabelFrame):
 
 class BaseToolFrame(ttk.Frame):
     """Common scaffolding: `self.body` (where subclasses parent their
-    widgets) plus hooks that refresh diff lists when shown. `body` is just
-    `self` — no scrolling wrapper, kept as a plain frame."""
+    widgets) plus hooks that refresh diff lists when shown. `body` sits in
+    a vertically-scrolling canvas — a tool with enough options (or a large
+    enough font size, see Settings #3) that its content no longer fits the
+    window stays fully reachable via scrollbar/mouse wheel instead of
+    clipping whatever falls below the bottom edge. The scrollbar only
+    appears once content actually overflows (see _update_scroll_state), so
+    a tool that already fits looks exactly as it did before."""
 
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
-        self.body = self
+
+        bg = ttk.Style().lookup("TFrame", "background") or None
+        canvas = tk.Canvas(self, highlightthickness=0, bg=bg)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        self._scroll_canvas = canvas
+        self._scrollbar = scrollbar
+
+        self.body = ttk.Frame(canvas)
+        self._body_window = canvas.create_window((0, 0), window=self.body, anchor="nw")
+
+        self.body.bind("<Configure>", lambda _e: self._update_scroll_state())
+        canvas.bind("<Configure>", self._on_scroll_canvas_configure)
+
+        def _on_wheel(event):
+            # Only the tool actually on top should react — every
+            # BaseToolFrame instance stays alive (place()'d, never
+            # destroyed) behind whichever one is currently shown, so this
+            # guards against a hidden tool's own binding stealing the
+            # scroll.
+            if self.app.frames.get(getattr(self.app, "_current_frame_name", None)) is not self:
+                return
+            # Defer to a widget that already owns wheel scrolling itself
+            # (e.g. Pattern Gallery's horizontally-scrolling card row) —
+            # only its own instance-level binding counts here, not this
+            # bind_all fallback, so this check can't see itself.
+            if event.widget.bind("<MouseWheel>"):
+                return
+            # Nothing to scroll if this tool's content already fits —
+            # recomputed fresh rather than trusting the last Configure-
+            # triggered state, since a width change (from resizing the
+            # window) can reflow wrapped labels and change body's actual
+            # height before its own <Configure> has a chance to catch up.
+            # Without this, a tool that fits could still creep a few
+            # pixels on every wheel tick even with the scrollbar hidden.
+            self._update_scroll_state()
+            if not self._scrollbar.winfo_ismapped():
+                return
+            if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                canvas.yview_scroll(-3, "units")
+            elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                canvas.yview_scroll(3, "units")
+
+        def _bind_wheel(_event=None):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+            canvas.bind_all("<Button-4>", _on_wheel)
+            canvas.bind_all("<Button-5>", _on_wheel)
+
+        def _unbind_wheel(_event=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        self.bind("<Enter>", _bind_wheel)
+        self.bind("<Leave>", _unbind_wheel)
+
+    def _on_scroll_canvas_configure(self, event):
+        # Stretch body to the canvas's own width so content only ever
+        # needs to scroll vertically, never horizontally.
+        self._scroll_canvas.itemconfig(self._body_window, width=event.width)
+        self._update_scroll_state()
+
+    def _update_scroll_state(self):
+        canvas = self._scroll_canvas
+        canvas_h = canvas.winfo_height()
+        # body is stretched to at least the canvas's own visible height
+        # (not just its own natural content height) so a tool with sparse
+        # content and its own side="bottom"-anchored widgets (e.g.
+        # FrontPage's footer) still sits at the true bottom of the visible
+        # area — matching how it looked before body lived inside a
+        # scrolling canvas. Content genuinely taller than the canvas is
+        # unaffected, since max() just leaves it at its own larger height.
+        target_h = max(self.body.winfo_reqheight(), canvas_h)
+        canvas.itemconfig(self._body_window, height=target_h)
+        bbox = canvas.bbox("all")
+        canvas.configure(scrollregion=bbox if bbox else (0, 0, 0, 0))
+        content_h = bbox[3] if bbox else 0
+        if content_h > canvas_h:
+            if not self._scrollbar.winfo_ismapped():
+                self._scrollbar.pack(side="right", fill="y")
+        elif self._scrollbar.winfo_ismapped():
+            self._scrollbar.pack_forget()
+            canvas.yview_moveto(0)
 
     def on_shown(self):
         pass
@@ -845,12 +1009,16 @@ class FrontPage(BaseToolFrame):
         super().__init__(master, app)
 
         footer = ttk.Frame(self.body)
-        footer.pack(side="bottom", pady=(0, 30))
-        ttk.Label(footer, text="From Amasugi ❤ ", font=("Segoe UI", 9)).pack(side="left")
-        credit_link = tk.Label(footer, text="App Icon", font=("Segoe UI", 9, "underline"),
+        footer.pack(side="bottom", pady=(0, 10))
+        credit_row = ttk.Frame(footer)
+        credit_row.pack()
+        ttk.Label(credit_row, text="From Amasugi ❤ ", font=("Segoe UI", 9)).pack(side="left")
+        credit_link = tk.Label(credit_row, text="App Icon", font=("Segoe UI", 9, "underline"),
                                 fg="#3366cc", cursor="hand2")
         credit_link.pack(side="left")
         credit_link.bind("<Button-1>", lambda e: webbrowser.open(self.CREDIT_URL))
+        ttk.Label(footer, text=f"App Version: {getattr(app, 'app_version', '?')}",
+                  font=("Segoe UI", 8), foreground="#999999").pack(pady=(4, 0))
 
         content = ttk.Frame(self.body)
         content.pack(expand=True)
@@ -2859,8 +3027,8 @@ class ManualPatternWindow(tk.Toplevel):
       Clicking an empty tick places a note with the current "brush"
       (Don/Kat × Finisher/normal); clicking an existing note REPLACES it
       with the brush instead of selecting it. Right-click deletes
-      whichever note is under the cursor. R/E toggle the brush for notes
-      placed from now on.
+      whichever note is under the cursor. R/W (Don/Kat) and E (Finisher)
+      toggle the brush for notes placed from now on.
     - **Select** (hotkey 1): no phantom preview. Clicking a note selects
       it (yellow border) — Ctrl+click toggles a multi-selection,
       Shift+click range-selects, same model as PatternGalleryFrame's card
@@ -2868,8 +3036,9 @@ class ManualPatternWindow(tk.Toplevel):
       endpoints, preserving length, for a slider/spinner); dragging a
       slider/spinner's tail instead resizes it. Delete or right-click
       removes the current selection; Ctrl+D or clicking an empty tick
-      deselects. R/E retype whichever notes are currently selected, in
-      place (skipping fields that don't apply to a given kind).
+      deselects. R/W (Don/Kat) and E (Finisher) retype whichever notes are
+      currently selected, in place (skipping fields that don't apply to a
+      given kind).
     - **Special** (hotkeys 3 and 4): places a slider (drumroll) or spinner
       (balloon) via a click/move/click gesture instead of one click — the
       first click sets the head and the object stretches live to follow
@@ -3010,34 +3179,8 @@ class ManualPatternWindow(tk.Toplevel):
         status_row.pack(fill="x", padx=12, pady=(0, 4))
         self.status_var = tk.StringVar()
         ttk.Label(status_row, textvariable=self.status_var, font=("Segoe UI", 11, "bold")).pack(side="left")
-        InfoIcon(status_row, "Note mode (2) — click an empty tick to place "
-                              "a note, click an existing one to replace it "
-                              "with the current brush. Right-click deletes it.\n"
-                              "Select mode (1) — click a note/slider/spinner "
-                              "to select it (Ctrl/Shift to multi-select), or "
-                              "drag from empty space to box-select several "
-                              "at once. Drag a note's head or body to move "
-                              "it, drag its tail to change its length. "
-                              "Delete removes the selection; right-click "
-                              "deletes just the one object under the "
-                              "cursor, or the selection if it's over empty "
-                              "space. Ctrl+D or clicking (without dragging) "
-                              "an empty tick deselects.\n"
-                              "Special mode (3 or 4) — click to place the "
-                              "head of a slider (yellow) or spinner (gray), "
-                              "then move the cursor to stretch it out and "
-                              "click again to set its tail. Right-click "
-                              "cancels a placement in progress, or deletes "
-                              "an existing one. Press 3 or 4 again to "
-                              "switch between slider and spinner.\n"
-                              "R — toggle Don/Kat (Note/Select modes only). "
-                              "E — toggle Finisher (spinners have no "
-                              "finisher variant). In Note/Special mode "
-                              "these set the brush for future placements; "
-                              "in Select mode they retype whichever "
-                              "notes are selected.\n"
-                              "Ctrl+scroll over the timeline — change the "
-                              "snap divisor.").pack(side="left", padx=(6, 0))
+        InfoIcon(status_row, "The control is the same as on osu!stable's "
+                              "default.").pack(side="left", padx=(6, 0))
 
         canvas_w = self.MARGIN * 2 + self.BEATS_SHOWN * self.PX_PER_BEAT
         self.canvas = tk.Canvas(self, width=canvas_w, height=self.CANVAS_H, bg="white",
@@ -3052,11 +3195,13 @@ class ManualPatternWindow(tk.Toplevel):
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x", padx=12, pady=(0, 12))
         ttk.Button(btn_row, text="Save Pattern", command=self._save).pack(side="right")
-        ttk.Label(btn_row, text="E: finisher toggle, R: don/kat toggle",
+        ttk.Label(btn_row, text="R or W: don/kat toggle",
                   foreground="#777777", font=("Segoe UI", 9)).pack(side="left")
 
         self.bind("<r>", self._on_r_key)
         self.bind("<R>", self._on_r_key)
+        self.bind("<w>", self._on_r_key)
+        self.bind("<W>", self._on_r_key)
         self.bind("<e>", self._on_e_key)
         self.bind("<E>", self._on_e_key)
         self.bind("<Delete>", self._on_delete_key)
@@ -3217,8 +3362,8 @@ class ManualPatternWindow(tk.Toplevel):
 
     def _guard_focus(self) -> bool:
         """True while a text-entry-ish widget has keyboard focus — used to
-        keep R/E/Delete/the 1-2-3 mode hotkeys from hijacking normal typing
-        (e.g. in the name field)."""
+        keep R/W/E/Delete/the 1-2-3 mode hotkeys from hijacking normal
+        typing (e.g. in the name field)."""
         return isinstance(self.focus_get(), (tk.Entry, tk.Spinbox, tk.Text, ttk.Combobox))
 
     def _set_mode_hotkey(self, mode: str):
@@ -3908,12 +4053,25 @@ class PatternGalleryFrame(BaseToolFrame):
         add_header(self.body, "Pattern Gallery",
                    "Build up your own reusable pattern library")
 
-        capture_row = ttk.Frame(self.body)
-        capture_row.pack(fill="x", padx=10, pady=10)
-        ttk.Label(capture_row, text="Pattern name:").pack(side="left")
+        # Split across two rows — at a big enough font size or narrow
+        # enough window, cramming the name field, both buttons, and the
+        # info icon onto one line pushed "Manually Add Pattern" (and
+        # sometimes "Capture from osu!" too) out past the tool body's
+        # actual visible width with no way to reach it. `width=20` (down
+        # from the original 30) is still safely under the available width
+        # even at the largest font-size setting and the app's minimum
+        # window size — no need for fill/expand to guarantee that here,
+        # so the field can stay a normal, un-stretched size instead of
+        # ballooning to fill whatever room a wide window leaves over.
+        name_row = ttk.Frame(self.body)
+        name_row.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(name_row, text="Pattern name:").pack(side="left")
         self.name_var = tk.StringVar()
-        self.name_entry = ttk.Entry(capture_row, textvariable=self.name_var, width=30)
+        self.name_entry = ttk.Entry(name_row, textvariable=self.name_var, width=20)
         self.name_entry.pack(side="left", padx=5)
+
+        capture_row = ttk.Frame(self.body)
+        capture_row.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(capture_row, text="Capture from osu!", command=self.capture).pack(side="left", padx=5)
         InfoIcon(capture_row, "To capture pattern from osu!, copy it and "
                                "save the map. Then click the button to "
@@ -4715,7 +4873,11 @@ class FileNameCheckerFrame(BaseToolFrame):
         self.diff_list = DiffCheckList(self.body, app)
         self.diff_list.pack(fill="both", expand=True, padx=10, pady=5)
 
-        self.result_text = tk.Text(self.body, height=10, wrap="word", font=("Segoe UI", 14))
+        # "word" wrap can't break a single unbroken "word" — and a file
+        # name here often has no spaces (underscores instead), so a long
+        # one would just run past the widget's right edge instead of
+        # wrapping. "char" guarantees a wrap point regardless.
+        self.result_text = tk.Text(self.body, height=10, wrap="char", font=("Segoe UI", 14))
         self.result_text.pack(fill="both", expand=False, padx=10, pady=5)
 
         btns = ttk.Frame(self.body)
