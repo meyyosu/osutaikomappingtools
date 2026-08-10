@@ -3241,7 +3241,7 @@ class ManualPatternWindow(tk.Toplevel):
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x", padx=12, pady=(0, 12))
         ttk.Button(btn_row, text="Save Pattern", command=self._save).pack(side="right")
-        ttk.Label(btn_row, text="R or W: don/kat toggle",
+        ttk.Label(btn_row, text="E: finisher toggle - R or W: don/kat toggle",
                   foreground="#777777", font=("Segoe UI", 9)).pack(side="left")
 
         self.bind("<r>", self._on_r_key)
