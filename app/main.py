@@ -58,9 +58,21 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+
+# Shell palette (title bar + sidebar + front page only — individual tool
+# screens intentionally keep their existing default ttk look).
+UI_BG = "#ffffff"
+UI_SOFT = "#f2f3f8"
+UI_SOFT_HOVER = "#e8eaf5"
+UI_BORDER = "#e9e9f1"
+UI_TEXT = "#22252f"
+UI_TEXT_MUTED = "#8b8fa3"
+UI_ACCENT = "#4f46e5"
+UI_ACCENT_HOVER = "#433bd0"
+UI_ACCENT_SOFT = "#eef0fd"
 
 
 def _version_tuple(v: str):
@@ -315,7 +327,6 @@ SIDEBAR_ITEMS = [
 ]
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_config.txt")
-FONT_SIZE_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_fontsize.txt")
 SONG_INDEX_MODE_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_indexmode.txt")
 CONFIRM_PATTERN_DELETE_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_confirmdelete.txt")
 LIVE_SYNC_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_livesync.txt")
@@ -339,7 +350,6 @@ DEFAULT_WINDOW_GEOMETRY = "1500x950+50+20"
 # back to the default every single launch.
 _GEOMETRY_RE = re.compile(r"^\d+x\d+[+-]-?\d+[+-]-?\d+$")
 
-TEXT_SIZE_OPTIONS = [("Small", 10), ("Default", 14), ("Medium", 17), ("Large", 20), ("Grandma", 25)]
 SONG_INDEX_MODE_OPTIONS = [
     ("manual", "Manual Index"),
     ("partial", "Partial Index"),
@@ -360,22 +370,6 @@ def save_osu_folder_config(path: str):
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             f.write(path)
-    except OSError:
-        pass
-
-
-def load_font_size_config() -> int:
-    try:
-        with open(FONT_SIZE_CONFIG_PATH, "r", encoding="utf-8") as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return 14
-
-
-def save_font_size_config(size: int):
-    try:
-        with open(FONT_SIZE_CONFIG_PATH, "w", encoding="utf-8") as f:
-            f.write(str(size))
     except OSError:
         pass
 
@@ -538,8 +532,7 @@ class App(tk.Tk):
         self.geometry(load_window_geometry_config())
         self.minsize(900, 550)
         self._set_app_icon()
-        self.current_font_size = load_font_size_config()
-        self._scale_up_fonts(self.current_font_size)
+        self._scale_up_fonts()
 
         self.osu_songs_folder = load_osu_folder_config() or guess_osu_stable_songs_folder()
         self.song_index_mode = load_song_index_mode()
@@ -909,21 +902,47 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
 
+    def _make_icon_button(self, parent, text, command, font=("Segoe UI Emoji", 11)):
+        """Small flat square icon button matching the shell's light-gray
+        pill styling (search box, "Now Selecting" pill, sidebar)."""
+        return tk.Button(parent, text=text, command=command, font=font,
+                          bg=UI_SOFT, activebackground=UI_SOFT_HOVER,
+                          fg=UI_TEXT, activeforeground=UI_TEXT,
+                          relief="flat", bd=0, cursor="hand2",
+                          width=3, height=1, padx=2, pady=6)
+
+    def _make_accent_button(self, parent, text, command):
+        """Prominent filled indigo pill button - "Start Indexing" /
+        "Index Full Library", the shell's one primary call-to-action."""
+        return tk.Button(parent, text=text, command=command,
+                          font=("Segoe UI", 11, "bold"),
+                          bg=UI_ACCENT, activebackground=UI_ACCENT_HOVER,
+                          fg="#ffffff", activeforeground="#ffffff",
+                          relief="flat", bd=0, cursor="hand2",
+                          padx=16, pady=8)
+
     def _build_titlebar(self):
-        bar = ttk.Frame(self)
+        bar = tk.Frame(self, bg=UI_BG)
         bar.pack(side="top", fill="x")
 
+        search_wrap = tk.Frame(bar, bg=UI_SOFT, highlightthickness=1,
+                                highlightbackground=UI_BORDER, highlightcolor=UI_BORDER)
+        search_wrap.pack(side="left", padx=(14, 8), pady=13)
+
         self.search_var = tk.StringVar(value="Search osu! map...")
-        search_entry = ttk.Entry(bar, width=20, textvariable=self.search_var)
-        search_entry.pack(side="left", padx=(6, 4), pady=4)
+        search_entry = tk.Entry(search_wrap, width=20, textvariable=self.search_var,
+                                 relief="flat", bd=0, bg=UI_SOFT, fg=UI_TEXT,
+                                 insertbackground=UI_TEXT, font=("Segoe UI", 11))
+        search_entry.pack(side="left", padx=(10, 4), pady=8)
         search_entry.bind("<Return>", lambda e: self._on_search())
         search_entry.bind("<FocusIn>", self._on_search_focus_in)
         self.search_entry = search_entry
 
-        icon_font = ("Segoe UI Emoji", 12)
-        search_btn = ttk.Button(bar, text="🔍", width=3, command=self._on_search)
-        search_btn.pack(side="left")
-        search_btn.configure(style="Icon.TButton")
+        search_btn = tk.Button(search_wrap, text="🔍", command=self._on_search,
+                                font=("Segoe UI Emoji", 10), bg=UI_SOFT, activebackground=UI_SOFT,
+                                fg=UI_TEXT_MUTED, activeforeground=UI_TEXT_MUTED,
+                                relief="flat", bd=0, cursor="hand2", padx=8)
+        search_btn.pack(side="left", padx=(0, 6))
         self.search_btn = search_btn
 
         def _search_tooltip_text():
@@ -940,11 +959,11 @@ class App(tk.Tk):
         # Indexing status (progress bar + label), hidden until a Songs
         # folder index build actually starts. The "index full library"
         # button lives in this same spot when nothing else needs it.
-        self.index_status_frame = ttk.Frame(bar)
+        self.index_status_frame = tk.Frame(bar, bg=UI_BG)
         self.index_progress = ttk.Progressbar(self.index_status_frame, mode="indeterminate", length=80)
         self.index_status_var = tk.StringVar(value="")
-        self.index_status_label = ttk.Label(self.index_status_frame, textvariable=self.index_status_var,
-                                             foreground="#666666")
+        self.index_status_label = tk.Label(self.index_status_frame, textvariable=self.index_status_var,
+                                            bg=UI_BG, fg=UI_TEXT_MUTED, font=("Segoe UI", 10))
         self.index_status_label.pack(side="left")
 
         def _index_tooltip_text():
@@ -956,58 +975,57 @@ class App(tk.Tk):
 
         _add_tooltip(self.index_progress, _index_tooltip_text, align="right")
         _add_tooltip(self.index_status_label, _index_tooltip_text, align="right")
-        self.index_full_button = ttk.Button(self.index_status_frame, text="Index Full Library",
-                                             command=lambda: self.build_song_index(full=True))
+        self.index_full_button = self._make_accent_button(
+            self.index_status_frame, "Index Full Library",
+            lambda: self.build_song_index(full=True))
         _add_tooltip(self.index_full_button,
                      "100 most recently imported osu!taiko maps have been "
                      "indexed for search.\nClick this button to fully index "
                      "your entire osu! song folder.", align="right")
 
-        self.start_indexing_button = ttk.Button(self.index_status_frame, text="Start Indexing",
-                                                 command=self._on_start_indexing_clicked)
+        self.start_indexing_button = self._make_accent_button(
+            self.index_status_frame, "▶  Start Indexing", self._on_start_indexing_clicked)
         _add_tooltip(self.start_indexing_button,
                      "Click this button to index the 100 most recently "
                      "imported taiko maps", align="right")
 
-        folder_btn = ttk.Button(bar, text="📁", width=3, command=self.browse_for_map_folder,
-                                 style="Icon.TButton")
-        folder_btn.pack(side="left", padx=2)
+        folder_btn = self._make_icon_button(bar, "📁", self.browse_for_map_folder)
+        folder_btn.pack(side="left", padx=(0, 6), pady=13)
         _add_tooltip(folder_btn, "Open map manually", align="center")
 
-        lightning_btn = ttk.Button(bar, text="📡", width=3, command=self.pickup_current_map,
-                                    style="Icon.TButton")
-        lightning_btn.pack(side="left", padx=2)
+        lightning_btn = self._make_icon_button(bar, "📡", self.pickup_current_map)
+        lightning_btn.pack(side="left", padx=(0, 6), pady=13)
         _add_tooltip(lightning_btn, "Open map from osu!", align="center")
 
-        style = ttk.Style()
-        style.configure("Icon.TButton", font=icon_font)
-
-        title_lbl = ttk.Label(bar, textvariable=self.now_selecting_var, anchor="w",
-                               relief="sunken", padding=4, justify="left")
-        title_lbl.pack(side="left", fill="x", expand=True, padx=4)
+        title_lbl = tk.Label(bar, textvariable=self.now_selecting_var, anchor="w",
+                              justify="left", bg=UI_SOFT, fg=UI_TEXT, font=("Segoe UI", 11),
+                              padx=16, pady=10, highlightthickness=1,
+                              highlightbackground=UI_BORDER, highlightcolor=UI_BORDER)
+        title_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=13)
         self._titlebar = bar
         self._now_selecting_label = title_lbl
 
-        romanise_btn = ttk.Button(bar, text="あ", width=3, command=self.toggle_metadata_display)
-        romanise_btn.pack(side="left", padx=(0, 4))
+        romanise_btn = self._make_icon_button(bar, "あ", self.toggle_metadata_display,
+                                               font=("Segoe UI", 11))
+        romanise_btn.pack(side="left", padx=(0, 6), pady=13)
         _add_tooltip(romanise_btn, "Romanisation Toggle", align="center")
 
-        open_folder_btn = ttk.Button(bar, text="📂", width=3, command=self.open_current_map_folder,
-                                      style="Icon.TButton")
-        open_folder_btn.pack(side="left", padx=(0, 4))
+        open_folder_btn = self._make_icon_button(bar, "📂", self.open_current_map_folder)
+        open_folder_btn.pack(side="left", padx=(0, 6), pady=13)
         _add_tooltip(open_folder_btn, "Open currently selected song folder", align="center")
 
-        beatmap_link_btn = ttk.Button(bar, text="🔗", width=3, command=self.open_beatmap_page,
-                                       style="Icon.TButton")
-        beatmap_link_btn.pack(side="left", padx=(0, 4))
+        beatmap_link_btn = self._make_icon_button(bar, "🔗", self.open_beatmap_page)
+        beatmap_link_btn.pack(side="left", padx=(0, 6), pady=13)
         _add_tooltip(beatmap_link_btn, "Open beatmap page", align="center")
 
-        settings_btn = ttk.Button(bar, text="⚙", width=3, command=self.open_settings, style="Icon.TButton")
-        settings_btn.pack(side="left", padx=(10, 4))
+        settings_btn = self._make_icon_button(bar, "⚙", self.open_settings)
+        settings_btn.pack(side="left", padx=(0, 14), pady=13)
         _add_tooltip(settings_btn, "Settings", align="center")
 
         # No custom minimize/maximize/close buttons — the OS window chrome
         # already provides these; duplicating them here was redundant.
+
+        tk.Frame(self, bg=UI_BORDER, height=1).pack(side="top", fill="x")
 
         # Keeps the "Now Selecting" label from pushing every button to its
         # right out of the visible window once a map's title is long — the
@@ -1052,51 +1070,75 @@ class App(tk.Tk):
             self._settings_win.lift()
             self._settings_win.focus_force()
             return
+        from screens import (make_scrollable_toplevel_body, InfoIcon, show_toast, RoundedCard,
+                              LightCheckbox, LightRadiobutton, _make_light_entry,
+                              _make_accent_button, _make_ghost_button,
+                              FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
+
         win = tk.Toplevel(self)
         win.title("Settings")
+        win.configure(bg=FRONT_BG)
         win.resizable(False, False)
-        _position_over_window(win, self, width=560, height=780)
+        _position_over_window(win, self, width=580, height=780)
 
         # Staged values — nothing here actually takes effect (or gets
         # written to disk) until Apply/Restart is clicked.
         pending = {
             "folder": self.osu_songs_folder or "",
-            "font_size": getattr(self, "current_font_size", 14),
             "index_mode": self.song_index_mode,
             "confirm_pattern_delete": self.confirm_pattern_delete,
             "live_sync": self.live_sync_enabled,
         }
 
-        from screens import make_scrollable_toplevel_body
-        body = make_scrollable_toplevel_body(win)
-        body.configure(padding=16)
+        body = make_scrollable_toplevel_body(win, bg=FRONT_BG)
+        body.configure(padding=20)
+
+        tk.Label(body, text="Settings", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(0, 16))
+
+        def section_card():
+            card = RoundedCard(body)
+            card.pack(fill="x", pady=(0, 16))
+            return card
+
+        def section_heading(parent, text, info_text=None):
+            row = tk.Frame(parent, bg=FRONT_CARD_BG)
+            row.pack(fill="x", anchor="w", pady=(0, 10))
+            tk.Label(row, text=text, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                     font=("Segoe UI", 14, "bold")).pack(side="left")
+            if info_text:
+                icon = InfoIcon(row, info_text)
+                icon.configure(bg=FRONT_CARD_BG)
+                icon.pack(side="left", padx=(6, 0))
 
         # ------------------------------------------------------------------
-        # 1. Set osu! Song Folder
+        # 1. osu! Song Folder
         # ------------------------------------------------------------------
-        ttk.Label(body, text="1. Set osu! Song Folder", font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(0, 4))
+        folder_card = section_card()
+        section_heading(folder_card.body, "1. osu! Song Folder")
 
         status_var = tk.StringVar()
-        status_label = tk.Label(body, textvariable=status_var, fg="red", wraplength=520, justify="left")
-        status_label.pack(anchor="w", pady=(0, 8))
+        status_label = tk.Label(folder_card.body, textvariable=status_var, bg=FRONT_CARD_BG,
+                                 wraplength=490, justify="left", font=("Segoe UI", 10))
+        status_label.pack(anchor="w", pady=(0, 10))
 
         def refresh_status():
             if pending["folder"] and os.path.isdir(pending["folder"]):
                 status_var.set(f"osu! Songs folder is set to {pending['folder']}")
-                status_label.configure(fg="black")
+                status_label.configure(fg=FRONT_TEXT_MUTED)
             else:
                 status_var.set("osu! Songs folder is not set yet.")
-                status_label.configure(fg="red")
+                status_label.configure(fg="#d9455f")
+            folder_card.redraw()
 
-        refresh_status()
-
-        folder_row = ttk.Frame(body)
-        folder_row.pack(fill="x", pady=(0, 12))
+        folder_row = tk.Frame(folder_card.body, bg=FRONT_CARD_BG)
+        folder_row.pack(fill="x")
         folder_var = tk.StringVar(value=pending["folder"])
-        folder_entry = ttk.Entry(folder_row, textvariable=folder_var)
-        folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        folder_entry = _make_light_entry(folder_row, textvariable=folder_var)
+        folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
 
-        set_btn = ttk.Button(folder_row, text="Set", state="disabled")
+        set_btn = _make_accent_button(folder_row, "Set", lambda: None)
+        set_btn.configure(state="disabled")
 
         def do_set():
             path = folder_var.get().strip()
@@ -1121,46 +1163,39 @@ class App(tk.Tk):
                 folder_var.set(chosen)
                 set_btn.configure(state="normal")
 
-        ttk.Button(folder_row, text="Browse Folder", command=browse).pack(side="left", padx=(0, 6))
+        _make_ghost_button(folder_row, "Browse", browse).pack(side="left", padx=(0, 8))
         set_btn.pack(side="left")
 
         # Typing directly in the field should also re-enable Set, in case
         # someone pastes/edits a path instead of using Browse.
         folder_var.trace_add("write", lambda *a: set_btn.configure(state="normal"))
 
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=12)
+        refresh_status()
 
         # ------------------------------------------------------------------
         # 2. Live-sync song select
         # ------------------------------------------------------------------
-        ttk.Label(body, text="2. Live-sync song select",
-                  font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(0, 4))
+        sync_card = section_card()
+        section_heading(sync_card.body, "2. Live-sync Song Select")
 
         live_sync_var = tk.StringVar(value="auto" if pending["live_sync"] else "manual")
 
         def on_live_sync_change():
             pending["live_sync"] = (live_sync_var.get() == "auto")
 
-        ttk.Radiobutton(body, text="Automatically detect selected song in osu!", value="auto",
-                         variable=live_sync_var, command=on_live_sync_change).pack(anchor="w", pady=1)
-        ttk.Radiobutton(body, text="Load song manually", value="manual",
-                         variable=live_sync_var, command=on_live_sync_change).pack(anchor="w", pady=1)
-
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=12)
+        LightRadiobutton(sync_card.body, "Automatically detect selected song in osu!",
+                          live_sync_var, "auto", command=on_live_sync_change).pack(anchor="w", pady=3)
+        LightRadiobutton(sync_card.body, "Load song manually",
+                          live_sync_var, "manual", command=on_live_sync_change).pack(anchor="w", pady=3)
 
         # ------------------------------------------------------------------
         # 3. Song Index on Startup
         # ------------------------------------------------------------------
-        from screens import InfoIcon
-
-        index_header_row = ttk.Frame(body)
-        index_header_row.pack(anchor="w", pady=(0, 4))
-        ttk.Label(index_header_row, text="3. Song Index on Startup",
-                  font=("Segoe UI", 18, "bold")).pack(side="left")
-        InfoIcon(index_header_row,
-                 "- Manual: Disable auto-indexing\n"
-                 "- Partial: Auto-index 100 most recent taiko maps\n"
-                 "- Full: Auto-index your entire songs folder").pack(side="left", padx=(6, 0))
+        index_card = section_card()
+        section_heading(index_card.body, "3. Song Index on Startup",
+                         "- Manual: Disable auto-indexing\n"
+                         "- Partial: Auto-index 100 most recent taiko maps\n"
+                         "- Full: Auto-index your entire songs folder")
 
         index_mode_var = tk.StringVar(value=pending["index_mode"])
 
@@ -1168,41 +1203,38 @@ class App(tk.Tk):
             pending["index_mode"] = index_mode_var.get()
 
         for value, label in SONG_INDEX_MODE_OPTIONS:
-            ttk.Radiobutton(body, text=label, value=value, variable=index_mode_var,
-                             command=on_index_mode_change).pack(anchor="w", pady=1)
-
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=12)
+            LightRadiobutton(index_card.body, label, index_mode_var, value,
+                              command=on_index_mode_change).pack(anchor="w", pady=3)
 
         # ------------------------------------------------------------------
         # 4. Confirm Gallery Pattern Deletion
         # ------------------------------------------------------------------
-        ttk.Label(body, text="4. Confirm Gallery Pattern Deletion", font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(0, 4))
+        confirm_card = section_card()
+        section_heading(confirm_card.body, "4. Confirm Gallery Pattern Deletion")
 
         disable_warning_var = tk.BooleanVar(value=not pending["confirm_pattern_delete"])
 
         def on_disable_warning_change():
             pending["confirm_pattern_delete"] = not disable_warning_var.get()
 
-        ttk.Checkbutton(body, text="Disable warning when deleting patterns in gallery.", variable=disable_warning_var,
-                         command=on_disable_warning_change).pack(anchor="w", pady=(0, 4))
-
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=12)
+        LightCheckbox(confirm_card.body, "Disable warning when deleting patterns in gallery.",
+                      disable_warning_var, command=on_disable_warning_change).pack(anchor="w")
 
         # ------------------------------------------------------------------
         # 5. Download resources
         # ------------------------------------------------------------------
-        download_header_row = ttk.Frame(body)
-        download_header_row.pack(anchor="w", pady=(0, 4))
-        ttk.Label(download_header_row, text="5. Download resources",
-                  font=("Segoe UI", 18, "bold")).pack(side="left")
-        InfoIcon(download_header_row,
-                 "Including\n\n"
-                 "- ffmpeg + ffprobe\n"
-                 "- VLC Player").pack(side="left", padx=(6, 0))
+        download_card = section_card()
+        section_heading(download_card.body, "5. Download Resources",
+                         "Including\n\n"
+                         "- ffmpeg + ffprobe\n"
+                         "- VLC Player")
 
-        ttk.Label(body, text="They are required to use certain tools.").pack(anchor="w", pady=(0, 6))
+        tk.Label(download_card.body, text="They are required to use certain tools.",
+                 bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
 
-        download_btn = ttk.Button(body, text="Install Automatically")
+        download_btn = _make_ghost_button(download_card.body, "Install Automatically",
+                                           lambda: do_install_resources())
+        download_btn.pack(anchor="w")
 
         def do_install_resources():
             original_text = "Install Automatically"
@@ -1220,6 +1252,7 @@ class App(tk.Tk):
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
+            download_card.redraw()
 
             def work(cancel_event):
                 errors = []
@@ -1242,6 +1275,7 @@ class App(tk.Tk):
             def reset_button():
                 if download_btn.winfo_exists():
                     download_btn.configure(state="normal", text=original_text)
+                    download_card.redraw()
 
             def on_success(result):
                 installed, errors = result
@@ -1263,90 +1297,11 @@ class App(tk.Tk):
                 cancelled_toast="Installation Cancelled!",
             )
 
-        download_btn.configure(command=do_install_resources)
-        download_btn.pack(anchor="w")
-
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=12)
-
-        # ------------------------------------------------------------------
-        # 6. Text Size
-        # ------------------------------------------------------------------
-        ttk.Label(body, text="6. Text Size", font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(0, 4))
-
-        default_idx = 1
-        for i, (_name, size) in enumerate(TEXT_SIZE_OPTIONS):
-            if size == pending["font_size"]:
-                default_idx = i
-                break
-
-        current_label_var = tk.StringVar()
-
-        def _label_for(idx):
-            name, _size = TEXT_SIZE_OPTIONS[idx]
-            return f"Selected: {name}"
-
-        current_label_var.set(_label_for(default_idx))
-        ttk.Label(body, textvariable=current_label_var).pack(anchor="w", pady=(0, 4))
-
-        # showvalue/tickinterval off — the numeric 0..4 index means nothing
-        # to the user; the Small/Default/Medium/Large/Grandma row below the
-        # slider is the only labeling that should show.
-        scale = tk.Scale(body, from_=0, to=len(TEXT_SIZE_OPTIONS) - 1, resolution=1,
-                          orient="horizontal", showvalue=False, length=440, tickinterval=0)
-        scale.set(default_idx)
-        scale.pack(anchor="w")
-
-        names_row = tk.Frame(body)
-        names_row.pack(anchor="w")
-        name_labels = []
-        for name, _size in TEXT_SIZE_OPTIONS:
-            lbl = tk.Label(names_row, text=name, font=("Segoe UI", 10))
-            name_labels.append(lbl)
-
-        def position_name_labels():
-            """Places each name label so its horizontal center lines up
-            with the slider's actual tick position for that value — not
-            just evenly spread across the row, which doesn't match where
-            the slider itself actually stops at each notch (its ends are
-            inset by half the thumb's width). The first/last labels anchor
-            by their edge instead of their center, so "Grandma" (the
-            widest name) doesn't overflow past the row's right edge and
-            get clipped — it still lines up with that tick, just growing
-            inward instead of spilling off both sides of it.
-            """
-            scale.update_idletasks()
-            width = scale.winfo_width()
-            thumb = 30  # tk.Scale's default sliderlength
-            names_row.configure(width=width, height=22)
-            names_row.pack_propagate(False)
-            usable = max(1, width - thumb)
-            n = len(TEXT_SIZE_OPTIONS)
-            for i, lbl in enumerate(name_labels):
-                x = thumb / 2 + i * usable / (n - 1)
-                if i == 0:
-                    lbl.place(x=x, y=0, anchor="nw")
-                elif i == n - 1:
-                    lbl.place(x=x, y=0, anchor="ne")
-                else:
-                    lbl.place(x=x, y=0, anchor="n")
-
-        win.after(1, position_name_labels)
-
-        def on_slider_move(val):
-            # Only stages the choice and updates the preview label — no
-            # live font change and no save until Apply/Restart.
-            idx = int(round(float(val)))
-            current_label_var.set(_label_for(idx))
-            pending["font_size"] = TEXT_SIZE_OPTIONS[idx][1]
-
-        scale.configure(command=on_slider_move)
-
         # ------------------------------------------------------------------
         # Apply / Restart
         # ------------------------------------------------------------------
         def has_unsaved_changes():
             return (pending["folder"] != (self.osu_songs_folder or "")
-                    or pending["font_size"] != getattr(self, "current_font_size", 14)
                     or pending["index_mode"] != self.song_index_mode
                     or pending["confirm_pattern_delete"] != self.confirm_pattern_delete
                     or pending["live_sync"] != self.live_sync_enabled)
@@ -1370,10 +1325,6 @@ class App(tk.Tk):
                 # selected mode instead of waiting for some other trigger.
                 self._start_indexing_per_mode()
             self._refresh_manual_index_button()
-            if pending["font_size"] != getattr(self, "current_font_size", 14):
-                self.current_font_size = pending["font_size"]
-                self._scale_up_fonts(pending["font_size"])
-                save_font_size_config(pending["font_size"])
             if pending["confirm_pattern_delete"] != self.confirm_pattern_delete:
                 self.confirm_pattern_delete = pending["confirm_pattern_delete"]
                 save_confirm_pattern_delete(pending["confirm_pattern_delete"])
@@ -1382,7 +1333,6 @@ class App(tk.Tk):
 
         def apply_and_notify():
             do_apply()
-            from screens import show_toast
             show_toast(win, "Settings Applied", display_ms=1000)
 
         def do_restart():
@@ -1437,12 +1387,12 @@ class App(tk.Tk):
 
             self._check_for_update_async(done)
 
-        btn_row = ttk.Frame(body)
-        btn_row.pack(fill="x", pady=(16, 0))
-        check_update_btn = ttk.Button(btn_row, text="Check for Update", command=do_check_for_update)
+        btn_row = tk.Frame(body, bg=FRONT_BG)
+        btn_row.pack(fill="x", pady=(4, 0))
+        check_update_btn = _make_ghost_button(btn_row, "Check for Update", do_check_for_update)
         check_update_btn.pack(side="left")
-        ttk.Button(btn_row, text="Apply", command=apply_and_notify).pack(side="right")
-        ttk.Button(btn_row, text="Restart", command=do_restart).pack(side="right", padx=(0, 6))
+        _make_accent_button(btn_row, "Apply", apply_and_notify).pack(side="right")
+        _make_ghost_button(btn_row, "Restart", do_restart).pack(side="right", padx=(0, 8))
 
         # Re-position/re-size using the body's *actual* required height now
         # that every section is built, instead of the rough guess passed
@@ -1452,13 +1402,12 @@ class App(tk.Tk):
         # `body` now sits inside a canvas (see make_scrollable_toplevel_body)
         # whose own reqheight doesn't follow its embedded content the way a
         # plain Frame's would. Capped to the screen height minus a little
-        # margin — if content still doesn't fit even at that cap (e.g. the
-        # font-size setting above is cranked way up), the canvas's own
-        # scrollbar takes over rather than the window extending off-screen
-        # with the Apply/Restart row unreachable.
+        # margin — if content still doesn't fit even at that cap, the
+        # canvas's own scrollbar takes over rather than the window
+        # extending off-screen with the Apply/Restart row unreachable.
         win.update_idletasks()
         target_h = min(body.winfo_reqheight() + 16, win.winfo_screenheight() - 80)
-        _position_over_window(win, self, width=560, height=target_h)
+        _position_over_window(win, self, width=580, height=target_h)
 
         win.protocol("WM_DELETE_WINDOW", on_close)
         win.bind("<Escape>", lambda e: on_close())
@@ -1481,44 +1430,66 @@ class App(tk.Tk):
             existing.lift()
             existing.focus_force()
             return
+        from screens import (make_scrollable_toplevel_body, InfoIcon, show_toast, RoundedCard,
+                              _make_light_entry, _make_accent_button, _make_ghost_button,
+                              FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
+
         win = tk.Toplevel(self)
         win.title("First time setup")
+        win.configure(bg=FRONT_BG)
         win.resizable(False, False)
 
         pending = {"folder": self.osu_songs_folder or ""}
 
-        from screens import make_scrollable_toplevel_body
-        body = make_scrollable_toplevel_body(win)
+        body = make_scrollable_toplevel_body(win, bg=FRONT_BG)
         body.configure(padding=20)
 
-        ttk.Label(body, text="First time setup", font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(0, 16))
+        tk.Label(body, text="First time setup", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(0, 16))
+
+        def section_card():
+            card = RoundedCard(body)
+            card.pack(fill="x", pady=(0, 16))
+            return card
+
+        def section_heading(parent, text, info_text=None):
+            row = tk.Frame(parent, bg=FRONT_CARD_BG)
+            row.pack(fill="x", anchor="w", pady=(0, 10))
+            tk.Label(row, text=text, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                     font=("Segoe UI", 14, "bold")).pack(side="left")
+            if info_text:
+                icon = InfoIcon(row, info_text)
+                icon.configure(bg=FRONT_CARD_BG)
+                icon.pack(side="left", padx=(6, 0))
 
         # ------------------------------------------------------------------
         # 1. Choose your osu! Songs folder
         # ------------------------------------------------------------------
-        ttk.Label(body, text="1. Choose your osu! Songs folder",
-                  font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 8))
+        folder_card = section_card()
+        section_heading(folder_card.body, "1. Choose your osu! Songs folder")
 
-        folder_row = ttk.Frame(body)
-        folder_row.pack(fill="x", pady=(0, 6))
+        folder_row = tk.Frame(folder_card.body, bg=FRONT_CARD_BG)
+        folder_row.pack(fill="x")
         folder_var = tk.StringVar(value=pending["folder"])
-        folder_entry = ttk.Entry(folder_row, textvariable=folder_var)
-        folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        folder_entry = _make_light_entry(folder_row, textvariable=folder_var)
+        folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
 
-        set_btn = ttk.Button(folder_row, text="Set", state="disabled")
+        set_btn = _make_accent_button(folder_row, "Set", lambda: None)
+        set_btn.configure(state="disabled")
 
         status_var = tk.StringVar()
-        status_label = tk.Label(body, textvariable=status_var, fg="red", wraplength=540, justify="left")
-        status_label.pack(anchor="w", pady=(0, 16))
+        status_label = tk.Label(folder_card.body, textvariable=status_var, bg=FRONT_CARD_BG,
+                                 fg=FRONT_TEXT_MUTED, wraplength=490, justify="left",
+                                 font=("Segoe UI", 10))
 
         def refresh_status():
             if pending["folder"] and os.path.isdir(pending["folder"]):
                 status_var.set(f"osu! Songs folder has been set to {pending['folder']}")
-                status_label.configure(fg="black")
+                status_label.pack(anchor="w", pady=(10, 0))
             else:
                 status_var.set("")
-
-        refresh_status()
+                status_label.pack_forget()
+            folder_card.redraw()
 
         def do_set():
             path = folder_var.get().strip()
@@ -1543,34 +1514,32 @@ class App(tk.Tk):
                 folder_var.set(chosen)
                 set_btn.configure(state="normal")
 
-        ttk.Button(folder_row, text="Browse", command=browse).pack(side="left", padx=(0, 6))
+        _make_ghost_button(folder_row, "Browse", browse).pack(side="left", padx=(0, 8))
         set_btn.pack(side="left")
 
         # Typing directly in the field should also re-enable Set, in case
         # someone pastes/edits a path instead of using Browse.
         folder_var.trace_add("write", lambda *a: set_btn.configure(state="normal"))
 
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=(0, 16))
+        refresh_status()
 
         # ------------------------------------------------------------------
         # 2. Download extra resources
         # ------------------------------------------------------------------
-        from screens import InfoIcon, show_toast
+        download_card = section_card()
+        section_heading(download_card.body, "2. Download Extra Resources",
+                         "Including:\n\n"
+                         "- ffmpeg + ffprobe\n"
+                         "- VLC Player")
 
-        download_header_row = ttk.Frame(body)
-        download_header_row.pack(anchor="w", pady=(0, 4))
-        ttk.Label(download_header_row, text="2. Download extra resources",
-                  font=("Segoe UI", 14, "bold")).pack(side="left")
-        InfoIcon(download_header_row,
-                 "Including:\n\n"
-                 "- ffmpeg + ffprobe\n"
-                 "- VLC Player").pack(side="left", padx=(6, 0))
+        tk.Label(download_card.body, text="These are required to run certain features in this tool. "
+                                           "You can install them now or later in Settings.",
+                 bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED, wraplength=490, justify="left",
+                 font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
 
-        ttk.Label(body, text="These are required to run certain features in this tool. "
-                              "You can install them now or later in Settings.",
-                  wraplength=540, justify="left").pack(anchor="w", pady=(0, 8))
-
-        download_btn = ttk.Button(body, text="Install Automatically")
+        download_btn = _make_ghost_button(download_card.body, "Install Automatically",
+                                           lambda: do_install_resources())
+        download_btn.pack(anchor="w")
 
         def do_install_resources():
             original_text = "Install Automatically"
@@ -1588,6 +1557,7 @@ class App(tk.Tk):
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
+            download_card.redraw()
 
             def work(cancel_event):
                 errors = []
@@ -1610,6 +1580,7 @@ class App(tk.Tk):
             def reset_button():
                 if download_btn.winfo_exists():
                     download_btn.configure(state="normal", text=original_text)
+                    download_card.redraw()
 
             def on_success(result):
                 installed, errors = result
@@ -1630,11 +1601,6 @@ class App(tk.Tk):
                 work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
                 cancelled_toast="Installation Cancelled!",
             )
-
-        download_btn.configure(command=do_install_resources)
-        download_btn.pack(anchor="w")
-
-        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=(16, 16))
 
         # ------------------------------------------------------------------
         # All set!
@@ -1659,7 +1625,8 @@ class App(tk.Tk):
             self._first_time_win = None
             show_toast(self, "Settings saved!")
 
-        ttk.Button(body, text="All set!", command=do_all_set).pack(anchor="center")
+        _make_accent_button(body, "All set!", do_all_set,
+                             font=("Segoe UI", 12, "bold"), padx=28, pady=11).pack(anchor="center", pady=(4, 0))
 
         win.update_idletasks()
         target_h = min(body.winfo_reqheight() + 16, win.winfo_screenheight() - 80)
@@ -2030,26 +1997,25 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------
     def _build_body(self):
-        body = ttk.Frame(self)
+        body = tk.Frame(self, bg=UI_BG)
         body.pack(side="top", fill="both", expand=True)
 
-        self.sidebar = ttk.Frame(body, width=230)
+        self.sidebar = tk.Frame(body, width=230, bg=UI_BG)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
+        tk.Frame(body, width=1, bg=UI_BORDER).pack(side="left", fill="y")
+
         self.sidebar_buttons = {}
-        n_items = len(SIDEBAR_ITEMS)
-        for i, item in enumerate(SIDEBAR_ITEMS):
-            btn = tk.Button(self.sidebar, text=item, anchor="w", relief="flat",
-                             bg="white", activebackground="#e0e0e0",
-                             font=("Segoe UI", 15), padx=10,
+        for item in SIDEBAR_ITEMS:
+            btn = tk.Button(self.sidebar, text=item, anchor="w", relief="flat", bd=0,
+                             bg=UI_BG, activebackground=UI_ACCENT_SOFT,
+                             fg=UI_TEXT, activeforeground=UI_ACCENT,
+                             font=("Segoe UI", 12), padx=16, pady=12,
+                             cursor="hand2",
                              command=lambda i=item: self.show_frame(i))
-            # weight each row equally so the whole column of buttons
-            # stretches to fill the sidebar's full height
-            self.sidebar.grid_rowconfigure(i, weight=1)
-            btn.grid(row=i, column=0, sticky="nsew")
+            btn.pack(side="top", fill="x", padx=10, pady=3)
             self.sidebar_buttons[item] = btn
-        self.sidebar.grid_columnconfigure(0, weight=1)
 
         self.container = ttk.Frame(body)
         self.container.pack(side="left", fill="both", expand=True)
@@ -2090,7 +2056,10 @@ class App(tk.Tk):
         self._current_frame_name = name
         frame.lift()
         for key, btn in self.sidebar_buttons.items():
-            btn.configure(bg="#d0d0d0" if key == name else "white")
+            active = key == name
+            btn.configure(bg=UI_ACCENT_SOFT if active else UI_BG,
+                          fg=UI_ACCENT if active else UI_TEXT,
+                          font=("Segoe UI", 12, "bold" if active else "normal"))
         if hasattr(frame, "on_shown"):
             frame.on_shown()
 

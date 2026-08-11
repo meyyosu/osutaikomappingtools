@@ -12,11 +12,98 @@ import webbrowser
 from fractions import Fraction
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import font as tkfont
 
 import osu_parser
 import tools_logic as logic
 
 DIVISORS = ["1/1", "1/2", "1/4", "1/6", "1/12", "1/24", "1/36", "1/48"]
+
+# Light-card palette used by individually-restyled screens (FrontPage,
+# MetadataManagerFrame) that opt into the shell's light look — every other
+# tool screen keeps the plain default ttk look.
+FRONT_BG = "#fbfbfe"
+FRONT_CARD_BG = "#ffffff"
+FRONT_BORDER = "#ececf3"
+FRONT_TEXT = "#22252f"
+FRONT_TEXT_MUTED = "#8b8fa3"
+FRONT_GRADIENT_START = (139, 92, 246)   # purple
+FRONT_GRADIENT_END = (79, 70, 229)      # indigo
+LIGHT_ACCENT = "#4f46e5"
+LIGHT_ACCENT_HOVER = "#433bd0"
+LIGHT_ACCENT_SOFT = "#eef0fd"
+
+
+def _style_light_body(base_frame):
+    """Overrides `base_frame`'s (a BaseToolFrame) scrolling canvas + body
+    background to the light-card palette above, instead of the default
+    ttk frame background every tool screen gets otherwise. Call once at
+    the top of a screen's __init__ to opt it into the light look."""
+    base_frame._scroll_canvas.configure(bg=FRONT_BG)
+    ttk.Style().configure("FrontBody.TFrame", background=FRONT_BG)
+    base_frame.body.configure(style="FrontBody.TFrame")
+
+
+def _make_light_entry(parent, **kwargs):
+    """Returns a `LightEntry` (see its own class docstring, further down
+    this file) — kept as a separate factory function rather than having
+    every call site construct `LightEntry` directly, purely for historical
+    continuity: this used to build a plain flat-bordered `tk.Entry`, and
+    every existing call site already goes through this function."""
+    return LightEntry(parent, **kwargs)
+
+
+def _make_accent_button(parent, text, command, **kwargs):
+    defaults = dict(font=("Segoe UI", 11, "bold"), bg=LIGHT_ACCENT,
+                     activebackground=LIGHT_ACCENT_HOVER, fg="#ffffff",
+                     activeforeground="#ffffff", relief="flat", bd=0,
+                     cursor="hand2", padx=18, pady=9)
+    defaults.update(kwargs)
+    return tk.Button(parent, text=text, command=command, **defaults)
+
+
+def _make_ghost_button(parent, text, command, **kwargs):
+    defaults = dict(font=("Segoe UI", 10, "bold"), bg=LIGHT_ACCENT_SOFT,
+                     activebackground=LIGHT_ACCENT_SOFT, fg=LIGHT_ACCENT,
+                     activeforeground=LIGHT_ACCENT, relief="flat", bd=0,
+                     cursor="hand2", padx=14, pady=8)
+    defaults.update(kwargs)
+    return tk.Button(parent, text=text, command=command, **defaults)
+
+
+def _render_gradient_text(text, font_size=30, bold=True,
+                           color1=FRONT_GRADIENT_START, color2=FRONT_GRADIENT_END):
+    """Renders `text` as a left-to-right gradient image (purple -> indigo),
+    for FrontPage's title. A one-row gradient stretched to full height is
+    used instead of a per-pixel double loop, since only the gradient's
+    width actually varies. Returns None (caller falls back to a plain
+    solid-color ttk.Label) if PIL or a usable font isn't available."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont, ImageTk
+        font_path = "segoeuib.ttf" if bold else "segoeui.ttf"
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except OSError:
+            font = ImageFont.load_default()
+        probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        bbox = probe.textbbox((0, 0), text, font=font)
+        pad = 4
+        w = bbox[2] - bbox[0] + pad * 2
+        h = bbox[3] - bbox[1] + pad * 2
+        gradient_row = Image.new("RGBA", (w, 1))
+        for x in range(w):
+            t = x / max(1, w - 1)
+            r = int(color1[0] + (color2[0] - color1[0]) * t)
+            g = int(color1[1] + (color2[1] - color1[1]) * t)
+            b = int(color1[2] + (color2[2] - color1[2]) * t)
+            gradient_row.putpixel((x, 0), (r, g, b, 255))
+        gradient = gradient_row.resize((w, h))
+        mask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(mask).text((pad - bbox[0], pad - bbox[1]), text, font=font, fill=255)
+        result = Image.composite(gradient, Image.new("RGBA", (w, h), (0, 0, 0, 0)), mask)
+        return ImageTk.PhotoImage(result)
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -304,56 +391,6 @@ def add_header(parent, title: str, info_text: str = None):
     return row
 
 
-VLC_DOWNLOAD_URL = "https://www.videolan.org/vlc/"
-FFMPEG_MANUAL_URL = "https://ffmpeg.org/download.html"
-
-
-def _make_inline_link(parent, url):
-    """A small clickable label meant to sit inline within a sentence built
-    from several packed Labels — the URL itself is never shown, only the
-    word/phrase this is attached to."""
-    link = tk.Label(parent, fg="#0066cc", cursor="hand2")
-    f = link.cget("font")
-    link.configure(font=(f, 11, "underline") if isinstance(f, str) else f)
-    link.bind("<Button-1>", lambda e: webbrowser.open(url))
-    return link
-
-
-def _run_bundled_install(master, win, button, install_fn, tool_name, busy_msg):
-    """Runs one of tools_logic's `install_*_bundled` functions on a worker
-    thread from inside `show_troubleshoot_window`. `master` is always the
-    `BaseToolFrame` the troubleshoot window was opened from (its `.body`
-    IS the frame itself — see `BaseToolFrame.__init__` — so `.app` is
-    always reachable for the shared busy overlay), and `button` is
-    disabled with its own text swapped to "Installing..." for the
-    duration so a second click can't start an overlapping install.
-    Reports the result via a plain `messagebox` — this popup doesn't use
-    `notify_done`'s toast since it isn't tied to any particular tool
-    screen being visible."""
-    button.configure(state="disabled", text="Installing...")
-    original_text = f"Install {tool_name} automatically"
-
-    def work(cancel_event):
-        install_fn()
-
-    def reset_button():
-        if button.winfo_exists():
-            button.configure(state="normal", text=original_text)
-
-    def on_success(_result):
-        reset_button()
-        if win.winfo_exists():
-            messagebox.showinfo(tool_name, f"{tool_name} installed successfully.")
-
-    def on_error(err_msg):
-        reset_button()
-        if win.winfo_exists():
-            messagebox.showerror(tool_name, err_msg)
-
-    master.app.run_cancellable_job(busy_msg, work, on_success=on_success, on_error=on_error,
-                                    on_cancel=reset_button, cancelled_toast="Installation Cancelled!")
-
-
 class CoordinateEditorWindow(tk.Toplevel):
     """A 17x13-line grid (16x12 cells, each worth 32 osu! coordinate units —
     the full 0-512 x 0-384 playfield space) with 2 or 4 draggable circles
@@ -374,6 +411,7 @@ class CoordinateEditorWindow(tk.Toplevel):
         on_apply(dict key -> (x, y)) is called when Apply is clicked."""
         super().__init__(master)
         self.title(title)
+        self.configure(bg=FRONT_BG)
         self.resizable(False, False)
         self.on_apply = on_apply
         self.points_spec = points_spec
@@ -384,30 +422,35 @@ class CoordinateEditorWindow(tk.Toplevel):
         grid_w = self.GRID_COLS * self.CELL_PX
         grid_h = self.GRID_ROWS * self.CELL_PX
 
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=12, pady=10)
+        top = tk.Frame(self, bg=FRONT_BG)
+        top.pack(fill="x", padx=16, pady=(14, 4))
+        tk.Label(top, text=title, bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 13, "bold")).pack(side="left")
+        _make_accent_button(top, "Apply", self._apply).pack(side="right")
 
-        labels_frame = ttk.Frame(top)
-        labels_frame.pack(side="left", fill="x", expand=True)
+        labels_row = tk.Frame(self, bg=FRONT_BG)
+        labels_row.pack(fill="x", padx=16, pady=(6, 10))
         per_col = 2 if len(points_spec) > 2 else len(points_spec)
         num_cols = -(-len(points_spec) // per_col)  # ceil division
         col_frames = []
         for _c in range(num_cols):
-            cf = ttk.Frame(labels_frame)
+            cf = tk.Frame(labels_row, bg=FRONT_BG)
             cf.pack(side="left", padx=(0, 30))
             col_frames.append(cf)
 
+        # Label text is colored to match its point's own dot color, tying
+        # the numeric readout directly to the corresponding circle on the
+        # grid below instead of leaving every label the same neutral color.
         self.label_vars = {}
         for i, p in enumerate(points_spec):
             var = tk.StringVar()
             self.label_vars[p["key"]] = var
-            ttk.Label(col_frames[i // per_col], textvariable=var, font=("Segoe UI", 14)).pack(anchor="w")
-
-        ttk.Button(top, text="Apply", command=self._apply).pack(side="right", anchor="n")
+            tk.Label(col_frames[i // per_col], textvariable=var, bg=FRONT_BG, fg=p["color"],
+                     font=("Segoe UI", 12, "bold")).pack(anchor="w")
 
         self.canvas = tk.Canvas(self, width=grid_w + 2 * self.MARGIN, height=grid_h + 2 * self.MARGIN,
-                                 bg="white", highlightthickness=1, highlightbackground="black")
-        self.canvas.pack(padx=12, pady=(0, 12))
+                                 bg=FRONT_CARD_BG, highlightthickness=1, highlightbackground=FRONT_BORDER)
+        self.canvas.pack(padx=16, pady=(0, 16))
 
         self._draw_grid()
         self._create_points()
@@ -446,8 +489,8 @@ class CoordinateEditorWindow(tk.Toplevel):
         # Bold center crosshair, matching the reference wireframes.
         cx, _ = self._unit_to_canvas(256, 0)
         _, cy = self._unit_to_canvas(0, 192)
-        self.canvas.create_line(cx, self.MARGIN, cx, self.MARGIN + grid_h, fill="black", width=2)
-        self.canvas.create_line(self.MARGIN, cy, self.MARGIN + grid_w, cy, fill="black", width=2)
+        self.canvas.create_line(cx, self.MARGIN, cx, self.MARGIN + grid_h, fill=LIGHT_ACCENT, width=2)
+        self.canvas.create_line(self.MARGIN, cy, self.MARGIN + grid_w, cy, fill=LIGHT_ACCENT, width=2)
 
     def _create_points(self):
         # Drawn in a fixed stacking order (small over big, red over blue)
@@ -505,87 +548,40 @@ class CoordinateEditorWindow(tk.Toplevel):
         self.destroy()
 
 
-def show_troubleshoot_window(master):
-    """Behind every "The tool is not working?" link — the video preview
-    and taiko video resizer both depend on external programs (VLC, FFmpeg)
-    that aren't bundled, so this is where we point people at getting those
-    installed."""
-    existing = getattr(master, "_troubleshoot_win", None)
-    if existing is not None and existing.winfo_exists():
-        existing.lift()
-        existing.focus_force()
-        return
-    win = tk.Toplevel(master)
-    win.title("The tool is not working?")
-
-    body = ttk.Frame(win)
-    body.pack(fill="both", expand=True, padx=16, pady=16)
-
-    ttk.Label(body, text="The video offset preview is not working!",
-              font=("Segoe UI", 18, "bold"), wraplength=580, justify="left").pack(anchor="w", pady=(0, 6))
-    ttk.Label(body, text="VLC is required for this. Install it here:",
-              wraplength=580, justify="left").pack(anchor="w", pady=(0, 6))
-    vlc_btn = ttk.Button(body, text="Install VLC automatically")
-    vlc_btn.configure(command=lambda: _run_bundled_install(
-        master, win, vlc_btn, logic.install_vlc_bundled, "VLC",
-        "Installing VLC (may take a few minutes)... Please wait..."))
-    vlc_btn.pack(anchor="w", pady=(0, 4))
-    vlc_manual_link = _make_inline_link(body, VLC_DOWNLOAD_URL)
-    vlc_manual_link.configure(text="Or download it manually")
-    vlc_manual_link.pack(anchor="w")
-
-    ttk.Separator(body, orient="horizontal").pack(fill="x", pady=8)
-
-    ttk.Label(body, text="The taiko video resizer is not working!",
-              font=("Segoe UI", 18, "bold"), wraplength=580, justify="left").pack(anchor="w", pady=(0, 6))
-    ttk.Label(body, text="FFmpeg is required to use this feature. Install it here:",
-              wraplength=580, justify="left").pack(anchor="w", pady=(0, 6))
-    ffmpeg_btn = ttk.Button(body, text="Install FFmpeg automatically")
-    ffmpeg_btn.configure(command=lambda: _run_bundled_install(
-        master, win, ffmpeg_btn, logic.install_ffmpeg_suite_bundled, "FFmpeg",
-        "Installing ffmpeg + ffprobe (may take a few minutes)... Please wait..."))
-    ffmpeg_btn.pack(anchor="w", pady=(0, 4))
-    manual_link = _make_inline_link(body, FFMPEG_MANUAL_URL)
-    manual_link.configure(text="Or download it manually")
-    manual_link.pack(anchor="w")
-
-    master._troubleshoot_win = win
-    win.bind("<Escape>", lambda e: win.destroy())
-    win.transient(master)
-    _position_over_window(win, master, width=620, height=440)
-    win.lift()
-    win.focus_force()
-    win.grab_set()
-
-
-def make_scrollable_toplevel_body(win):
+def make_scrollable_toplevel_body(win, bg=None):
     """Wraps a Toplevel's content in a vertically-scrolling canvas — for a
-    window whose content can end up taller than the screen (most notably
-    Settings, once the font-size option is cranked way up — see Settings
-    section 3), so whatever's below the fold (often the Apply/Restart row)
-    stays reachable via scrollbar/mouse wheel instead of running off-screen
-    with no way back. The scrollbar only appears once content actually
-    overflows the window, so a window that already fits looks exactly as
-    it did before. Returns a `ttk.Frame` to parent content into, as a
-    drop-in replacement for a plain `ttk.Frame(win)` — including a
-    `padding` option to reproduce whatever padx/pady margin the caller
-    used to apply on the old frame's own `.pack()` call, since that now
-    has to live on the frame itself rather than on how it's packed into
-    `win`. Mouse wheel is bound only while the pointer is over `win` (the
-    same Enter/Leave-toggled bind_all trick as SongSearchResultsWindow —
-    needed since the canvas itself ends up almost entirely covered by
-    embedded content, so binding wheel scroll on the bare canvas alone
-    doesn't work in practice)."""
+    window whose content can end up taller than the screen, so whatever's
+    below the fold (often an Apply/Restart row) stays reachable via
+    scrollbar/mouse wheel instead of running off-screen with no way back.
+    The scrollbar only appears once content actually overflows the window,
+    so a window that already fits looks exactly as it did before. Returns a
+    `ttk.Frame` to parent content into, as a drop-in replacement for a plain
+    `ttk.Frame(win)` — including a `padding` option to reproduce whatever
+    padx/pady margin the caller used to apply on the old frame's own
+    `.pack()` call, since that now has to live on the frame itself rather
+    than on how it's packed into `win`. Mouse wheel is bound only while the
+    pointer is over `win` (the same Enter/Leave-toggled bind_all trick as
+    SongSearchResultsWindow — needed since the canvas itself ends up almost
+    entirely covered by embedded content, so binding wheel scroll on the
+    bare canvas alone doesn't work in practice).
+
+    `bg`, if given, paints the scrolling canvas and the returned frame that
+    color instead of leaving them at the default ttk frame background — for
+    a caller opting into the light-card theme (see Settings)."""
     outer = ttk.Frame(win)
     outer.pack(fill="both", expand=True)
 
-    canvas = tk.Canvas(outer, highlightthickness=0,
-                        bg=ttk.Style().lookup("TFrame", "background") or None)
+    canvas_bg = bg if bg is not None else (ttk.Style().lookup("TFrame", "background") or None)
+    canvas = tk.Canvas(outer, highlightthickness=0, bg=canvas_bg)
     scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
     canvas.configure(yscrollcommand=scrollbar.set)
     canvas.pack(side="left", fill="both", expand=True)
 
     body = ttk.Frame(canvas)
+    if bg is not None:
+        style_name = f"ScrollBody{id(body)}.TFrame"
+        ttk.Style().configure(style_name, background=bg)
+        body.configure(style=style_name)
     window_id = canvas.create_window((0, 0), window=body, anchor="nw")
 
     def _update_scroll_state(_event=None):
@@ -634,21 +630,6 @@ def make_scrollable_toplevel_body(win):
     return body
 
 
-def add_apply_row(parent, command, button_text="Apply"):
-    """Packs a right-anchored row with a 'The tool is not working?' help
-    link next to the Apply button — the standard pattern at the bottom of
-    every tool screen."""
-    row = ttk.Frame(parent)
-    row.pack(anchor="e", fill="x", padx=10, pady=10)
-    ttk.Button(row, text=button_text, command=command).pack(side="right")
-    link = tk.Label(row, text="The tool is not working?", fg="#0066cc", cursor="hand2")
-    link.pack(side="right", padx=(0, 12))
-    f = link.cget("font")
-    link.configure(font=(f, 10, "underline") if isinstance(f, str) else f)
-    link.bind("<Button-1>", lambda e: show_troubleshoot_window(parent))
-    return row
-
-
 class SongSearchResultsWindow(tk.Toplevel):
     """A scrollable list of search results, each showing a small background
     thumbnail plus "Artist - Title", so the user can quickly spot and pick
@@ -657,26 +638,34 @@ class SongSearchResultsWindow(tk.Toplevel):
 
     THUMB_W, THUMB_H = 64, 36
     MAX_ROWS_VISIBLE = 8
+    ROW_BG = FRONT_CARD_BG
+    ROW_HOVER_BG = LIGHT_ACCENT_SOFT
 
     def __init__(self, app, matches, on_select):
         super().__init__(app)
         self.title(f"Search results ({len(matches)})")
+        self.configure(bg=FRONT_BG)
         self.resizable(False, True)
         self.on_select = on_select
         self._thumb_images = []  # keep references so Tk doesn't GC them
         self._row_labels = []    # (entry, text_label) pairs, for the あ toggle
         self.use_romanised = False
 
-        top = ttk.Frame(self)
+        top = tk.Frame(self, bg=FRONT_BG)
         top.pack(fill="x")
-        ttk.Button(top, text="あ", width=3, command=self.toggle_display).pack(side="right", padx=4, pady=4)
+        n = len(matches)
+        tk.Label(top, text=f"{n} result{'s' if n != 1 else ''}", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 12, "bold")).pack(side="left", padx=12, pady=10)
+        _make_ghost_button(top, "あ", self.toggle_display, width=3).pack(side="right", padx=10, pady=8)
 
-        outer = ttk.Frame(self)
+        tk.Frame(self, bg=FRONT_BORDER, height=1).pack(fill="x")
+
+        outer = tk.Frame(self, bg=FRONT_BG)
         outer.pack(fill="both", expand=True)
 
-        self._canvas = canvas = tk.Canvas(outer, width=480, highlightthickness=0)
+        self._canvas = canvas = tk.Canvas(outer, width=480, highlightthickness=0, bg=FRONT_BG)
         scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
+        inner = tk.Frame(canvas, bg=FRONT_BG)
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -716,7 +705,7 @@ class SongSearchResultsWindow(tk.Toplevel):
 
         row_h = 58
         visible_rows = min(len(matches), self.MAX_ROWS_VISIBLE)
-        _position_over_window(self, app, width=500, height=visible_rows * row_h + 30)
+        _position_over_window(self, app, width=500, height=visible_rows * row_h + 48)
 
         # Bring the window to front and give it real keyboard/focus so it
         # doesn't open silently behind the main window, and so the mouse
@@ -738,8 +727,8 @@ class SongSearchResultsWindow(tk.Toplevel):
             label.configure(text=text or entry.get("display", ""))
 
     def _add_row(self, parent, entry):
-        row = tk.Frame(parent, cursor="hand2", bg="white")
-        row.pack(fill="x", pady=1)
+        row = tk.Frame(parent, cursor="hand2", bg=self.ROW_BG)
+        row.pack(fill="x", pady=(0, 1))
 
         thumb_label = tk.Label(row, bg="black")
         thumb_label.pack(side="left", padx=6, pady=6)
@@ -754,7 +743,7 @@ class SongSearchResultsWindow(tk.Toplevel):
 
         initial_text = entry.get("display_romanised") if self.use_romanised else entry.get("display")
         text = tk.Label(row, text=initial_text or entry.get("display", ""), anchor="w", justify="left",
-                         bg="white", font=("Segoe UI", 12))
+                         bg=self.ROW_BG, fg=FRONT_TEXT, font=("Segoe UI", 12))
         text.pack(side="left", fill="x", expand=True, padx=6)
         self._row_labels.append((entry, text))
 
@@ -764,10 +753,10 @@ class SongSearchResultsWindow(tk.Toplevel):
 
         for widget in (row, thumb_label, text):
             widget.bind("<Button-1>", select)
-            widget.bind("<Enter>", lambda e, r=row, t=text: (r.configure(bg="#e6f0ff"),
-                                                              t.configure(bg="#e6f0ff")))
-            widget.bind("<Leave>", lambda e, r=row, t=text: (r.configure(bg="white"),
-                                                              t.configure(bg="white")))
+            widget.bind("<Enter>", lambda e, r=row, t=text: (r.configure(bg=self.ROW_HOVER_BG),
+                                                              t.configure(bg=self.ROW_HOVER_BG)))
+            widget.bind("<Leave>", lambda e, r=row, t=text: (r.configure(bg=self.ROW_BG),
+                                                              t.configure(bg=self.ROW_BG)))
 
     def _set_placeholder_thumbnail(self, label):
         from PIL import Image, ImageTk
@@ -794,19 +783,1001 @@ class SongSearchResultsWindow(tk.Toplevel):
             pass  # keep the (already correctly-sized) placeholder on any read/decode error
 
 
+def _rounded_rect_points(x1, y1, x2, y2, r):
+    """Point list for a smoothed create_polygon rounded rectangle — the
+    standard tkinter recipe (a polygon with a corner point pulled in by
+    the radius on each side, then smoothed so Tk bows each corner pair
+    into an arc)."""
+    r = min(r, (x2 - x1) / 2, (y2 - y1) / 2)
+    return [
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    ]
+
+
+def _draw_rounded_rect(canvas, x1, y1, x2, y2, r=12, **kwargs):
+    return canvas.create_polygon(_rounded_rect_points(x1, y1, x2, y2, r), smooth=True, **kwargs)
+
+
+# Module-level "currently open" tracking for _show_light_context_menu, mirroring
+# LightDropdown._open_instance — only one of these popups is ever open at a
+# time, and the outside-click dismiss handler below is bound to bind_all
+# exactly ONCE, permanently (add="+"), never unbound. Per CLAUDE.md's own
+# warning, Tk's unbind_all clears *every* handler for a sequence on the "all"
+# bindtag, not just this one — calling it here would silently wipe out other
+# unrelated app-wide Button-1 handlers (main.py's click-unfocus, LightDropdown's
+# own dismiss handler, etc.), so this never unbinds; it just no-ops once no
+# menu is open.
+_open_context_menu = {"popup": None, "close": None}
+_context_menu_global_bound = False
+
+
+def _close_any_open_context_menu():
+    if _open_context_menu["popup"] is not None:
+        close = _open_context_menu["close"]
+        if close is not None:
+            close()
+
+
+def _on_any_click_for_context_menu(event):
+    popup = _open_context_menu["popup"]
+    if popup is None:
+        return
+    w = event.widget
+    try:
+        if str(w).startswith(str(popup)):
+            return  # a row click on the popup itself — its own handler deals with it
+    except Exception:
+        pass
+    _close_any_open_context_menu()
+
+
+def _show_light_context_menu(parent, x_root, y_root, items):
+    """A rounded, custom-drawn right-click context menu positioned at
+    (x_root, y_root) — replaces a plain tk.Menu (native OS chrome that
+    can't be restyled to match this theme's rounded white cards, same
+    "native chrome ignores styling" reasoning as LightDropdown/
+    LightCheckbox elsewhere in this file).
+
+    `items` is a list where each entry is either:
+      - "separator" — a thin horizontal divider
+      - (label, command) — a normal row in the default text color
+      - (label, command, color) — a row in a custom color (e.g. a
+        destructive "Delete" row)
+
+    Dismissed by clicking a row (which also runs its command), clicking
+    anywhere else, or Escape/losing focus — no grab_set(), same reasoning
+    as LightDropdown's own popup: grabbing would block the very outside
+    click this relies on to close."""
+    _close_any_open_context_menu()
+
+    ROW_H = 32
+    SEP_H = 11
+    PAD_Y = 6
+    PAD_X = 16
+    RADIUS = 10
+    font = ("Segoe UI", 11)
+    fnt = tkfont.Font(font=font)
+
+    rows = []
+    y = PAD_Y
+    max_text_w = 0
+    for item in items:
+        if item == "separator":
+            rows.append({"sep": True, "y1": y, "y2": y + SEP_H})
+            y += SEP_H
+        else:
+            label, command = item[0], item[1]
+            color = item[2] if len(item) > 2 else FRONT_TEXT
+            max_text_w = max(max_text_w, fnt.measure(label))
+            rows.append({"label": label, "command": command, "color": color,
+                         "y1": y, "y2": y + ROW_H})
+            y += ROW_H
+    total_h = y + PAD_Y
+    width = max(160, max_text_w + PAD_X * 2)
+
+    popup = tk.Toplevel(parent)
+    popup.overrideredirect(True)
+    popup.attributes("-topmost", True)
+    screen_w = popup.winfo_screenwidth()
+    screen_h = popup.winfo_screenheight()
+    x = max(0, min(x_root, screen_w - width - 4))
+    y_pos = max(0, min(y_root, screen_h - total_h - 4))
+    popup.geometry(f"{width}x{total_h}+{x}+{y_pos}")
+
+    canvas = tk.Canvas(popup, width=width, height=total_h, highlightthickness=0, bg=FRONT_BG)
+    canvas.pack()
+
+    state = {"hover": None, "closed": False}
+
+    def redraw():
+        canvas.delete("all")
+        _draw_rounded_rect(canvas, 1, 1, width - 1, total_h - 1, RADIUS,
+                            fill=FRONT_CARD_BG, outline=FRONT_BORDER, width=1.5)
+        for i, row in enumerate(rows):
+            if row.get("sep"):
+                ym = (row["y1"] + row["y2"]) // 2
+                canvas.create_line(PAD_X, ym, width - PAD_X, ym, fill=FRONT_BORDER)
+                continue
+            if i == state["hover"]:
+                _draw_rounded_rect(canvas, 5, row["y1"] + 1, width - 5, row["y2"] - 1, 8,
+                                    fill=LIGHT_ACCENT_SOFT, outline="")
+            canvas.create_text(PAD_X, (row["y1"] + row["y2"]) // 2, text=row["label"],
+                                anchor="w", fill=row["color"], font=font)
+
+    def row_at(y):
+        for i, row in enumerate(rows):
+            if not row.get("sep") and row["y1"] <= y <= row["y2"]:
+                return i
+        return None
+
+    def on_motion(event):
+        idx = row_at(event.y)
+        if idx != state["hover"]:
+            state["hover"] = idx
+            redraw()
+
+    def close():
+        if state["closed"]:
+            return
+        state["closed"] = True
+        if _open_context_menu["popup"] is popup:
+            _open_context_menu["popup"] = None
+            _open_context_menu["close"] = None
+        popup.destroy()
+
+    def on_click(event):
+        idx = row_at(event.y)
+        close()
+        if idx is not None:
+            rows[idx]["command"]()
+
+    canvas.bind("<Motion>", on_motion)
+    canvas.bind("<Leave>", lambda _e: (state.update(hover=None), redraw()))
+    canvas.bind("<Button-1>", on_click)
+    popup.bind("<Escape>", lambda _e: close())
+    popup.bind("<FocusOut>", lambda _e: close())
+
+    global _context_menu_global_bound
+    if not _context_menu_global_bound:
+        _context_menu_global_bound = True
+        parent.bind_all("<Button-1>", _on_any_click_for_context_menu, add="+")
+
+    _open_context_menu["popup"] = popup
+    _open_context_menu["close"] = close
+    redraw()
+    popup.focus_force()
+
+
+# =============================================================================
+class RoundedCard(ttk.Frame):
+    """A generic rounded white card container for the light theme — the
+    building block behind every "grouped box" the light theme needs
+    (DiffCheckList, CopySection, and any future one). Built on a Canvas
+    since ttk has no real rounded-corner/shadow support and native
+    LabelFrame/theme chrome can't be reskinned to match on this theme (see
+    DiffCheckList's docstring for the specifics that were confirmed the
+    hard way).
+
+    Pack arbitrary content into `.body` (bg=FRONT_CARD_BG) — the card
+    resizes to fit body's own requested height automatically on every
+    canvas resize. Call `.redraw()` after changing body's content (e.g.
+    adding/removing rows) so the card catches up immediately instead of
+    waiting for the next resize event to notice."""
+
+    RADIUS = 14
+    PAD_X = 18
+    PAD_Y_TOP = 12
+    PAD_Y_BOTTOM = 14
+
+    def __init__(self, master, page_bg=FRONT_BG):
+        ttk.Frame.__init__(self, master)
+        self._canvas = tk.Canvas(self, highlightthickness=0, bg=page_bg)
+        self._canvas.pack(fill="both", expand=True)
+        self.body = tk.Frame(self._canvas, bg=FRONT_CARD_BG)
+        self._window_item = self._canvas.create_window(
+            self.PAD_X, self.PAD_Y_TOP, anchor="nw", window=self.body)
+        self._canvas.bind("<Configure>", lambda e: self.redraw())
+
+    def redraw(self):
+        canvas = self._canvas
+        canvas.update_idletasks()
+        w = canvas.winfo_width()
+        if w <= 1:
+            return
+        h = self.body.winfo_reqheight() + self.PAD_Y_TOP + self.PAD_Y_BOTTOM
+        canvas.configure(height=h)
+        canvas.delete("card_bg")
+        _draw_rounded_rect(canvas, 1, 1, w - 2, h - 1, self.RADIUS,
+                            fill=FRONT_CARD_BG, outline=FRONT_BORDER, tags="card_bg")
+        canvas.tag_lower("card_bg")
+        canvas.itemconfig(self._window_item, width=w - self.PAD_X * 2)
+
+
+# =============================================================================
+class LightCheckbox(tk.Frame):
+    """A custom-drawn checkbox (small Canvas box + Label), used by
+    DiffCheckList in light mode instead of tk.Checkbutton. Tk's classic
+    Checkbutton indicator on Windows draws its checkmark glyph in a fixed
+    color that ignores every color-related option (confirmed empirically:
+    `selectcolor` does recolor the box fill, as used before this widget
+    existed, but there is no equivalent for the tick itself) — the same
+    "native chrome ignores styling" wall hit elsewhere in this redesign,
+    so a fully custom-drawn box+tick is the only reliable way to get a
+    legible white tick against the indigo fill.
+
+    `command`, if given, is called (no args) after every toggle — same
+    shape as ttk.Checkbutton's own `command=`, used for the recurring
+    "child options disabled until parent checked" pattern (see CLAUDE.md).
+    `set_enabled(bool)` grays the box/text out and ignores clicks while
+    disabled, mirroring `.configure(state="disabled")` on the native
+    ttk.Checkbutton this replaces — MapCleanerFrame's various `_sync_*`
+    methods call this instead."""
+
+    SIZE = 16
+    RADIUS = 4
+    DISABLED_FG = FRONT_TEXT_MUTED
+
+    def __init__(self, master, text, variable, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 accent=LIGHT_ACCENT, font=("Segoe UI", 11), command=None):
+        super().__init__(master, bg=bg)
+        self.variable = variable
+        self.accent = accent
+        self.command = command
+        self._fg = fg
+        self.enabled = True
+        self.canvas = tk.Canvas(self, width=self.SIZE, height=self.SIZE,
+                                 bg=bg, highlightthickness=0, cursor="hand2")
+        self.canvas.pack(side="left", padx=(0, 8))
+        self.label = tk.Label(self, text=text, bg=bg, fg=fg, font=font, cursor="hand2")
+        self.label.pack(side="left")
+        self.canvas.bind("<Button-1>", self._toggle)
+        self.label.bind("<Button-1>", self._toggle)
+        # Redraws whenever the variable changes for *any* reason, not just
+        # this checkbox's own click — needed for e.g. a "mutually exclusive
+        # checkboxes" pattern (see VideoOffsetShifterFrame's Resizer/SB
+        # Code checkboxes) where one checkbox's command handler sets
+        # *another* checkbox's variable directly. Without this trace, that
+        # other checkbox's own widget is never told to redraw and stays
+        # visually stuck on its last-clicked state even though the
+        # variable underneath it already changed (confirmed for real: the
+        # variable was correctly False but the box still rendered checked).
+        self._trace_id = variable.trace_add("write", lambda *_a: self._redraw())
+        self.bind("<Destroy>", self._on_destroy)
+        self._redraw()
+
+    def _on_destroy(self, _event=None):
+        try:
+            self.variable.trace_remove("write", self._trace_id)
+        except Exception:
+            pass
+
+    def _toggle(self, _event=None):
+        if not self.enabled:
+            return
+        self.variable.set(not self.variable.get())  # redraw happens via the trace above
+        if self.command:
+            self.command()
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = enabled
+        cursor = "hand2" if enabled else "arrow"
+        self.canvas.configure(cursor=cursor)
+        self.label.configure(cursor=cursor, fg=self._fg if enabled else self.DISABLED_FG)
+        self._redraw()
+
+    def _redraw(self):
+        self.canvas.delete("all")
+        checked = self.variable.get()
+        if self.enabled:
+            fill = self.accent if checked else "#ffffff"
+            outline = self.accent if checked else FRONT_BORDER
+            tick = "#ffffff"
+        else:
+            fill = "#eceef4" if checked else "#f7f7fa"
+            outline = FRONT_BORDER
+            tick = "#c7c7d6"
+        _draw_rounded_rect(self.canvas, 1, 1, self.SIZE - 1, self.SIZE - 1, self.RADIUS,
+                            fill=fill, outline=outline, width=1.5)
+        if checked:
+            self.canvas.create_line(4, 8, 7, 11, 12, 4, fill=tick,
+                                     width=2, capstyle="round", joinstyle="round")
+
+
+# =============================================================================
+class LightRadiobutton(tk.Frame):
+    """Custom-drawn radio button (Canvas circle + Label) — same rationale
+    as LightCheckbox: a native ttk.Radiobutton's indicator dot on this
+    theme ignores color styling the same way the checkbox tick does, so a
+    legible indigo-filled dot needs a fully custom-drawn circle instead.
+
+    Every radio button in a group must share the same `variable` (a
+    StringVar) — a trace on it redraws this button whenever a *sibling*
+    radio button changes it too, matching how a native radio group
+    deselects the others automatically. `command`/`set_enabled` mirror
+    LightCheckbox's own (see its docstring)."""
+
+    SIZE = 16
+
+    def __init__(self, master, text, variable, value, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 accent=LIGHT_ACCENT, font=("Segoe UI", 11), command=None):
+        super().__init__(master, bg=bg)
+        self.variable = variable
+        self.value = value
+        self.accent = accent
+        self.command = command
+        self._fg = fg
+        self.enabled = True
+        self.canvas = tk.Canvas(self, width=self.SIZE, height=self.SIZE,
+                                 bg=bg, highlightthickness=0, cursor="hand2")
+        self.canvas.pack(side="left", padx=(0, 8))
+        self.label = tk.Label(self, text=text, bg=bg, fg=fg, font=font, cursor="hand2")
+        self.label.pack(side="left")
+        self.canvas.bind("<Button-1>", self._select)
+        self.label.bind("<Button-1>", self._select)
+        self._trace_id = variable.trace_add("write", lambda *_a: self._redraw())
+        self.bind("<Destroy>", self._on_destroy)
+        self._redraw()
+
+    def _on_destroy(self, _event=None):
+        try:
+            self.variable.trace_remove("write", self._trace_id)
+        except Exception:
+            pass
+
+    def _select(self, _event=None):
+        if not self.enabled:
+            return
+        self.variable.set(self.value)
+        if self.command:
+            self.command()
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = enabled
+        cursor = "hand2" if enabled else "arrow"
+        self.canvas.configure(cursor=cursor)
+        self.label.configure(cursor=cursor, fg=self._fg if enabled else LightCheckbox.DISABLED_FG)
+        self._redraw()
+
+    def _redraw(self):
+        self.canvas.delete("all")
+        selected = self.variable.get() == self.value
+        if self.enabled:
+            outline = self.accent if selected else FRONT_BORDER
+            dot = self.accent
+        else:
+            outline = FRONT_BORDER
+            dot = "#c7c7d6"
+        self.canvas.create_oval(1, 1, self.SIZE - 1, self.SIZE - 1,
+                                 fill="#ffffff", outline=outline, width=1.5)
+        if selected:
+            pad = 4
+            self.canvas.create_oval(pad, pad, self.SIZE - pad, self.SIZE - pad,
+                                     fill=dot, outline="")
+
+
+# =============================================================================
+class LightSpinner(tk.Frame):
+    """A numeric Entry + up/down stepper, replacing tk.Spinbox on the light
+    theme. tk.Spinbox keeps a visible native seam/border around its
+    button area no matter how flat its `buttonuprelief`/`buttondownrelief`
+    are configured (confirmed empirically: even fully flattened, the
+    button area still reads as a separate glued-on box next to the entry,
+    sticking out against the rest of the flat light-themed card) — so
+    this wraps a single shared border around a plain Entry plus two tiny
+    Canvas-drawn triangle buttons instead, rendering as one seamless box
+    like every other light-themed input.
+
+    `fmt`, if given, is an old-style `%`-format string (e.g. "%.1f",
+    "%d") applied to the value after each step, matching tk.Spinbox's own
+    `format=` option. `on_change`, if given, is called (no args) after
+    every step. `validate=(mode, command)` is forwarded to the inner
+    Entry's own `validate`/`validatecommand`, same shape as tk.Spinbox's
+    own key-validation. `.entry` is exposed directly for callers that
+    need to bind their own events (e.g. `<FocusOut>` clamping) the way
+    they would on a plain Entry — **always pass `add="+"`** when doing so,
+    since this widget already binds its own `<FocusIn>`/`<FocusOut>` on
+    `.entry` (for the focus-highlight border below) using `add="+"`
+    itself; a plain non-additive `.bind()` would silently replace *both*
+    bindings with just the caller's own.
+
+    The border is drawn on a `tk.Canvas` (rounded rect, same construction
+    as `RoundedCard`/`LightEntry`) rather than via a plain
+    `highlightthickness` square border — `tk.Spinbox`'s square corners
+    were never the actual reason this widget exists (see the class's own
+    reasoning above about the seam/border around Spinbox's button area),
+    but leaving this one square while every text field around it went
+    rounded would look inconsistent."""
+
+    RADIUS = 8
+    BOX_H = 36
+    # See LightEntry.TEXT_Y_NUDGE/BOX_SHIFT — a real tk.Entry embedded on
+    # a canvas and centered by pure geometry renders visibly higher than
+    # a sibling Label centered the same way; this widget embeds a real
+    # Entry the same way LightEntry does, so it needs the identical
+    # two-part correction (and the same place()-based BOX_SHIFT technique
+    # to move the box itself without a caller's own centering halving it).
+    TEXT_Y_NUDGE = 0
+    BOX_SHIFT = 0
+
+    def __init__(self, master, textvariable, from_, to, increment=1, width=5,
+                 fmt=None, bg=FRONT_CARD_BG, fg=FRONT_TEXT, accent=LIGHT_ACCENT,
+                 font=("Segoe UI", 11), on_change=None, validate=None):
+        super().__init__(master, bg=bg, highlightthickness=0)
+        self.bg = bg
+        self.accent = accent
+        self._border_color = FRONT_BORDER
+        self.textvariable = textvariable
+        self.from_ = from_
+        self.to = to
+        self.increment = increment
+        self.fmt = fmt
+        self.on_change = on_change
+        self.enabled = True
+
+        self.canvas = tk.Canvas(self, height=self.BOX_H, highlightthickness=0, bg=bg)
+        inner = tk.Frame(self.canvas, bg=bg)
+
+        entry_kwargs = dict(textvariable=textvariable, width=width, relief="flat", bd=0,
+                             bg=bg, fg=fg, insertbackground=fg, font=font, highlightthickness=0)
+        if validate is not None:
+            entry_kwargs["validate"] = validate[0]
+            entry_kwargs["validatecommand"] = validate[1]
+        self.entry = tk.Entry(inner, **entry_kwargs)
+        self.entry.pack(side="left", padx=(4, 2))
+
+        arrows = tk.Frame(inner, bg=bg)
+        arrows.pack(side="left", padx=(0, 2))
+        self.up_canvas = tk.Canvas(arrows, width=12, height=8, bg=bg, highlightthickness=0, cursor="hand2")
+        self.up_canvas.pack(side="top")
+        self.down_canvas = tk.Canvas(arrows, width=12, height=8, bg=bg, highlightthickness=0, cursor="hand2")
+        self.down_canvas.pack(side="top")
+        self.up_canvas.bind("<Button-1>", lambda e: self._step(1))
+        self.down_canvas.bind("<Button-1>", lambda e: self._step(-1))
+        self._draw_arrows()
+
+        inner.update_idletasks()
+        self._inner_w = inner.winfo_reqwidth()
+        self.canvas.create_window(8, self.BOX_H // 2 + self.TEXT_Y_NUDGE, window=inner, anchor="w")
+        box_w = self._inner_w + 16
+        self.canvas.configure(width=box_w)
+        self.configure(width=box_w, height=self.BOX_H)
+        self._position_canvas()
+        # See LightEntry._position_canvas for why this re-centers on every
+        # real <Configure> instead of trusting a fixed y=BOX_SHIFT offset
+        # — a caller's `ipady` on its own grid()/pack() call genuinely
+        # resizes this widget beyond BOX_H, same as it does for LightEntry.
+        self.bind("<Configure>", lambda _e: self._position_canvas())
+
+        self.entry.bind("<FocusIn>", lambda _e: self._set_focused(True), add="+")
+        self.entry.bind("<FocusOut>", lambda _e: self._set_focused(False), add="+")
+        self._redraw()
+
+    def _position_canvas(self):
+        self.update_idletasks()
+        y = max(0, (self.winfo_height() - self.BOX_H) // 2) + self.BOX_SHIFT
+        self.canvas.place(x=0, y=y)
+
+    def _set_focused(self, focused):
+        self._border_color = self.accent if focused else FRONT_BORDER
+        self._redraw()
+
+    def _redraw(self):
+        c = self.canvas
+        w = self._inner_w + 16
+        c.delete("box")
+        _draw_rounded_rect(c, 1, 1, w - 1, self.BOX_H - 1, self.RADIUS,
+                            fill=self.bg, outline=self._border_color, width=1.5, tags="box")
+        c.tag_lower("box")
+
+    def _draw_arrows(self):
+        for c in (self.up_canvas, self.down_canvas):
+            c.delete("all")
+        color = FRONT_TEXT_MUTED if self.enabled else "#d7d7e0"
+        self.up_canvas.create_polygon(1, 7, 6, 1, 11, 7, fill=color, outline="")
+        # Not a literal mirror of the up triangle's coordinates (1,1 / 6,7 /
+        # 11,1) — confirmed empirically (screenshot + per-row pixel count)
+        # that Tk's polygon scan-fill rasterizes a flat-top triangle
+        # differently from a flat-bottom one: the exact mirror rendered as
+        # 6 filled rows / 35px versus the up triangle's 5 rows / 25px, a
+        # visibly "bigger" down arrow despite identical-looking coordinates.
+        # These coordinates (base narrowed to 1.5-10.5, base row at y=2
+        # instead of y=1) were the one candidate, out of several tried,
+        # that rasterized to an exact pixel-for-pixel mirror of the up
+        # triangle (25px, 5 rows, row-width profile 9,7,5,3,1 vs up's
+        # 1,3,5,7,9) — don't "simplify" this back to a clean mirror of the
+        # up coordinates, that's the version confirmed to look bigger.
+        self.down_canvas.create_polygon(1.5, 2, 6, 7, 10.5, 2, fill=color, outline="")
+
+    def _step(self, direction):
+        if not self.enabled:
+            return
+        try:
+            val = float(self.textvariable.get())
+        except ValueError:
+            val = self.from_
+        val = round(val + direction * self.increment, 6)
+        val = max(self.from_, min(self.to, val))
+        if self.fmt:
+            text = self.fmt % val
+        elif val == int(val):
+            # Without an explicit fmt, `val` is still a float internally
+            # (see the float() conversion above) even for an
+            # integer-only field like a plain +/-1 offset stepper — left
+            # as str(val) this prints a stray ".0" on every whole number
+            # (confirmed for real: stepping "New offset" turned 17500 into
+            # "17500.0"). Only reaching for int() when the value actually
+            # *is* whole keeps a genuinely fractional value (e.g. an
+            # increment=0.1 field with no fmt given) printing normally.
+            text = str(int(val))
+        else:
+            text = str(val)
+        self.textvariable.set(text)
+        if self.on_change:
+            self.on_change()
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = enabled
+        self.entry.configure(state="normal" if enabled else "disabled")
+        cursor = "hand2" if enabled else "arrow"
+        self.up_canvas.configure(cursor=cursor)
+        self.down_canvas.configure(cursor=cursor)
+        self._draw_arrows()
+
+
+# =============================================================================
+class LightDropdown(tk.Frame):
+    """Read-only dropdown/picker, replacing ttk.Combobox(state="readonly")
+    on the light theme. Every ttk.Combobox this replaces was already
+    read-only (a picker, not free-text entry) — this widget only supports
+    that mode, same "custom-drawn because native chrome can't be
+    controlled" reasoning as LightCheckbox/LightRadiobutton: ttk's native
+    popdown listbox is a plain unstyled rectangle (selectbackground/
+    selectforeground/font are about the only things you can touch) with
+    no rounded corners and no per-row hover highlight, so matching a
+    rounded-corner panel with a lavender hover bar needs a fully custom
+    popup instead.
+
+    Backed by a `textvariable` StringVar the same way ttk.Combobox is
+    (`.get()`/`.set()` on it work exactly the same), and generates the
+    same `<<ComboboxSelected>>` virtual event on selection so an existing
+    `.bind("<<ComboboxSelected>>", ...)` call site doesn't need to change.
+    `.set_values(values)` replaces ttk.Combobox's `combo["values"] = ...`
+    bracket-assignment idiom — "values" isn't a real Tk widget option, so
+    plain item assignment doesn't apply to a hand-built widget like this.
+
+    Only one dropdown's popup can be open at a time app-wide — opening a
+    second closes whichever one was already open, tracked via the
+    `_open_instance` class attribute (mirrors a native `<select>`).
+
+    Dismissed the same way a native `<select>` would be, via three
+    independent mechanisms since no single Tk event reliably covers every
+    case (see `_ensure_global_handlers`):
+    - Selecting a row, or `<Escape>`/`<FocusOut>` on the popup itself.
+    - Clicking anywhere else *in this app* — a permanent, app-wide
+      `bind_all("<Button-1>", ..., add="+")` installed once (not per
+      dropdown) and never removed, so it can't ever clash with or clobber
+      main.py's own pre-existing global click-unfocus handler.
+    - The window *hosting the dropdown* losing OS-level activation (e.g.
+      Alt-Tab, or clicking a different application) — `<FocusOut>` on the
+      borderless popup itself was found not to fire reliably for this in
+      practice, so each real (decorated) Toplevel that ever hosts a
+      dropdown also gets a `<Deactivate>` binding, lazily, the first time
+      one is created inside it."""
+
+    ROW_H = 32
+    RADIUS = 10
+    PAD_Y = 6
+
+    _open_instance = None
+    _global_click_bound = False
+    _deactivate_bound_toplevels = set()  # str(toplevel) already wired up
+
+    def __init__(self, master, textvariable, values=(), width=20,
+                 bg=FRONT_CARD_BG, page_bg=FRONT_BG, fg=FRONT_TEXT,
+                 accent=LIGHT_ACCENT, font=("Segoe UI", 11)):
+        super().__init__(master, bg=page_bg, highlightthickness=0)
+        self.textvariable = textvariable
+        self.values = list(values)
+        self.bg = bg
+        self.page_bg = page_bg
+        self.fg = fg
+        self.accent = accent
+        self.font = font
+        self._is_open = False
+        self._popup = None
+        self._popup_canvas = None
+        self._hover_index = None
+        self._current_idx = None
+        self._box_h = 32
+        # This widget draws its own box on a Canvas (for real rounded
+        # corners, unlike a plain Entry/ttk.Combobox) rather than wrapping
+        # a real Entry, so it has no built-in "width in characters" the
+        # way tk.Entry does — approximated here from the given char count
+        # instead, close enough to match how wide the ttk.Combobox call
+        # sites this replaces used to size themselves.
+        self._box_w = max(60, width * 8 + 34)
+
+        self.canvas = tk.Canvas(self, width=self._box_w, height=self._box_h,
+                                 highlightthickness=0, bg=page_bg, cursor="hand2")
+        self.canvas.pack()
+        self.canvas.bind("<Button-1>", self._toggle)
+        self._trace_id = textvariable.trace_add("write", lambda *_a: self._redraw())
+        self.bind("<Destroy>", self._on_destroy)
+        self._ensure_global_handlers()
+        self._redraw()
+
+    def _ensure_global_handlers(self):
+        cls = LightDropdown
+        if not cls._global_click_bound:
+            cls._global_click_bound = True
+            # add="+" so this coexists with any other app-wide Button-1
+            # handler (main.py's App already installs one for a different
+            # reason) rather than overwriting it — and since this is only
+            # ever *added*, never removed, there's no matching unbind_all
+            # to ever risk wiping that other handler out either (unlike
+            # bind_all, Tk's unbind_all clears *every* handler for a
+            # sequence on the "all" bindtag, not just this one — see
+            # CLAUDE.md).
+            self.bind_all("<Button-1>", LightDropdown._on_any_click, add="+")
+        top = self.winfo_toplevel()
+        key = str(top)
+        if key not in cls._deactivate_bound_toplevels:
+            cls._deactivate_bound_toplevels.add(key)
+            top.bind("<Deactivate>", lambda _e: LightDropdown._close_open_instance(), add="+")
+
+    @staticmethod
+    def _close_open_instance():
+        inst = LightDropdown._open_instance
+        if inst is not None:
+            inst._close_popup()
+
+    @staticmethod
+    def _on_any_click(event):
+        inst = LightDropdown._open_instance
+        if inst is None:
+            return
+        w = event.widget
+        if w is inst.canvas:
+            return  # the box's own <Button-1> handler already deals with this click
+        if inst._popup is not None:
+            try:
+                if str(w).startswith(str(inst._popup)):
+                    return  # a row click — the popup canvas's own handler deals with it
+            except Exception:
+                pass
+        inst._close_popup()
+
+    def _on_destroy(self, _event=None):
+        try:
+            self.textvariable.trace_remove("write", self._trace_id)
+        except Exception:
+            pass
+        self._close_popup()
+
+    def set_values(self, values):
+        self.values = list(values)
+
+    def _redraw(self):
+        c = self.canvas
+        c.delete("all")
+        border = self.accent if self._is_open else FRONT_BORDER
+        _draw_rounded_rect(c, 1, 1, self._box_w - 1, self._box_h - 1, self.RADIUS,
+                            fill=self.bg, outline=border, width=1.5)
+        c.create_text(12, self._box_h // 2, text=self.textvariable.get(), anchor="w",
+                       fill=self.fg, font=self.font)
+        # Chevron flips to point up while the popup is open, matching a
+        # native <select>'s own convention for signalling open/closed.
+        cx, cy = self._box_w - 18, self._box_h // 2
+        pts = (cx - 5, cy + 2, cx + 5, cy + 2, cx, cy - 3) if self._is_open \
+            else (cx - 5, cy - 2, cx + 5, cy - 2, cx, cy + 3)
+        c.create_polygon(pts, fill=FRONT_TEXT_MUTED, outline="")
+
+    def _toggle(self, _event=None):
+        if self._is_open:
+            self._close_popup()
+        else:
+            self._open_popup()
+
+    def _open_popup(self):
+        if LightDropdown._open_instance is not None and LightDropdown._open_instance is not self:
+            LightDropdown._open_instance._close_popup()
+        if not self.values:
+            return
+        self._is_open = True
+        LightDropdown._open_instance = self
+        self._redraw()
+
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        self._popup = popup
+
+        w = self._box_w
+        h = len(self.values) * self.ROW_H + self.PAD_Y * 2
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self._box_h + 4
+        popup.geometry(f"{w}x{h}+{x}+{y}")
+
+        canvas = tk.Canvas(popup, width=w, height=h, highlightthickness=0, bg=self.page_bg)
+        canvas.pack()
+        self._popup_canvas = canvas
+        self._hover_index = None
+        try:
+            self._current_idx = self.values.index(self.textvariable.get())
+        except ValueError:
+            self._current_idx = None
+        self._draw_popup_rows()
+
+        canvas.bind("<Motion>", self._on_popup_motion)
+        canvas.bind("<Leave>", lambda _e: self._set_hover(None))
+        canvas.bind("<Button-1>", self._on_popup_click)
+        # No grab_set() — this is a transient popup, not a modal dialog;
+        # grabbing would block the outside click this relies on to close.
+        popup.bind("<Escape>", lambda _e: self._close_popup())
+        popup.bind("<FocusOut>", lambda _e: self._close_popup())
+        popup.focus_force()
+
+    def _draw_popup_rows(self):
+        c = self._popup_canvas
+        c.delete("all")
+        w = self._box_w
+        h = len(self.values) * self.ROW_H + self.PAD_Y * 2
+        _draw_rounded_rect(c, 1, 1, w - 1, h - 1, self.RADIUS,
+                            fill=self.bg, outline=FRONT_BORDER, width=1.5)
+        for i, val in enumerate(self.values):
+            y1 = self.PAD_Y + i * self.ROW_H
+            y2 = y1 + self.ROW_H
+            if i == self._hover_index:
+                _draw_rounded_rect(c, 5, y1 + 2, w - 5, y2 - 2, 8,
+                                    fill=LIGHT_ACCENT_SOFT, outline="")
+            selected = i == self._current_idx
+            text_color = self.accent if selected else self.fg
+            text_font = (self.font[0], self.font[1], "bold") if selected else self.font
+            c.create_text(16, (y1 + y2) // 2, text=str(val), anchor="w",
+                           fill=text_color, font=text_font)
+
+    def _on_popup_motion(self, event):
+        idx = (event.y - self.PAD_Y) // self.ROW_H
+        self._set_hover(idx if 0 <= idx < len(self.values) else None)
+
+    def _set_hover(self, idx):
+        if idx != self._hover_index:
+            self._hover_index = idx
+            self._draw_popup_rows()
+
+    def _on_popup_click(self, event):
+        idx = (event.y - self.PAD_Y) // self.ROW_H
+        if 0 <= idx < len(self.values):
+            self.textvariable.set(self.values[idx])
+            self._close_popup()
+            self.event_generate("<<ComboboxSelected>>")
+
+    def _close_popup(self):
+        if self._popup is not None:
+            self._popup.destroy()
+            self._popup = None
+            self._popup_canvas = None
+        if self._is_open:
+            self._is_open = False
+            self._redraw()
+        if LightDropdown._open_instance is self:
+            LightDropdown._open_instance = None
+
+
+# =============================================================================
+class LightEntry(tk.Frame):
+    """Rounded-corner text field, replacing the flat `highlightthickness`-
+    bordered `tk.Entry` that `_make_light_entry` used to return directly.
+    A plain `tk.Entry` has no border-radius option of its own — same
+    structural limit as everything else on this theme — so this wraps a
+    real, borderless `tk.Entry` inside a `tk.Canvas`-drawn rounded
+    rectangle instead, the same "Canvas background + embedded real
+    widget" construction `RoundedCard`/`LightSpinner` already use. Applies
+    equally to a typeable field (`state="normal"`, the default) and an
+    untypeable one (`state="readonly"`/`"disabled"`) — the rounded box
+    itself doesn't care which; only the embedded `Entry`'s own state does.
+
+    Drop-in replacement for what `_make_light_entry` used to return —
+    every existing call site already only ever used `.get()`/`.insert()`/
+    `.delete()`/`.bind()` (all forwarded here to the real inner `Entry`,
+    `.entry`) and `.configure(state=...)` (the one configure kwarg any
+    call site actually used post-construction, forwarded the same way).
+    `.pack()`/`.grid()` work as normal since this is a real `tk.Frame`.
+
+    Supports being stretched via `.grid(sticky="we")` in a weighted
+    column (used by Metadata Manager's tag fields) — the rounded rect and
+    the embedded `Entry`'s own width both track the canvas's actual
+    allocated width on `<Configure>`, the same resize-tracking
+    `RoundedCard` already needs for its own body.
+
+    Border turns `accent`-colored while the `Entry` has keyboard focus,
+    matching `LightSpinner`/`LightDropdown`'s own focus-highlight
+    convention."""
+
+    RADIUS = 8
+    PAD_X = 10
+    BOX_H = 36
+    # A real tk.Entry, embedded on a canvas via create_window and centered
+    # purely by geometry (BOX_H // 2), renders its text visibly *higher*
+    # than a tk.Label centered the same way with the same font — Tk's two
+    # widget implementations don't vertically position text within their
+    # own box identically. TEXT_Y_NUDGE closes *that* gap on its own,
+    # independently of BOX_SHIFT below, which moves the box (and this
+    # already-centered text riding along inside it) as one rigid unit
+    # relative to a sibling Label, purely for visual taste. Don't "solve"
+    # BOX_SHIFT by adjusting this instead (or vice versa) — that
+    # reintroduces the very gap TEXT_Y_NUDGE exists to close, just
+    # relative to the box instead of the Label; keep the two independent.
+    # Tuned by real screenshot + pixel measurement each time, not guessed
+    # — most recently nudged back up slightly (6 -> 4) per direct visual
+    # feedback that text sat a touch low within the box's own borders.
+    TEXT_Y_NUDGE = 0
+    # Shifts the drawn box (and everything on its canvas — border *and*
+    # embedded Entry together) down within this widget's own row-alignment
+    # bounding box, via `place()` rather than pack()'d padding. A caller's
+    # grid/pack centers *this whole widget* against a sibling Label using
+    # this widget's own declared height (BOX_H, unchanged) — so ordinary
+    # padding added on just one side gets *halved* by that same centering
+    # (half the added space ends up above the old center, half below,
+    # diluting a desired D-pixel shift down to only D/2). `place()` here
+    # sidesteps that: the canvas is deliberately allowed to render
+    # BOX_SHIFT px past this Frame's own declared bottom edge, which
+    # doesn't disturb the Frame's own declared size (still exactly BOX_H,
+    # so it keeps centering against the Label exactly as it always did)
+    # while still visibly moving the box itself down by the full,
+    # undiluted BOX_SHIFT. Since this Frame has no visible content of its
+    # own (bg matches the canvas's), the overflow is seamless. Purely a
+    # deliberate visual offset from the Label's exact center, requested
+    # directly — the box+text unit still keeps its own internal centering
+    # (via TEXT_Y_NUDGE above) exactly as before.
+    BOX_SHIFT = 0
+
+    def __init__(self, parent, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 accent=LIGHT_ACCENT, font=("Segoe UI", 11), **entry_kwargs):
+        super().__init__(parent, bg=bg, highlightthickness=0)
+        self.bg = bg
+        self.accent = accent
+        self._border_color = FRONT_BORDER
+
+        self.canvas = tk.Canvas(self, height=self.BOX_H, highlightthickness=0, bg=bg)
+
+        defaults = dict(relief="flat", bd=0, highlightthickness=0,
+                         bg=bg, fg=fg, font=font, insertbackground=fg,
+                         disabledbackground=bg, readonlybackground=bg)
+        defaults.update(entry_kwargs)
+        self.entry = tk.Entry(self.canvas, **defaults)
+        self.entry.update_idletasks()
+        self._entry_w = self.entry.winfo_reqwidth()
+        self._window_id = self.canvas.create_window(
+            self.PAD_X, self.BOX_H // 2 + self.TEXT_Y_NUDGE, window=self.entry, anchor="w")
+
+        self._current_w = self._entry_w + self.PAD_X * 2
+        self.canvas.configure(width=self._current_w)
+        self.configure(width=self._current_w, height=self.BOX_H)
+        self._position_canvas()
+
+        # bind() is overridden below to forward to the inner Entry (so
+        # external callers can do e.g. `light_entry.bind("<<Paste>>", ...)`
+        # without reaching into `.entry` themselves) — this Frame-level
+        # <Configure> binding needs the real tk.Frame.bind underneath that
+        # override, not the override itself.
+        tk.Frame.bind(self, "<Configure>", self._on_configure)
+        # add="+" so an external `.bind("<FocusOut>", ...)` call (e.g. a
+        # numeric field clamping its value on focus-out) coexists with
+        # this instead of silently replacing it — see LightSpinner's own
+        # docstring note about the identical hazard.
+        self.entry.bind("<FocusIn>", lambda _e: self._set_focused(True), add="+")
+        self.entry.bind("<FocusOut>", lambda _e: self._set_focused(False), add="+")
+        self._redraw()
+
+    def _position_canvas(self, width=None):
+        # Centers the canvas within this widget's *actual* current height
+        # before applying BOX_SHIFT — NOT a hardcoded y=BOX_SHIFT assuming
+        # self stays exactly BOX_H tall. A caller's `ipady` on its own
+        # grid()/pack() call genuinely *resizes* this widget (confirmed
+        # for real: unlike pady, which only adds external margin around an
+        # unchanged-size widget, ipady inflates the widget's own allocated
+        # rectangle) — Metadata Manager's fields use ipady=6, making self
+        # 48px tall, not 36. A fixed y=BOX_SHIFT then anchored the canvas
+        # near self's own top instead of its middle, pushing the box
+        # *above* the Label's center instead of the intended tiny bit
+        # below it. Recomputing from self.winfo_height() every time keeps
+        # this correct regardless of whether the caller uses ipady or not.
+        self.update_idletasks()
+        y = max(0, (self.winfo_height() - self.BOX_H) // 2) + self.BOX_SHIFT
+        kwargs = {"x": 0, "y": y}
+        if width is not None:
+            kwargs["width"] = width
+        self.canvas.place(**kwargs)
+
+    def _on_configure(self, event):
+        self._current_w = event.width
+        self._position_canvas(width=event.width)
+        self.canvas.itemconfig(self._window_id,
+                                width=max(self._entry_w, event.width - self.PAD_X * 2))
+        self._redraw()
+
+    def _set_focused(self, focused):
+        self._border_color = self.accent if focused else FRONT_BORDER
+        self._redraw()
+
+    def _redraw(self):
+        c = self.canvas
+        c.delete("box")
+        _draw_rounded_rect(c, 1, 1, self._current_w - 1, self.BOX_H - 1, self.RADIUS,
+                            fill=self.bg, outline=self._border_color, width=1.5, tags="box")
+        c.tag_lower("box")
+
+    # --- Entry-compatible surface, forwarded to the real inner Entry ---
+    def get(self, *args, **kwargs):
+        return self.entry.get(*args, **kwargs)
+
+    def insert(self, *args, **kwargs):
+        return self.entry.insert(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        return self.entry.delete(*args, **kwargs)
+
+    def bind(self, *args, **kwargs):
+        return self.entry.bind(*args, **kwargs)
+
+    def configure(self, **kwargs):
+        if "state" in kwargs:
+            self.entry.configure(state=kwargs.pop("state"))
+        if kwargs:
+            super().configure(**kwargs)
+
+    config = configure
+
+
 # =============================================================================
 class DiffCheckList(ttk.LabelFrame):
     """The recurring 'Apply to: [x] Diff1 [x] Diff2 ...' widget, ticked by
     default. Displays each difficulty's [Version] name (e.g. "Oni") rather
-    than the full filename, for compactness."""
+    than the full filename, for compactness.
 
-    def __init__(self, master, app, label="Apply to:"):
-        super().__init__(master, text=label)
+    `light=True` (opt-in, default off so every other caller is unaffected)
+    replaces the native ttk.LabelFrame chrome entirely with a RoundedCard,
+    plus tk.Checkbutton (not ttk) rows with an indigo `selectcolor` — a
+    native-themed ttk.Checkbutton's indicator glyph, and a ttk.LabelFrame's
+    own border/label, are drawn by Windows' own UxTheme under the "vista"
+    theme and ignore style color/geometry overrides (confirmed empirically
+    elsewhere in this redesign — see main.py's title bar / sidebar, which
+    hit the same wall), so matching the light theme's card look needs
+    fully custom rendering instead of trying to reskin the native widgets.
+
+    `label_inside=False` skips drawing the bold "Apply to" label inside
+    the card — for a caller (e.g. CopySection) that wants to put its own
+    label above the card instead, as part of a larger enclosing layout."""
+
+    def __init__(self, master, app, label="Apply to:", light=False, label_inside=True):
+        self.light = light
+        if light:
+            # Deliberately calls ttk.Frame.__init__ instead of going through
+            # super()/LabelFrame — even with text="", a real ttk::labelframe
+            # Tk widget still reserves a label-margin strip above its content
+            # on this theme (confirmed empirically: a persistent gray band
+            # appeared above the card no matter what padding/borderwidth was
+            # configured), since that margin is baked into the "labelframe"
+            # layout itself, not conditional on the label text being empty.
+            # A plain ttk::frame widget has no such reserved region.
+            ttk.Frame.__init__(self, master)
+            self._card = RoundedCard(self)
+            self._card.pack(fill="both", expand=True)
+            if label_inside:
+                tk.Label(self._card.body, text=label.rstrip(":").strip(), bg=FRONT_CARD_BG,
+                         fg=FRONT_TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+            self.inner = tk.Frame(self._card.body, bg=FRONT_CARD_BG)
+            self.inner.pack(fill="both", expand=True)
+        else:
+            super().__init__(master, text=label)
+            self.inner = ttk.Frame(self)
+            self.inner.pack(fill="both", expand=True)
         self.app = app
         self.vars = {}          # display label -> BooleanVar
         self.label_to_file = {}  # display label -> filename
-        self.inner = ttk.Frame(self)
-        self.inner.pack(fill="both", expand=True)
 
     MAX_ROWS_PER_COLUMN = 3
 
@@ -819,11 +1790,16 @@ class DiffCheckList(ttk.LabelFrame):
         ordered_labels = sorted(self.label_to_file.keys(), key=osu_parser.taiko_diff_sort_key)
         for i, label in enumerate(ordered_labels):
             v = tk.BooleanVar(value=True)
-            cb = ttk.Checkbutton(self.inner, text=label, variable=v)
+            if self.light:
+                cb = LightCheckbox(self.inner, label, v, font=("Segoe UI", 11))
+            else:
+                cb = ttk.Checkbutton(self.inner, text=label, variable=v)
             row = i % self.MAX_ROWS_PER_COLUMN
             col = i // self.MAX_ROWS_PER_COLUMN
             cb.grid(row=row, column=col, sticky="w", padx=(0, 16), pady=1)
             self.vars[label] = v
+        if self.light:
+            self._card.redraw()
 
     def selected(self):
         return [self.label_to_file[label] for label, v in self.vars.items() if v.get()]
@@ -835,15 +1811,31 @@ class DiffRadioList(ttk.LabelFrame):
     time (unlike the usual "apply to several diffs at once" pattern
     DiffCheckList is for). Supports preselecting a specific difficulty
     (e.g. whichever one is actually open in a live osu! editor) instead
-    of always defaulting to the alphabetically/priority-first one."""
+    of always defaulting to the alphabetically/priority-first one.
 
-    def __init__(self, master, app, label="Apply to:"):
-        super().__init__(master, text=label)
+    `light=True` (opt-in, default off so every other caller is unaffected)
+    renders as a RoundedCard with LightRadiobutton rows instead of a
+    native LabelFrame+ttk.Radiobutton — same rationale as DiffCheckList's
+    own light mode (see its docstring)."""
+
+    def __init__(self, master, app, label="Apply to:", light=False, label_inside=True):
+        self.light = light
+        if light:
+            ttk.Frame.__init__(self, master)
+            self._card = RoundedCard(self)
+            self._card.pack(fill="both", expand=True)
+            if label_inside:
+                tk.Label(self._card.body, text=label.rstrip(":").strip(), bg=FRONT_CARD_BG,
+                         fg=FRONT_TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+            self.inner = tk.Frame(self._card.body, bg=FRONT_CARD_BG)
+            self.inner.pack(fill="both", expand=True)
+        else:
+            super().__init__(master, text=label)
+            self.inner = ttk.Frame(self)
+            self.inner.pack(fill="both", expand=True)
         self.app = app
         self.label_to_file = {}
         self.var = tk.StringVar()
-        self.inner = ttk.Frame(self)
-        self.inner.pack(fill="both", expand=True)
 
     MAX_ROWS_PER_COLUMN = 3
 
@@ -854,7 +1846,10 @@ class DiffRadioList(ttk.LabelFrame):
         self.label_to_file = osu_parser.get_diff_display_map(folder, diffs) if folder else {}
         ordered_labels = sorted(self.label_to_file.keys(), key=osu_parser.taiko_diff_sort_key)
         for i, label in enumerate(ordered_labels):
-            rb = ttk.Radiobutton(self.inner, text=label, value=label, variable=self.var)
+            if self.light:
+                rb = LightRadiobutton(self.inner, label, self.var, label)
+            else:
+                rb = ttk.Radiobutton(self.inner, text=label, value=label, variable=self.var)
             row = i % self.MAX_ROWS_PER_COLUMN
             col = i // self.MAX_ROWS_PER_COLUMN
             rb.grid(row=row, column=col, sticky="w", padx=(0, 16), pady=1)
@@ -868,6 +1863,8 @@ class DiffRadioList(ttk.LabelFrame):
         if preselect_label is None and ordered_labels:
             preselect_label = ordered_labels[0]
         self.var.set(preselect_label or "")
+        if self.light:
+            self._card.redraw()
 
     def selected(self):
         return self.label_to_file.get(self.var.get())
@@ -1008,30 +2005,49 @@ class FrontPage(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
 
-        footer = ttk.Frame(self.body)
-        footer.pack(side="bottom", pady=(0, 10))
-        credit_row = ttk.Frame(footer)
-        credit_row.pack()
-        ttk.Label(credit_row, text="From Amasugi ❤ ", font=("Segoe UI", 9)).pack(side="left")
-        credit_link = tk.Label(credit_row, text="App Icon", font=("Segoe UI", 9, "underline"),
-                                fg="#3366cc", cursor="hand2")
+        # This screen's canvas/body normally inherit the default ttk frame
+        # background (see BaseToolFrame) — overridden here, and only here,
+        # to the FrontPage-specific light card palette (FRONT_* above).
+        self._scroll_canvas.configure(bg=FRONT_BG)
+        ttk.Style().configure("FrontBody.TFrame", background=FRONT_BG)
+        self.body.configure(style="FrontBody.TFrame")
+
+        footer = tk.Frame(self.body, bg=FRONT_BG)
+        footer.pack(side="bottom", pady=(0, 24))
+        card = tk.Frame(footer, bg=FRONT_CARD_BG, highlightthickness=1,
+                         highlightbackground=FRONT_BORDER, highlightcolor=FRONT_BORDER)
+        card.pack()
+        credit_row = tk.Frame(card, bg=FRONT_CARD_BG)
+        credit_row.pack(padx=28, pady=(16, 2))
+        tk.Label(credit_row, text="From Amasugi! ❤ ", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        credit_link = tk.Label(credit_row, text="App Icon", font=("Segoe UI", 10, "underline"),
+                                bg=FRONT_CARD_BG, fg="#4f46e5", cursor="hand2")
         credit_link.pack(side="left")
         credit_link.bind("<Button-1>", lambda e: webbrowser.open(self.CREDIT_URL))
-        ttk.Label(footer, text=f"App Version: {getattr(app, 'app_version', '?')}",
-                  font=("Segoe UI", 8), foreground="#999999").pack(pady=(4, 0))
+        tk.Label(card, text=f"App Version: {getattr(app, 'app_version', '?')}",
+                 bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 9)).pack(pady=(0, 16))
 
-        content = ttk.Frame(self.body)
-        content.pack(expand=True)
+        content = tk.Frame(self.body, bg=FRONT_BG)
+        content.pack(expand=True, pady=(40, 0))
 
         logo = self._load_logo_image()
         if logo is not None:
             self._logo_image = logo  # kept alive on self, not just this scope
-            ttk.Label(content, image=logo).pack(pady=(0, 20))
+            tk.Label(content, image=logo, bg=FRONT_BG).pack(pady=(0, 24))
 
-        ttk.Label(content, text="osu!taiko Mapping Tools",
-                  font=("Segoe UI", 26)).pack()
-        ttk.Label(content, text="Made by osu!taiko mapper, for osu!taiko mappers",
-                  font=("Segoe UI", 12), foreground="#666666").pack(pady=(6, 0))
+        title_image = _render_gradient_text("osu!taiko Mapping Tools", font_size=30)
+        if title_image is not None:
+            self._title_image = title_image  # kept alive on self
+            tk.Label(content, image=title_image, bg=FRONT_BG).pack()
+        else:
+            tk.Label(content, text="osu!taiko Mapping Tools", bg=FRONT_BG, fg=FRONT_TEXT,
+                      font=("Segoe UI", 26, "bold")).pack()
+
+        tk.Label(content, text="Made by osu!taiko mapper, for osu!taiko mappers",
+                 bg=FRONT_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 12)).pack(pady=(8, 0))
+        tk.Label(content, text="────  ✦  ────",
+                 bg=FRONT_BG, fg=FRONT_BORDER, font=("Segoe UI", 10)).pack(pady=(10, 0))
 
     def _load_logo_image(self):
         """icon.png doubles as the app's window/taskbar icon (see
@@ -1053,19 +2069,35 @@ class FrontPage(BaseToolFrame):
 
 # =============================================================================
 class MetadataManagerFrame(BaseToolFrame):
+    # osu!'s own Tags field has no hard server-side cap this app is aware
+    # of — 1000 is a generous, deliberately round local limit so the field
+    # can't grow unboundedly, not a value mirrored from the game itself.
+    TAGS_MAX_CHARS = 1000
+
     def __init__(self, master, app):
         super().__init__(master, app)
-        add_header(self.body, "Metadata Manager",
-                   "Import metadata from selected mapset, and apply changed "
-                   "metadata to all difficulties in the set (or a few of "
-                   "them, if you're into it)")
+        _style_light_body(self)
 
-        row0 = ttk.Frame(self.body)
-        row0.pack(anchor="w", padx=10, pady=10)
-        ttk.Button(row0, text="Import Meta", command=self.import_meta).pack(side="left")
+        header_row = tk.Frame(self.body, bg=FRONT_BG)
+        header_row.pack(fill="x", padx=24, pady=(20, 4))
+        tk.Label(header_row, text="Metadata Manager", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        info_icon = InfoIcon(header_row,
+                              "Import metadata from selected mapset, and apply changed "
+                              "metadata to all difficulties in the set (or a few of "
+                              "them, if you're into it)")
+        info_icon.configure(bg=FRONT_BG)
+        info_icon.pack(side="left", padx=(6, 0))
 
-        form = ttk.Frame(self.body)
-        form.pack(fill="x", padx=10)
+        row0 = tk.Frame(self.body, bg=FRONT_BG)
+        row0.pack(anchor="w", padx=24, pady=(4, 16))
+        _make_ghost_button(row0, "Import Meta", self.import_meta).pack(side="left")
+        self.autofill_var = tk.BooleanVar(value=True)
+        LightCheckbox(row0, "Auto-fill", self.autofill_var, bg=FRONT_BG).pack(
+            side="left", padx=(12, 0))
+
+        form = tk.Frame(self.body, bg=FRONT_BG)
+        form.pack(fill="x", padx=24)
         self.fields = {}
         labels = [
             ("Artist", "Artist"),
@@ -1076,33 +2108,70 @@ class MetadataManagerFrame(BaseToolFrame):
             ("Mapper", "Mapper"),
         ]
         for i, (label, key) in enumerate(labels):
-            ttk.Label(form, text=label + ":").grid(row=i, column=0, sticky="w", pady=3)
-            e = ttk.Entry(form, width=60)
-            e.grid(row=i, column=1, sticky="we", pady=3, padx=5)
+            tk.Label(form, text=label, bg=FRONT_BG, fg=FRONT_TEXT,
+                     font=("Segoe UI", 11)).grid(row=i, column=0, sticky="w", pady=8)
+            e = _make_light_entry(form, width=60)
+            e.grid(row=i, column=1, sticky="we", pady=8, padx=(12, 0), ipadx=8, ipady=6)
             self.fields[key] = e
         form.columnconfigure(1, weight=1)
 
         # Tags gets its own multi-line box (room for ~5 lines of text)
         tags_row = len(labels)
-        ttk.Label(form, text="Tags:").grid(row=tags_row, column=0, sticky="nw", pady=3)
-        tags_frame = ttk.Frame(form)
-        tags_frame.grid(row=tags_row, column=1, sticky="we", pady=3, padx=5)
-        self.tags_text = tk.Text(tags_frame, width=60, height=5, wrap="word", font=("Segoe UI", 14))
+        tk.Label(form, text="Tags", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).grid(row=tags_row, column=0, sticky="nw", pady=8)
+        tags_frame = tk.Frame(form, bg=FRONT_CARD_BG, highlightthickness=1,
+                               highlightbackground=FRONT_BORDER, highlightcolor=LIGHT_ACCENT)
+        tags_frame.grid(row=tags_row, column=1, sticky="we", pady=8, padx=(12, 0))
+        self.tags_text = tk.Text(tags_frame, width=60, height=5, wrap="word", font=("Segoe UI", 11),
+                                  relief="flat", bd=0, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                                  insertbackground=FRONT_TEXT, padx=8, pady=6)
         tags_scroll = ttk.Scrollbar(tags_frame, orient="vertical", command=self.tags_text.yview)
         self.tags_text.configure(yscrollcommand=tags_scroll.set)
         self.tags_text.pack(side="left", fill="both", expand=True)
         tags_scroll.pack(side="right", fill="y")
+        self.tags_text.bind("<<Modified>>", self._on_tags_modified)
 
-        pf = ttk.Frame(self.body)
-        pf.pack(fill="x", padx=10, pady=5)
-        ttk.Label(pf, text="Preview Point:").pack(side="left")
-        self.preview_point = ttk.Entry(pf, width=15)
-        self.preview_point.pack(side="left", padx=5)
+        self.tags_count_var = tk.StringVar(value=f"0 / {self.TAGS_MAX_CHARS}")
+        tk.Label(form, textvariable=self.tags_count_var, bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
+                 font=("Segoe UI", 9)).grid(row=tags_row + 1, column=1, sticky="e", pady=(2, 8))
 
-        self.diff_list = DiffCheckList(self.body, app)
-        self.diff_list.pack(fill="both", expand=True, padx=10, pady=5)
+        # Preview Point shares the same grid/column as Artist/Title/etc.
+        # (rather than its own separately-packed row) so its box's left
+        # edge lines up with every other field's — a pack-based row here
+        # sized itself off "Preview Point" 's own label width instead of
+        # the grid's shared column-0 width, which visibly misaligned it
+        # against the rest once every field got a distinct rounded box.
+        preview_row = tags_row + 2
+        tk.Label(form, text="Preview Point", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).grid(row=preview_row, column=0, sticky="w", pady=(4, 8))
+        self.preview_point = _make_light_entry(form, width=15)
+        self.preview_point.grid(row=preview_row, column=1, sticky="w", pady=(4, 8), padx=(12, 0))
 
-        ttk.Button(self.body, text="Apply", command=self.apply).pack(anchor="e", padx=10, pady=10)
+        self.diff_list = DiffCheckList(self.body, app, light=True)
+        self.diff_list.pack(fill="both", expand=True, padx=24, pady=(16, 8))
+
+        apply_row = tk.Frame(self.body, bg=FRONT_BG)
+        apply_row.pack(fill="x", padx=24, pady=(4, 20))
+        _make_accent_button(apply_row, "Apply", self.apply).pack(side="right")
+
+    def _on_tags_modified(self, _event=None):
+        """Live character counter + hard cap for the Tags box — Text
+        widgets have no built-in maxlength/validate option the way Entry
+        does, so this reacts to <<Modified>> instead: over the cap, the
+        overflow is trimmed back off immediately. edit_modified(False) at
+        the end resets the flag so the next real edit fires this again
+        (Tk only re-fires <<Modified>> on a False->True transition, so the
+        delete/insert used to trim doesn't recursively re-trigger this
+        while it's already running)."""
+        if not self.tags_text.edit_modified():
+            return
+        text = self.tags_text.get("1.0", "end-1c")
+        if len(text) > self.TAGS_MAX_CHARS:
+            text = text[: self.TAGS_MAX_CHARS]
+            self.tags_text.delete("1.0", "end")
+            self.tags_text.insert("1.0", text)
+        self.tags_count_var.set(f"{len(text)} / {self.TAGS_MAX_CHARS}")
+        self.tags_text.edit_modified(False)
 
     def on_shown(self):
         self.diff_list.refresh()
@@ -1118,7 +2187,10 @@ class MetadataManagerFrame(BaseToolFrame):
         changes (picked up from osu!, browsed to manually, or found via
         search), so the fields are never stale/empty without the user
         having to remember to click Import Meta. Does nothing (no warning
-        popup) if no map is loaded yet."""
+        popup) if no map is loaded yet, or if the "Auto-fill" checkbox is
+        unticked — Import Meta still works manually either way."""
+        if not self.autofill_var.get():
+            return
         folder, diffs = self.app.get_diff_files()
         if not folder or not diffs:
             return
@@ -1161,37 +2233,87 @@ class MetadataManagerFrame(BaseToolFrame):
 class CopySection(ttk.Frame):
     """Reusable 'big header (i) / Copy X from: [dropdown] / Apply to:
     [checklist] / Apply' block — same layout used for both volume and kiai
-    copying, each as its own bordered section."""
+    copying, each as its own section.
 
-    def __init__(self, master, owner, title, source_label_text, copy_func, noun, info_text=None):
-        super().__init__(master, relief="groove", borderwidth=1)
+    `light=True` (opt-in, default off so every other caller is unaffected)
+    renders the section as a RoundedCard instead of a native
+    ttk.Frame(relief="groove") box — same rationale as DiffCheckList's own
+    light mode (see its docstring)."""
+
+    def __init__(self, master, owner, title, source_label_text, copy_func, noun,
+                 info_text=None, light=False):
+        self.light = light
+        if light:
+            ttk.Frame.__init__(self, master)
+            self._card = RoundedCard(self)
+            self._card.pack(fill="both", expand=True)
+            body = self._card.body
+        else:
+            super().__init__(master, relief="groove", borderwidth=1)
+            body = self
         self.owner = owner  # hosting BaseToolFrame (for require_map/notify_done/app)
         self.copy_func = copy_func
         self.noun = noun
 
-        add_header(self, title, info_text)
+        if light:
+            header_row = tk.Frame(body, bg=FRONT_CARD_BG)
+            header_row.pack(fill="x", pady=(0, 10))
+            tk.Label(header_row, text=title, bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
+                     font=("Segoe UI", 13, "bold")).pack(side="left")
+            if info_text:
+                info_icon = InfoIcon(header_row, info_text)
+                info_icon.configure(bg=FRONT_CARD_BG)
+                info_icon.pack(side="left", padx=(6, 0))
 
-        row = ttk.Frame(self)
-        row.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Label(row, text=source_label_text).pack(side="left")
-        self.source_var = tk.StringVar()
-        self.source_combo = ttk.Combobox(row, textvariable=self.source_var, state="readonly", width=25)
-        self.source_combo.pack(side="left", padx=5)
-        self.diff_map = {}
+            row = tk.Frame(body, bg=FRONT_CARD_BG)
+            row.pack(fill="x", pady=(0, 12))
+            tk.Label(row, text=source_label_text, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                     font=("Segoe UI", 11)).pack(side="left")
+            self.source_var = tk.StringVar()
+            self.source_combo = LightDropdown(row, self.source_var, width=25, page_bg=FRONT_CARD_BG)
+            self.source_combo.pack(side="left", padx=(10, 0))
+            self.diff_map = {}
 
-        self.diff_list = DiffCheckList(self, owner.app)
-        self.diff_list.pack(fill="both", expand=True, padx=10, pady=5)
+            tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                     font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
+            self.diff_list = DiffCheckList(body, owner.app, light=True, label_inside=False)
+            self.diff_list.pack(fill="both", expand=True, pady=(0, 12))
 
-        ttk.Button(self, text="Apply", command=self.apply).pack(anchor="e", padx=10, pady=10)
+            btn_row = tk.Frame(body, bg=FRONT_CARD_BG)
+            btn_row.pack(fill="x")
+            _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
+        else:
+            add_header(self, title, info_text)
+
+            row = ttk.Frame(self)
+            row.pack(fill="x", padx=10, pady=(0, 10))
+            ttk.Label(row, text=source_label_text).pack(side="left")
+            self.source_var = tk.StringVar()
+            self.source_combo = ttk.Combobox(row, textvariable=self.source_var, state="readonly", width=25)
+            self.source_combo.pack(side="left", padx=5)
+            self.diff_map = {}
+
+            self.diff_list = DiffCheckList(self, owner.app)
+            self.diff_list.pack(fill="both", expand=True, padx=10, pady=5)
+
+            ttk.Button(self, text="Apply", command=self.apply).pack(anchor="e", padx=10, pady=10)
 
     def refresh(self):
         folder, diffs = self.owner.app.get_diff_files()
         self.diff_map = osu_parser.get_diff_display_map(folder, diffs) if folder else {}
         labels = sorted(self.diff_map.keys(), key=osu_parser.taiko_diff_sort_key)
-        self.source_combo["values"] = labels
+        if self.light:
+            self.source_combo.set_values(labels)
+        else:
+            self.source_combo["values"] = labels
         if labels and self.source_var.get() not in labels:
             self.source_var.set(labels[0])
         self.diff_list.refresh()
+        if self.light:
+            # The nested diff_list card just resized itself (its own
+            # refresh() redraws its own card) — this outer card also needs
+            # to catch up, since its own body's total height just changed.
+            self._card.redraw()
 
     def apply(self):
         if not self.owner.require_map():
@@ -1214,18 +2336,20 @@ class CopySection(ttk.Frame):
 class VolumeKiaiCopierFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        add_header(self.body, "Volume/Kiai Copier")
+        _style_light_body(self)
 
         self.volume_section = CopySection(
             self.body, self, "Volume Copier", "Copy volume from:", logic.copy_volumes, "Volume",
             info_text="Copy the volume changes of a difficulty and apply them "
-                       "to any difficulties in the set.")
-        self.volume_section.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+                       "to any difficulties in the set.",
+            light=True)
+        self.volume_section.pack(fill="both", expand=True, padx=24, pady=(16, 6))
         self.kiai_section = CopySection(
             self.body, self, "Kiai Copier", "Copy kiai from:", logic.copy_kiai, "Kiai",
             info_text="Copy the kiai portions of a difficulty and apply them "
-                       "to any difficulties in the set.")
-        self.kiai_section.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+                       "to any difficulties in the set.",
+            light=True)
+        self.kiai_section.pack(fill="both", expand=True, padx=24, pady=(6, 16))
 
     def on_shown(self):
         self.refresh()
@@ -1242,16 +2366,25 @@ class VolumeKiaiCopierFrame(BaseToolFrame):
 class MapCleanerFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        add_header(self.body, "Map Cleaner",
-                   "Make the map looks prettier and snappier in the editor "
-                   "without fundamentally changing how the map is played.")
+        _style_light_body(self)
 
-        row = ttk.Frame(self.body)
-        row.pack(fill="x", padx=10, pady=10)
-        ttk.Label(row, text="Selected diff:").pack(side="left")
+        header_row = tk.Frame(self.body, bg=FRONT_BG)
+        header_row.pack(fill="x", padx=24, pady=(20, 4))
+        tk.Label(header_row, text="Map Cleaner", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        header_info = InfoIcon(header_row,
+                                "Make the map looks prettier and snappier in the editor "
+                                "without fundamentally changing how the map is played.")
+        header_info.configure(bg=FRONT_BG)
+        header_info.pack(side="left", padx=(6, 0))
+
+        diff_row = tk.Frame(self.body, bg=FRONT_BG)
+        diff_row.pack(fill="x", padx=24, pady=(4, 16))
+        tk.Label(diff_row, text="Selected diff:", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).pack(side="left")
         self.diff_var = tk.StringVar()
-        self.diff_combo = ttk.Combobox(row, textvariable=self.diff_var, state="readonly", width=25)
-        self.diff_combo.pack(side="left", padx=5)
+        self.diff_combo = LightDropdown(diff_row, self.diff_var, width=25)
+        self.diff_combo.pack(side="left", padx=(10, 0))
         self.diff_map = {}
 
         self.resnap_notes_var = tk.BooleanVar(value=False)
@@ -1276,190 +2409,181 @@ class MapCleanerFrame(BaseToolFrame):
         vcmd_float = (self.register(self._validate_float), "%P")
         vcmd_time = (self.register(_validate_partial_time), "%P")
 
-        opts = ttk.Frame(self.body)
-        opts.pack(fill="x", padx=10, pady=2, anchor="w")
+        card = RoundedCard(self.body)
+        card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        opts = card.body
 
-        r1 = ttk.Frame(opts)
-        r1.pack(fill="x", anchor="w", pady=2)
-        ttk.Checkbutton(r1, text="Resnap all notes", variable=self.resnap_notes_var,
-                         command=self._sync_resnap_notes_state).pack(side="left")
-        self.divisor_combo = ttk.Combobox(r1, textvariable=self.snap_divisor_var, values=DIVISORS,
-                                           state="readonly", width=8)
+        def info(parent, text, **kw):
+            icon = InfoIcon(parent, text, **kw)
+            icon.configure(bg=FRONT_CARD_BG)
+            return icon
+
+        def row(indent=0, pady=6):
+            r = tk.Frame(opts, bg=FRONT_CARD_BG)
+            r.pack(fill="x", anchor="w", padx=(indent, 0), pady=pady)
+            return r
+
+        def label(parent, text, **kw):
+            defaults = dict(bg=FRONT_CARD_BG, fg=FRONT_TEXT, font=("Segoe UI", 11))
+            defaults.update(kw)
+            return tk.Label(parent, text=text, **defaults)
+
+        r1 = row()
+        LightCheckbox(r1, "Resnap all notes", self.resnap_notes_var,
+                      command=self._sync_resnap_notes_state).pack(side="left")
+        self.divisor_combo = LightDropdown(r1, self.snap_divisor_var, values=DIVISORS,
+                                            width=8, page_bg=FRONT_CARD_BG)
         self.divisor_combo.pack(side="left", padx=8)
-        InfoIcon(r1, "- 1/12 = 1/4 + 1/6\n- 1/24 = 1/8 + 1/12\n- 1/36 = 1/4 + 1/6 + 1/9\n"
-                     "- 1/48 = 1/12 + 1/16").pack(side="left")
+        info(r1, "- 1/12 = 1/4 + 1/6\n- 1/24 = 1/8 + 1/12\n- 1/36 = 1/4 + 1/6 + 1/9\n"
+                 "- 1/48 = 1/12 + 1/16").pack(side="left")
 
         # Resnap Child Option: Apply to this section only
-        r1_section = ttk.Frame(opts)
-        r1_section.pack(fill="x", anchor="w", padx=(24, 0), pady=2)
-        self.resnap_section_only_cb = ttk.Checkbutton(
-            r1_section, text="Apply to this section only",
-            variable=self.resnap_section_only_var, command=self._sync_resnap_section_state,
-            state="disabled")
+        r1_section = row(indent=24)
+        self.resnap_section_only_cb = LightCheckbox(
+            r1_section, "Apply to this section only", self.resnap_section_only_var,
+            command=self._sync_resnap_section_state)
         self.resnap_section_only_cb.pack(side="left")
+        self.resnap_section_only_cb.set_enabled(False)
 
-        r1_section_fields = ttk.Frame(opts)
-        r1_section_fields.pack(fill="x", anchor="w", padx=(24, 0), pady=2)
-        self.resnap_from_label = ttk.Label(r1_section_fields, text="From", state="disabled")
+        r1_section_fields = row(indent=24)
+        self.resnap_from_label = label(r1_section_fields, "From", fg=FRONT_TEXT_MUTED)
         self.resnap_from_label.pack(side="left")
-        self.resnap_from_entry = ttk.Entry(r1_section_fields, textvariable=self.resnap_from_var, width=15,
-                                            validate="key", validatecommand=vcmd_time, state="disabled")
-        self.resnap_from_entry.pack(side="left", padx=5)
+        self.resnap_from_entry = _make_light_entry(
+            r1_section_fields, textvariable=self.resnap_from_var, width=15,
+            validate="key", validatecommand=vcmd_time, state="disabled")
+        self.resnap_from_entry.pack(side="left", padx=5, ipady=4)
         self.resnap_from_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.resnap_from_var))
-        self.resnap_to_label = ttk.Label(r1_section_fields, text="to", state="disabled")
+        self.resnap_to_label = label(r1_section_fields, "to", fg=FRONT_TEXT_MUTED)
         self.resnap_to_label.pack(side="left")
-        self.resnap_to_entry = ttk.Entry(r1_section_fields, textvariable=self.resnap_to_var, width=15,
-                                          validate="key", validatecommand=vcmd_time, state="disabled")
-        self.resnap_to_entry.pack(side="left", padx=5)
+        self.resnap_to_entry = _make_light_entry(
+            r1_section_fields, textvariable=self.resnap_to_var, width=15,
+            validate="key", validatecommand=vcmd_time, state="disabled")
+        self.resnap_to_entry.pack(side="left", padx=5, ipady=4)
         self.resnap_to_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.resnap_to_var))
 
-        r2 = ttk.Frame(opts)
-        r2.pack(fill="x", anchor="w", pady=2)
-        ttk.Checkbutton(r2, text="Remove unused green lines", variable=self.remove_unused_green_var).pack(side="left")
-        InfoIcon(r2, "Remove all redundant lines that have no meaningful "
-                     "effect on the map.").pack(side="left", padx=(2, 0))
+        r2 = row()
+        LightCheckbox(r2, "Remove unused green lines", self.remove_unused_green_var).pack(side="left")
+        info(r2, "Remove all redundant lines that have no meaningful "
+                 "effect on the map.").pack(side="left", padx=(6, 0))
 
-        r3 = ttk.Frame(opts)
-        r3.pack(fill="x", anchor="w", pady=2)
-        ttk.Checkbutton(r3, text="Snap Kiai Toggles", variable=self.resnap_important_green_var).pack(side="left")
-        InfoIcon(r3, "Resolve the occasional kiai unsnaps.").pack(side="left", padx=(2, 0))
+        r3 = row()
+        LightCheckbox(r3, "Snap Kiai Toggles", self.resnap_important_green_var).pack(side="left")
+        info(r3, "Resolve the occasional kiai unsnaps.").pack(side="left", padx=(6, 0))
 
-        r4 = ttk.Frame(opts)
-        r4.pack(fill="x", anchor="w", pady=2)
-        ttk.Checkbutton(r4, text="Turn all Kat's whistle to clap", variable=self.kat_var).pack(side="left")
-        InfoIcon(r4, "Remove all whistle hitsounds and replace them with claps.").pack(side="left", padx=(2, 0))
+        r4 = row()
+        LightCheckbox(r4, "Turn all Kat's whistle to clap", self.kat_var).pack(side="left")
+        info(r4, "Remove all whistle hitsounds and replace them with claps.").pack(side="left", padx=(6, 0))
 
-        r5 = ttk.Frame(opts)
-        r5.pack(fill="x", anchor="w", pady=2)
-        ttk.Checkbutton(r5, text="Set all green/red lines to Normal Sampleset",
-                         variable=self.sampleset_var).pack(side="left")
-        InfoIcon(r5, "Make sure the entire map is in Normal Sampleset so it "
-                     "won't play funny hitsounds for some skins. Be careful "
-                     "when using custom hitsounds.").pack(side="left", padx=(2, 0))
+        r5 = row()
+        LightCheckbox(r5, "Set all green/red lines to Normal Sampleset", self.sampleset_var).pack(side="left")
+        info(r5, "Make sure the entire map is in Normal Sampleset so it "
+                 "won't play funny hitsounds for some skins. Be careful "
+                 "when using custom hitsounds.").pack(side="left", padx=(6, 0))
 
-        r6 = ttk.Frame(opts)
-        r6.pack(fill="x", anchor="w", pady=2)
-        ttk.Checkbutton(r6, text="Resolve red/green line conflicts",
-                         variable=self.conflicts_var).pack(side="left")
-        InfoIcon(r6, "Resolve the mismatched kiai and volume setting between "
-                     "green line and red line on the same timestamp. Green "
-                     "line takes priority over red line.").pack(side="left", padx=(2, 0))
+        r6 = row()
+        LightCheckbox(r6, "Resolve red/green line conflicts", self.conflicts_var).pack(side="left")
+        info(r6, "Resolve the mismatched kiai and volume setting between "
+                 "green line and red line on the same timestamp. Green "
+                 "line takes priority over red line.").pack(side="left", padx=(6, 0))
 
         # Base SV Option
-        r_base_sv = ttk.Frame(opts)
-        r_base_sv.pack(fill="x", anchor="w", pady=2)
-        self.set_base_sv_cb = ttk.Checkbutton(
-            r_base_sv, text="Set base SV setting to 1.4",
-            variable=self.set_base_sv_var,
-            command=self._sync_base_sv_state
-        )
+        r_base_sv = row()
+        self.set_base_sv_cb = LightCheckbox(r_base_sv, "Set base SV setting to 1.4", self.set_base_sv_var,
+                                             command=self._sync_base_sv_state)
         self.set_base_sv_cb.pack(side="left")
-        InfoIcon(r_base_sv, "Use this tool if your map's base SV got rounding error.").pack(side="left", padx=(2, 10))
+        info(r_base_sv, "Use this tool if your map's base SV got rounding error.").pack(side="left", padx=(6, 10))
 
         # Base SV Child Option: Other
-        r_base_sv_other = ttk.Frame(opts)
-        r_base_sv_other.pack(fill="x", anchor="w", padx=(24, 0), pady=2)
-        self.base_sv_other_cb = ttk.Checkbutton(
-            r_base_sv_other, text="Other",
-            variable=self.base_sv_other_var,
-            command=self._sync_base_sv_state,
-            state="disabled"
-        )
-        self.base_sv_other_cb.pack(side="left", padx=(5, 5))
+        r_base_sv_other = row(indent=24)
+        self.base_sv_other_cb = LightCheckbox(r_base_sv_other, "Other", self.base_sv_other_var,
+                                               command=self._sync_base_sv_state)
+        self.base_sv_other_cb.pack(side="left", padx=(0, 5))
+        self.base_sv_other_cb.set_enabled(False)
 
-        self.base_sv_spinbox = tk.Spinbox(
-            r_base_sv_other, from_=0.4, to=3.6, increment=0.1,
-            textvariable=self.base_sv_val_var, width=5,
-            state="disabled", format="%.1f",
-            validate="key", validatecommand=vcmd_float
-        )
+        self.base_sv_spinbox = LightSpinner(
+            r_base_sv_other, self.base_sv_val_var, from_=0.4, to=3.6, increment=0.1,
+            width=5, fmt="%.1f", validate=("key", vcmd_float))
         self.base_sv_spinbox.pack(side="left")
-        self.base_sv_spinbox.bind("<FocusOut>", self._on_base_sv_focus_out)
+        self.base_sv_spinbox.set_enabled(False)
+        self.base_sv_spinbox.entry.bind("<FocusOut>", self._on_base_sv_focus_out, add="+")
 
         # Push Green Option
-        r_push_green = ttk.Frame(opts)
-        r_push_green.pack(fill="x", anchor="w", pady=2)
-        self.push_green_cb = ttk.Checkbutton(
-            r_push_green, text="Push all green lines by ",
-            variable=self.push_green_var,
-            command=self._sync_push_green_state
-        )
+        r_push_green = row()
+        self.push_green_cb = LightCheckbox(r_push_green, "Push all green lines by ", self.push_green_var,
+                                            command=self._sync_push_green_state)
         self.push_green_cb.pack(side="left")
-        self.push_green_spinbox = tk.Spinbox(
-            r_push_green, from_=5, to=20, increment=1,
-            textvariable=self.push_green_ms_var, width=4,
-            state="disabled",
-            validate="key", validatecommand=vcmd_int
-        )
+        self.push_green_spinbox = LightSpinner(
+            r_push_green, self.push_green_ms_var, from_=5, to=20, increment=1,
+            width=4, fmt="%d", validate=("key", vcmd_int))
         self.push_green_spinbox.pack(side="left", padx=2)
-        self.push_green_spinbox.bind("<FocusOut>", self._on_push_green_focus_out)
-        ttk.Label(r_push_green, text=" ms").pack(side="left")
-        InfoIcon(r_push_green, "This does not affect kiai toggles and red-line-supported green lines.").pack(side="left", padx=(5, 0))
+        self.push_green_spinbox.set_enabled(False)
+        self.push_green_spinbox.entry.bind("<FocusOut>", self._on_push_green_focus_out, add="+")
+        label(r_push_green, " ms").pack(side="left")
+        info(r_push_green, "This does not affect kiai toggles and red-line-supported green lines."
+             ).pack(side="left", padx=(5, 0))
 
-        r7 = ttk.Frame(opts)
-        r7.pack(fill="x", anchor="w", pady=(8, 2))
-        ttk.Checkbutton(r7, text="Reposition all notes in playfield", variable=self.center_notes_var,
-                         command=self._sync_center_children_state).pack(side="left")
+        r7 = row(pady=(14, 6))
+        LightCheckbox(r7, "Reposition all notes in playfield", self.center_notes_var,
+                      command=self._sync_center_children_state).pack(side="left")
 
         self.note_position_mode_var = tk.StringVar(value="default")
 
-        r_center = ttk.Frame(opts)
-        r_center.pack(fill="x", anchor="w", padx=(24, 0))
-        self.center_radio = ttk.Radiobutton(
-            r_center, text="All notes in center", value="default",
-            variable=self.note_position_mode_var, state="disabled",
+        r_center = row(indent=24, pady=3)
+        self.center_radio = LightRadiobutton(
+            r_center, "All notes in center", self.note_position_mode_var, "default",
             command=self._sync_coord_buttons_state)
         self.center_radio.pack(side="left")
-        InfoIcon(r_center, "Move all the notes scattered around the screen to the "
-                           "clean middle of the screen.").pack(side="left", padx=(2, 0))
+        self.center_radio.set_enabled(False)
+        info(r_center, "Move all the notes scattered around the screen to the "
+                       "clean middle of the screen.").pack(side="left", padx=(2, 0))
 
-        r8 = ttk.Frame(opts)
-        r8.pack(fill="x", anchor="w", padx=(24, 0))
-        self.separate_finishers_radio = ttk.Radiobutton(
-            r8, text="Separate finishers", value="separate_finishers",
-            variable=self.note_position_mode_var, state="disabled",
+        r8 = row(indent=24, pady=3)
+        self.separate_finishers_radio = LightRadiobutton(
+            r8, "Separate finishers", self.note_position_mode_var, "separate_finishers",
             command=self._sync_coord_buttons_state)
         self.separate_finishers_radio.pack(side="left")
-        InfoIcon(r8, "Finisher notes will be placed at their own position "
-                     "for easier differentiation.").pack(side="left", padx=(2, 6))
-        self.finisher_coord_btn = ttk.Button(
-            r8, text="Change Coordinate", state="disabled",
-            command=self._open_finisher_coord_editor)
+        self.separate_finishers_radio.set_enabled(False)
+        info(r8, "Finisher notes will be placed at their own position "
+                 "for easier differentiation.").pack(side="left", padx=(2, 6))
+        self.finisher_coord_btn = _make_ghost_button(r8, "Change Coordinate", self._open_finisher_coord_editor)
+        self.finisher_coord_btn.configure(state="disabled")
         self.finisher_coord_btn.pack(side="left")
 
-        r9 = ttk.Frame(opts)
-        r9.pack(fill="x", anchor="w", padx=(24, 0))
-        self.separate_note_types_radio = ttk.Radiobutton(
-            r9, text="Separate note types", value="separate_note_types",
-            variable=self.note_position_mode_var, state="disabled",
+        r9 = row(indent=24, pady=3)
+        self.separate_note_types_radio = LightRadiobutton(
+            r9, "Separate note types", self.note_position_mode_var, "separate_note_types",
             command=self._sync_coord_buttons_state)
         self.separate_note_types_radio.pack(side="left")
-        InfoIcon(r9, "Don, Kat, Don Finisher, and Kat Finisher notes will "
-                     "each be placed at their own position for easier "
-                     "differentiation.").pack(side="left", padx=(2, 6))
-        self.note_type_coord_btn = ttk.Button(
-            r9, text="Change Coordinate", state="disabled",
-            command=self._open_note_type_coord_editor)
+        self.separate_note_types_radio.set_enabled(False)
+        info(r9, "Don, Kat, Don Finisher, and Kat Finisher notes will "
+                 "each be placed at their own position for easier "
+                 "differentiation.").pack(side="left", padx=(2, 6))
+        self.note_type_coord_btn = _make_ghost_button(r9, "Change Coordinate", self._open_note_type_coord_editor)
+        self.note_type_coord_btn.configure(state="disabled")
         self.note_type_coord_btn.pack(side="left")
 
-        ttk.Button(self.body, text="Apply", command=self.apply).pack(anchor="e", padx=10, pady=10)
+        apply_row = tk.Frame(self.body, bg=FRONT_BG)
+        apply_row.pack(fill="x", padx=24, pady=(0, 20))
+        _make_accent_button(apply_row, "Apply", self.apply).pack(side="right")
 
     def _sync_resnap_notes_state(self):
-        self.resnap_section_only_cb.configure(state="normal" if self.resnap_notes_var.get() else "disabled")
+        self.resnap_section_only_cb.set_enabled(self.resnap_notes_var.get())
         self._sync_resnap_section_state()
 
     def _sync_resnap_section_state(self):
-        state = "normal" if (self.resnap_notes_var.get() and self.resnap_section_only_var.get()) else "disabled"
+        enabled = self.resnap_notes_var.get() and self.resnap_section_only_var.get()
+        state = "normal" if enabled else "disabled"
         self.resnap_from_entry.configure(state=state)
         self.resnap_to_entry.configure(state=state)
-        self.resnap_from_label.configure(state=state)
-        self.resnap_to_label.configure(state=state)
+        fg = FRONT_TEXT if enabled else FRONT_TEXT_MUTED
+        self.resnap_from_label.configure(fg=fg)
+        self.resnap_to_label.configure(fg=fg)
 
     def _sync_center_children_state(self):
-        state = "normal" if self.center_notes_var.get() else "disabled"
-        self.center_radio.configure(state=state)
-        self.separate_finishers_radio.configure(state=state)
-        self.separate_note_types_radio.configure(state=state)
+        enabled = self.center_notes_var.get()
+        self.center_radio.set_enabled(enabled)
+        self.separate_finishers_radio.set_enabled(enabled)
+        self.separate_note_types_radio.set_enabled(enabled)
         self._sync_coord_buttons_state()
 
     def _sync_coord_buttons_state(self):
@@ -1472,20 +2596,14 @@ class MapCleanerFrame(BaseToolFrame):
 
     def _sync_base_sv_state(self):
         if self.set_base_sv_var.get():
-            self.base_sv_other_cb.configure(state="normal")
-            if self.base_sv_other_var.get():
-                self.base_sv_spinbox.configure(state="normal")
-            else:
-                self.base_sv_spinbox.configure(state="disabled")
+            self.base_sv_other_cb.set_enabled(True)
+            self.base_sv_spinbox.set_enabled(self.base_sv_other_var.get())
         else:
-            self.base_sv_other_cb.configure(state="disabled")
-            self.base_sv_spinbox.configure(state="disabled")
+            self.base_sv_other_cb.set_enabled(False)
+            self.base_sv_spinbox.set_enabled(False)
 
     def _sync_push_green_state(self):
-        if self.push_green_var.get():
-            self.push_green_spinbox.configure(state="normal")
-        else:
-            self.push_green_spinbox.configure(state="disabled")
+        self.push_green_spinbox.set_enabled(self.push_green_var.get())
 
     def _validate_int(self, P):
         if P == "":
@@ -1555,7 +2673,7 @@ class MapCleanerFrame(BaseToolFrame):
         folder, diffs = self.app.get_diff_files()
         self.diff_map = osu_parser.get_diff_display_map(folder, diffs) if folder else {}
         labels = sorted(self.diff_map.keys(), key=osu_parser.taiko_diff_sort_key)
-        self.diff_combo["values"] = labels
+        self.diff_combo.set_values(labels)
 
         target_label = None
         if sync_to_current:
@@ -1648,93 +2766,109 @@ class MapCleanerFrame(BaseToolFrame):
 class OffsetShifterFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
+        _style_light_body(self)
 
-        # Two equal-height sections (offset/silence, then audio re-encode)
-        # rather than one section sized to its content and a lot of dead
-        # space below it — both of these Frames get `expand=True`, so
-        # Tk's pack manager splits whatever leftover vertical space the
-        # window has evenly between them.
-        section_offset = ttk.Frame(self.body)
-        section_offset.pack(fill="both", expand=True)
+        def info(parent, text, **kw):
+            icon = InfoIcon(parent, text, **kw)
+            icon.configure(bg=FRONT_CARD_BG)
+            return icon
 
-        add_header(section_offset, "Audio/Offset Settings",
-                   "Change offset and resnap all notes and preview point "
-                   "for all difficulties.")
+        # ---- Section 1: Audio/Offset Settings ------------------------------
+        self.card1 = RoundedCard(self.body)
+        self.card1.pack(fill="both", expand=True, padx=24, pady=(20, 12))
+        body1 = self.card1.body
 
-        form = ttk.Frame(section_offset)
-        form.pack(fill="x", padx=10, pady=10)
-        ttk.Label(form, text="Current offset:").grid(row=0, column=0, sticky="w", pady=3)
-        self.current_entry = ttk.Entry(form, width=15, state="readonly")
-        self.current_entry.grid(row=0, column=1, sticky="w", pady=3)
+        header1 = tk.Frame(body1, bg=FRONT_CARD_BG)
+        header1.pack(fill="x", pady=(0, 14))
+        tk.Label(header1, text="Audio/Offset Settings", bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
+                 font=("Segoe UI", 13, "bold")).pack(side="left")
+        info(header1, "Change offset and resnap all notes and preview point "
+                       "for all difficulties.").pack(side="left", padx=(6, 0))
 
-        ttk.Label(form, text="New offset:").grid(row=1, column=0, sticky="w", pady=3)
+        form = tk.Frame(body1, bg=FRONT_CARD_BG)
+        form.pack(fill="x", pady=(0, 12))
+        tk.Label(form, text="Current offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", pady=6)
+        self.current_entry = _make_light_entry(form, width=15, state="readonly")
+        self.current_entry.grid(row=0, column=1, sticky="w", pady=6, padx=(10, 0), ipady=4, ipadx=6)
+
+        tk.Label(form, text="New offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).grid(row=1, column=0, sticky="w", pady=6)
         self.new_var = tk.StringVar()
-        self.new_entry = tk.Spinbox(form, width=13, textvariable=self.new_var,
-                                     from_=-10_000_000, to=10_000_000, increment=1)
-        self.new_entry.grid(row=1, column=1, sticky="w", pady=3)
+        self.new_entry = LightSpinner(form, self.new_var, from_=-10_000_000, to=10_000_000,
+                                       increment=1, width=13)
+        self.new_entry.grid(row=1, column=1, sticky="w", pady=6, padx=(10, 0))
         self.new_var.trace_add("write", self._on_new_changed)
 
-        ttk.Label(form, text="Change:").grid(row=2, column=0, sticky="w", pady=3)
+        tk.Label(form, text="Change:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).grid(row=2, column=0, sticky="w", pady=6)
         self.change_var = tk.StringVar(value="0")
-        self.change_entry = tk.Spinbox(form, width=13, textvariable=self.change_var,
-                                        from_=-10_000_000, to=10_000_000, increment=1)
-        self.change_entry.grid(row=2, column=1, sticky="w", pady=3)
+        self.change_entry = LightSpinner(form, self.change_var, from_=-10_000_000, to=10_000_000,
+                                          increment=1, width=13)
+        self.change_entry.grid(row=2, column=1, sticky="w", pady=6, padx=(10, 0))
         self.change_var.trace_add("write", self._on_change_changed)
 
         self._updating = False
         self.base_offset = 0
 
         self.add_silence_var = tk.BooleanVar(value=False)
-        r_silence = ttk.Frame(section_offset)
-        r_silence.pack(fill="x", anchor="w", padx=10, pady=(0, 5))
-        ttk.Checkbutton(r_silence, text="Add silence", variable=self.add_silence_var).pack(side="left")
-        InfoIcon(r_silence, "Add 1000ms of silence to the beginning of the "
-                             "song to avoid first-note lag.").pack(side="left", padx=(2, 0))
+        r_silence = tk.Frame(body1, bg=FRONT_CARD_BG)
+        r_silence.pack(fill="x", anchor="w", pady=(0, 12))
+        LightCheckbox(r_silence, "Add silence", self.add_silence_var).pack(side="left")
+        info(r_silence, "Add 1000ms of silence to the beginning of the "
+                         "song to avoid first-note lag.").pack(side="left", padx=(6, 0))
 
-        self.diff_list = DiffCheckList(section_offset, app)
-        self.diff_list.pack(fill="both", expand=True, padx=10, pady=5)
+        tk.Label(body1, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        self.diff_list = DiffCheckList(body1, app, light=True, label_inside=False)
+        self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
 
-        ttk.Button(section_offset, text="Apply", command=self.apply).pack(anchor="e", padx=10, pady=10)
+        btn_row1 = tk.Frame(body1, bg=FRONT_CARD_BG)
+        btn_row1.pack(fill="x")
+        _make_accent_button(btn_row1, "Apply", self.apply).pack(side="right")
 
-        ttk.Separator(self.body, orient="horizontal").pack(fill="x", padx=10, pady=(0, 10))
+        # ---- Section 2: Audio Re-encode ------------------------------------
+        card2 = RoundedCard(self.body)
+        card2.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        body2 = card2.body
 
-        section_reencode = ttk.Frame(self.body)
-        section_reencode.pack(fill="both", expand=True)
-
-        add_header(section_reencode, "Audio Re-encode",
-                   "Re-encode audio down to a lower bitrate to reduce file size.")
+        header2 = tk.Frame(body2, bg=FRONT_CARD_BG)
+        header2.pack(fill="x", pady=(0, 14))
+        tk.Label(header2, text="Audio Re-encode", bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
+                 font=("Segoe UI", 13, "bold")).pack(side="left")
+        info(header2, "Re-encode audio down to a lower bitrate to reduce file size."
+             ).pack(side="left", padx=(6, 0))
 
         self.reencode_source_var = tk.StringVar(value="map")
-        r_src_map = ttk.Frame(section_reencode)
-        r_src_map.pack(fill="x", anchor="w", padx=10, pady=(6, 2))
-        ttk.Radiobutton(r_src_map, text="Use audio from the currently selected song",
-                         variable=self.reencode_source_var, value="map",
-                         command=self._sync_reencode_source_state).pack(side="left")
+        r_src_map = tk.Frame(body2, bg=FRONT_CARD_BG)
+        r_src_map.pack(fill="x", anchor="w", pady=(0, 6))
+        LightRadiobutton(r_src_map, "Use audio from the currently selected song",
+                          self.reencode_source_var, "map",
+                          command=self._sync_reencode_source_state).pack(side="left")
 
-        r_src_other = ttk.Frame(section_reencode)
-        r_src_other.pack(fill="x", anchor="w", padx=10, pady=(0, 2))
-        ttk.Radiobutton(r_src_other, text="Use other audio file",
-                         variable=self.reencode_source_var, value="other",
-                         command=self._sync_reencode_source_state).pack(side="left")
-        self.reencode_browse_btn = ttk.Button(r_src_other, text="Browse...",
-                                               command=self._browse_reencode_audio)
-        self.reencode_browse_btn.pack(side="left", padx=(8, 6))
+        r_src_other = tk.Frame(body2, bg=FRONT_CARD_BG)
+        r_src_other.pack(fill="x", anchor="w", pady=(0, 12))
+        LightRadiobutton(r_src_other, "Use other audio file", self.reencode_source_var, "other",
+                          command=self._sync_reencode_source_state).pack(side="left")
+        self.reencode_browse_btn = _make_ghost_button(r_src_other, "Browse...", self._browse_reencode_audio)
+        self.reencode_browse_btn.pack(side="left", padx=(10, 8))
         self.reencode_other_path = None
         self.reencode_other_name_var = tk.StringVar(value="")
-        ttk.Label(r_src_other, textvariable=self.reencode_other_name_var,
-                  foreground="#555555").pack(side="left")
+        tk.Label(r_src_other, textvariable=self.reencode_other_name_var, bg=FRONT_CARD_BG,
+                 fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10)).pack(side="left")
 
         self.reencode_bitrate_var = tk.StringVar(value="192")
-        r_bitrate = ttk.Frame(section_reencode)
-        r_bitrate.pack(fill="x", anchor="w", padx=(30, 10), pady=(2, 5))
-        for label, value in (("208kbps", "208"), ("192kbps", "192"),
-                              ("160kbps", "160"), ("128kbps", "128")):
-            ttk.Radiobutton(r_bitrate, text=label, value=value,
-                             variable=self.reencode_bitrate_var).pack(side="left", padx=(0, 10))
+        r_bitrate = tk.Frame(body2, bg=FRONT_CARD_BG)
+        r_bitrate.pack(fill="x", anchor="w", padx=(24, 0), pady=(0, 16))
+        for blabel, value in (("208kbps", "208"), ("192kbps", "192"),
+                               ("160kbps", "160"), ("128kbps", "128")):
+            LightRadiobutton(r_bitrate, blabel, self.reencode_bitrate_var, value
+                              ).pack(side="left", padx=(0, 16))
         self._sync_reencode_source_state()
 
-        ttk.Button(section_reencode, text="Apply", command=self.apply_reencode).pack(
-            anchor="e", padx=10, pady=(0, 10))
+        btn_row2 = tk.Frame(body2, bg=FRONT_CARD_BG)
+        btn_row2.pack(fill="x")
+        _make_accent_button(btn_row2, "Apply", self.apply_reencode).pack(side="right")
 
     def on_shown(self):
         self.refresh()
@@ -1762,6 +2896,13 @@ class OffsetShifterFrame(BaseToolFrame):
 
     def refresh(self):
         self.diff_list.refresh()
+        # The diff checklist just resized its own nested card to fit
+        # however many diffs there are — this outer card wrapping it needs
+        # to catch up too, or its rounded-rect boundary stays drawn at the
+        # stale (pre-refresh) height while the actual content below it
+        # grows/shrinks, producing a visible seam (see CopySection.refresh
+        # for the same pattern).
+        self.card1.redraw()
         folder, diffs = self.app.get_diff_files()
         if diffs:
             bm = osu_parser.Beatmap(os.path.join(folder, diffs[0]))
@@ -1937,33 +3078,52 @@ class OffsetShifterFrame(BaseToolFrame):
 class BgOffsetShifterFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        add_header(self.body, "BG Settings",
-                   "Preview and set BG offset without having to manually "
-                   "repeatedly type and guess the desired number.")
+        _style_light_body(self)
 
-        row = ttk.Frame(self.body)
-        row.pack(fill="x", padx=10, pady=10)
-        ttk.Label(row, text="BG File:").pack(side="left")
+        header_row = tk.Frame(self.body, bg=FRONT_BG)
+        header_row.pack(fill="x", padx=24, pady=(20, 4))
+        tk.Label(header_row, text="BG Settings", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        header_info = InfoIcon(header_row,
+                                "Preview and set BG offset without having to manually "
+                                "repeatedly type and guess the desired number.")
+        header_info.configure(bg=FRONT_BG)
+        header_info.pack(side="left", padx=(6, 0))
+
+        bg_row = tk.Frame(self.body, bg=FRONT_BG)
+        bg_row.pack(fill="x", padx=24, pady=(4, 16))
+        tk.Label(bg_row, text="BG File:", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).pack(side="left")
         self.bg_var = tk.StringVar()
-        self.bg_combo = ttk.Combobox(row, textvariable=self.bg_var, state="readonly", width=30)
-        self.bg_combo.pack(side="left", padx=5)
+        self.bg_combo = LightDropdown(bg_row, self.bg_var, width=30)
+        self.bg_combo.pack(side="left", padx=(10, 0))
         self.bg_combo.bind("<<ComboboxSelected>>", self._on_bg_selected)
+        _make_ghost_button(bg_row, "Browse...", self.browse_bg).pack(side="left", padx=(10, 0))
 
-        row2 = ttk.Frame(self.body)
-        row2.pack(fill="x", padx=10, pady=5)
-        ttk.Label(row2, text="New Offset:").pack(side="left")
+        self.card = RoundedCard(self.body)
+        self.card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        body = self.card.body
+
+        row2 = tk.Frame(body, bg=FRONT_CARD_BG)
+        row2.pack(fill="x", pady=(0, 12))
+        tk.Label(row2, text="New Offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).pack(side="left")
         self.offset_var = tk.StringVar(value="0")
-        tk.Spinbox(row2, textvariable=self.offset_var, width=8,
-                   from_=-10_000, to=10_000, increment=1).pack(side="left", padx=5)
-        ttk.Button(row2, text="Preview", command=self.open_preview).pack(side="left", padx=10)
+        LightSpinner(row2, self.offset_var, from_=-10_000, to=10_000, increment=1,
+                     width=8, fmt="%d").pack(side="left", padx=(10, 10))
+        _make_ghost_button(row2, "Preview", self.open_preview).pack(side="left")
 
         self.convert_jpg_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.body, text="Convert to .jpg", variable=self.convert_jpg_var).pack(anchor="w", padx=10)
+        LightCheckbox(body, "Convert to .jpg", self.convert_jpg_var).pack(anchor="w", pady=(0, 12))
 
-        self.diff_list = DiffCheckList(self.body, app)
-        self.diff_list.pack(fill="both", expand=True, padx=10, pady=5)
+        tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
+        self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
 
-        ttk.Button(self.body, text="Apply", command=self.apply).pack(anchor="e", padx=10, pady=10)
+        btn_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        btn_row.pack(fill="x")
+        _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
 
     def on_shown(self):
         self.refresh()
@@ -1974,7 +3134,7 @@ class BgOffsetShifterFrame(BaseToolFrame):
     def refresh(self):
         folder, diffs = self.app.get_diff_files()
         images = logic.list_song_folder_images(folder) if folder else []
-        self.bg_combo["values"] = images
+        self.bg_combo.set_values(images)
         current_bg = None
         if folder and diffs:
             bm = osu_parser.Beatmap(os.path.join(folder, diffs[0]))
@@ -1986,9 +3146,29 @@ class BgOffsetShifterFrame(BaseToolFrame):
         else:
             self.bg_var.set("")
         self.diff_list.refresh()
+        # See OffsetShifterFrame.refresh for why this outer card needs an
+        # explicit redraw after the nested diff checklist's own height
+        # changes — the diff_list's own card only resyncs itself.
+        self.card.redraw()
         self._prefill_current_offset()
 
     def _on_bg_selected(self, _event=None):
+        self._prefill_current_offset()
+
+    def browse_bg(self):
+        folder, _ = self.app.get_diff_files()
+        if not folder:
+            messagebox.showwarning("No map loaded", "Load a map before browsing for a background image.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select background image",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        final_name = logic.import_external_bg_image(folder, path)
+        self.refresh()
+        self.bg_var.set(final_name)
         self._prefill_current_offset()
 
     def _prefill_current_offset(self):
@@ -2062,7 +3242,7 @@ class PreviewWindow(tk.Toplevel):
     def __init__(self, parent_frame, folder, bg_file, initial_offset, on_apply):
         super().__init__(parent_frame)
         self.title("BG Offset Preview")
-        _position_over_window(self, parent_frame, width=self.CANVAS_W, height=self.CANVAS_H + 40)
+        _position_over_window(self, parent_frame, width=self.CANVAS_W, height=self.CANVAS_H + 56)
         self.resizable(False, False)
         self.folder = folder
         self.bg_file = bg_file
@@ -2076,17 +3256,22 @@ class PreviewWindow(tk.Toplevel):
         self._disp_to_osu = logic.OSU_H / self.CANVAS_H
         self.reverse_var = tk.BooleanVar(value=False)
 
-        top = ttk.Frame(self)
+        self.configure(bg=FRONT_BG)
+        top = tk.Frame(self, bg=FRONT_BG)
         top.pack(fill="x")
-        ttk.Button(top, text="Apply", command=self._apply).pack(side="right", padx=10, pady=5)
-        ttk.Checkbutton(top, text="Reverse control", variable=self.reverse_var).pack(
-            side="left", padx=10, pady=5)
-        InfoIcon(top, "- Drag the BG vertically to adjust its "
-                      "position and find the ideal offset for your map. "
-                      "You can also use the mouse wheel for finer "
-                      "adjustments.\n"
-                      "- For precise positioning, use the ↑ and ↓ buttons "
-                      "to fine-tune the offset.", align="right").pack(side="right", padx=(0, 4), pady=5)
+        _make_accent_button(top, "Apply", self._apply).pack(side="right", padx=10, pady=8)
+        top_info = InfoIcon(top, "- Drag the BG vertically to adjust its "
+                                  "position and find the ideal offset for your map. "
+                                  "You can also use the mouse wheel for finer "
+                                  "adjustments.\n"
+                                  "- For precise positioning, use the ↑ and ↓ buttons "
+                                  "to fine-tune the offset.", align="right")
+        top_info.configure(bg=FRONT_BG)
+        top_info.pack(side="right", padx=(0, 4), pady=8)
+        LightCheckbox(top, "Reverse control", self.reverse_var, bg=FRONT_BG).pack(
+            side="left", padx=10, pady=8)
+
+        tk.Frame(self, bg=FRONT_BORDER, height=1).pack(fill="x")
 
         self.canvas = tk.Canvas(self, width=self.CANVAS_W, height=self.CANVAS_H,
                                  bg="black", highlightthickness=0)
@@ -2165,6 +3350,56 @@ class PreviewWindow(tk.Toplevel):
         self.destroy()
 
 
+class _TransportButton(tk.Canvas):
+    """Small canvas-drawn rewind/play/pause/forward icon button, used by
+    VideoPreviewWindow's seek row instead of the Unicode "media control"
+    glyphs (ffff/f8/e9) — those render with a built-in square frame baked
+    right into the glyph itself on Windows (Segoe UI Emoji), which a
+    ttk.Button's own border used to mask but a borderless flat button
+    exposes as an unwanted box around each icon. Drawing the triangles/bars
+    directly sidesteps the font entirely, matching the rest of this theme's
+    "native rendering can't be controlled, draw it ourselves" approach
+    (see LightCheckbox/LightRadiobutton)."""
+
+    def __init__(self, parent, kind, command, size=26, bg=FRONT_BG,
+                 fg=FRONT_TEXT, hover_fg=LIGHT_ACCENT):
+        super().__init__(parent, width=size, height=size, bg=bg,
+                          highlightthickness=0, cursor="hand2")
+        self.kind = kind
+        self.fg = fg
+        self.hover_fg = hover_fg
+        self._draw(fg)
+        self.bind("<Button-1>", lambda _e: command())
+        self.bind("<Enter>", lambda _e: self._draw(self.hover_fg))
+        self.bind("<Leave>", lambda _e: self._draw(self.fg))
+
+    def set_kind(self, kind):
+        self.kind = kind
+        self._draw(self.fg)
+
+    def _draw(self, color):
+        self.delete("icon")
+        cx, cy = int(self["width"]) / 2, int(self["height"]) / 2
+        if self.kind == "back":
+            self.create_polygon(cx + 1, cy - 7, cx + 1, cy + 7, cx - 6, cy,
+                                 fill=color, outline=color, tags="icon")
+            self.create_polygon(cx + 8, cy - 7, cx + 8, cy + 7, cx + 1, cy,
+                                 fill=color, outline=color, tags="icon")
+        elif self.kind == "forward":
+            self.create_polygon(cx - 8, cy - 7, cx - 8, cy + 7, cx - 1, cy,
+                                 fill=color, outline=color, tags="icon")
+            self.create_polygon(cx - 1, cy - 7, cx - 1, cy + 7, cx + 6, cy,
+                                 fill=color, outline=color, tags="icon")
+        elif self.kind == "play":
+            self.create_polygon(cx - 5, cy - 7, cx - 5, cy + 7, cx + 6, cy,
+                                 fill=color, outline=color, tags="icon")
+        elif self.kind == "pause":
+            self.create_rectangle(cx - 6, cy - 7, cx - 2, cy + 7, fill=color,
+                                   outline=color, tags="icon")
+            self.create_rectangle(cx + 2, cy - 7, cx + 6, cy + 7, fill=color,
+                                   outline=color, tags="icon")
+
+
 class VideoPreviewWindow(tk.Toplevel):
     """480x270 live preview: plays the song's audio and the chosen video at
     the same time via VLC, with a seeker and quick offset buttons
@@ -2181,6 +3416,7 @@ class VideoPreviewWindow(tk.Toplevel):
         import vlc
 
         self.title("Video Sync Offset Preview")
+        self.configure(bg=FRONT_BG)
         _position_over_window(self, parent_frame, width=1440, height=840)
         self.resizable(False, False)
         self.folder = folder
@@ -2192,13 +3428,17 @@ class VideoPreviewWindow(tk.Toplevel):
         self._poll_job = None
         self._seeking = False
 
-        top = ttk.Frame(self)
-        top.pack(side="top", fill="x")
-        self.offset_label = ttk.Label(top, text=f"Current Video Offset: {self.offset}")
-        self.offset_label.pack(side="left", padx=10, pady=5)
+        ttk.Style().configure("Light.Horizontal.TScale", background=FRONT_BG,
+                               troughcolor=FRONT_BORDER)
 
-        ttk.Button(top, text="Apply", command=self._apply).pack(side="right", padx=10, pady=5)
-        InfoIcon(top, "- Use the offset controls to adjust the video's timing "
+        top = tk.Frame(self, bg=FRONT_BG)
+        top.pack(side="top", fill="x")
+        self.offset_label = tk.Label(top, text=f"Current Video Offset: {self.offset}",
+                                      bg=FRONT_BG, fg=FRONT_TEXT, font=("Segoe UI", 12, "bold"))
+        self.offset_label.pack(side="left", padx=14, pady=10)
+
+        _make_accent_button(top, "Apply", self._apply).pack(side="right", padx=14, pady=8)
+        top_info = InfoIcon(top, "- Use the offset controls to adjust the video's timing "
                       "until it is properly synchronized with the audio. Do "
                       "note that every time the offset is adjusted, the "
                       "video will restart.\n"
@@ -2206,7 +3446,11 @@ class VideoPreviewWindow(tk.Toplevel):
                       "the offset by applying a positive value.\n"
                       "- Use ← and → buttons to seek backward or forward "
                       "through the video, and press the Space key to play "
-                      "or pause playback.", align="right").pack(side="right", padx=(0, 4), pady=5)
+                      "or pause playback.", align="right")
+        top_info.configure(bg=FRONT_BG)
+        top_info.pack(side="right", padx=(0, 4), pady=8)
+
+        tk.Frame(self, bg=FRONT_BORDER, height=1).pack(fill="x")
 
         # Bottom-anchored controls packed first (each subsequent side="bottom"
         # widget stacks above the previous), so the volume row ends up right
@@ -2214,12 +3458,13 @@ class VideoPreviewWindow(tk.Toplevel):
         # seek bar above that — then the video surface fills whatever space
         # remains, using the freed-up room instead of leaving dead space
         # below a small fixed-size video area.
-        vol_row = ttk.Frame(self)
-        vol_row.pack(side="bottom", fill="x", padx=10, pady=(0, 6))
-        ttk.Label(vol_row, text="Vol").pack(side="right", padx=(4, 0))
+        vol_row = tk.Frame(self, bg=FRONT_BG)
+        vol_row.pack(side="bottom", fill="x", padx=14, pady=(4, 10))
+        tk.Label(vol_row, text="Vol", bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
+                 font=("Segoe UI", 10)).pack(side="right", padx=(6, 0))
         self.volume_var = tk.IntVar(value=50)
-        self.volume_scale = ttk.Scale(vol_row, from_=0, to=100, orient="horizontal", length=100,
-                                       command=self._on_volume_change)
+        self.volume_scale = ttk.Scale(vol_row, from_=0, to=100, orient="horizontal", length=110,
+                                       style="Light.Horizontal.TScale", command=self._on_volume_change)
         self.volume_scale.set(50)
         self.volume_scale.pack(side="right")
         # Same fix as the seek bar: clicking anywhere on the trough should
@@ -2227,33 +3472,39 @@ class VideoPreviewWindow(tk.Toplevel):
         self.volume_scale.bind("<Button-1>", self._on_volume_click)
         self.volume_scale.bind("<B1-Motion>", self._on_volume_click)
 
-        btn_row = ttk.Frame(self)
+        def _offset_button(parent, delta):
+            text = f"+{delta}" if delta > 0 else str(delta)
+            return tk.Button(parent, text=text, width=5, font=("Segoe UI", 9, "bold"),
+                              bg=LIGHT_ACCENT_SOFT, activebackground=LIGHT_ACCENT_SOFT,
+                              fg=LIGHT_ACCENT, activeforeground=LIGHT_ACCENT,
+                              relief="flat", bd=0, cursor="hand2", padx=2, pady=6,
+                              command=lambda: self._nudge(delta))
+
+        btn_row = tk.Frame(self, bg=FRONT_BG)
         btn_row.pack(side="bottom", pady=8)
         prev_delta = None
         for delta in self.QUICK_OFFSETS:
             if prev_delta is not None and prev_delta < 0 < delta:
-                tk.Label(btn_row, text="|", fg="#cccccc").pack(side="left", padx=6)
-            text = f"+{delta}" if delta > 0 else str(delta)
-            ttk.Button(btn_row, text=text, width=6,
-                       command=lambda d=delta: self._nudge(d)).pack(side="left", padx=1)
+                tk.Frame(btn_row, bg=FRONT_BORDER, width=1).pack(side="left", fill="y", padx=8, pady=2)
+            _offset_button(btn_row, delta).pack(side="left", padx=1)
             prev_delta = delta
 
-        seek_row = ttk.Frame(self)
-        seek_row.pack(side="bottom", fill="x", padx=10, pady=(5, 0))
-        self.time_label = ttk.Label(seek_row, text="00:00", width=6)
+        seek_row = tk.Frame(self, bg=FRONT_BG)
+        seek_row.pack(side="bottom", fill="x", padx=14, pady=(8, 0))
+        self.time_label = tk.Label(seek_row, text="00:00", width=6, bg=FRONT_BG,
+                                    fg=FRONT_TEXT, font=("Segoe UI", 10))
         self.time_label.pack(side="left")
 
-        ttk.Button(seek_row, text="⏪", width=5,
-                   command=lambda: self._seek_relative(-5000)).pack(side="left", padx=(4, 0))
-        self.play_pause_button = ttk.Button(seek_row, text="⏸", width=3,
-
-                                             command=self._toggle_play_pause)
+        _TransportButton(seek_row, "back", lambda: self._seek_relative(-5000)).pack(
+            side="left", padx=(6, 0))
+        self.play_pause_button = _TransportButton(seek_row, "pause", self._toggle_play_pause)
         self.play_pause_button.pack(side="left", padx=2)
-        ttk.Button(seek_row, text="⏩", width=5,
-                   command=lambda: self._seek_relative(5000)).pack(side="left", padx=(0, 4))
+        _TransportButton(seek_row, "forward", lambda: self._seek_relative(5000)).pack(
+            side="left", padx=(0, 6))
 
-        self.seek_scale = ttk.Scale(seek_row, from_=0, to=1000, orient="horizontal")
-        self.seek_scale.pack(side="left", fill="x", expand=True, padx=5)
+        self.seek_scale = ttk.Scale(seek_row, from_=0, to=1000, orient="horizontal",
+                                     style="Light.Horizontal.TScale")
+        self.seek_scale.pack(side="left", fill="x", expand=True, padx=8)
         # Bound directly to real mouse press/drag/release, not `command=` —
         # that fires on ANY value change including our own programmatic
         # position updates during playback, which made it impossible to
@@ -2360,7 +3611,7 @@ class VideoPreviewWindow(tk.Toplevel):
             self.after(80, lambda: self.video_player.set_time(int(-self.offset)))
         self._apply_volume_soon()
         self._paused = False
-        self.play_pause_button.configure(text="⏸")
+        self.play_pause_button.set_kind("pause")
 
     def _nudge(self, delta):
         self.offset += delta
@@ -2424,7 +3675,7 @@ class VideoPreviewWindow(tk.Toplevel):
                     self.audio_player.set_pause(0)
         except Exception:
             pass
-        self.play_pause_button.configure(text="▶" if self._paused else "⏸")
+        self.play_pause_button.set_kind("play" if self._paused else "pause")
 
     def _seek_to(self, audio_time_ms: int):
         """Moves playback to `audio_time_ms` on the audio timeline while
@@ -2482,45 +3733,75 @@ class VideoPreviewWindow(tk.Toplevel):
 class VideoOffsetShifterFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        add_header(self.body, "Video Settings",
-                   "Preview video offset to sync to the music without "
-                   "having to manually repeatedly type and guess the "
-                   "desired number.")
+        _style_light_body(self)
 
-        row = ttk.Frame(self.body)
-        row.pack(fill="x", padx=10, pady=10)
-        ttk.Label(row, text="Video file:").pack(side="left")
+        header_row = tk.Frame(self.body, bg=FRONT_BG)
+        header_row.pack(fill="x", padx=24, pady=(20, 4))
+        tk.Label(header_row, text="Video Settings", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        header_info = InfoIcon(header_row,
+                                "Preview video offset to sync to the music without "
+                                "having to manually repeatedly type and guess the "
+                                "desired number.")
+        header_info.configure(bg=FRONT_BG)
+        header_info.pack(side="left", padx=(6, 0))
+
+        video_row = tk.Frame(self.body, bg=FRONT_BG)
+        video_row.pack(fill="x", padx=24, pady=(4, 16))
+        tk.Label(video_row, text="Video file:", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).pack(side="left")
         self.video_var = tk.StringVar()
-        self.video_combo = ttk.Combobox(row, textvariable=self.video_var, state="readonly", width=30)
-        self.video_combo.pack(side="left", padx=5)
+        self.video_combo = LightDropdown(video_row, self.video_var, width=30)
+        self.video_combo.pack(side="left", padx=(10, 0))
+        _make_ghost_button(video_row, "Browse...", self.browse_video).pack(side="left", padx=(10, 0))
 
-        row2 = ttk.Frame(self.body)
-        row2.pack(fill="x", padx=10, pady=5)
-        ttk.Label(row2, text="Current Offset:").pack(side="left")
-        self.current_entry = ttk.Entry(row2, width=10, state="readonly")
-        self.current_entry.pack(side="left", padx=5)
+        self.card = RoundedCard(self.body)
+        self.card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        body = self.card.body
 
-        row3 = ttk.Frame(self.body)
-        row3.pack(fill="x", padx=10, pady=5)
-        ttk.Label(row3, text="New Offset:").pack(side="left")
+        def info(parent, text, **kw):
+            icon = InfoIcon(parent, text, **kw)
+            icon.configure(bg=FRONT_CARD_BG)
+            return icon
+
+        # "Current Offset:"/"New Offset:" are independently packed rows,
+        # not a shared grid — same label width on both (fixed to the
+        # longer text's own character count, left-anchored) so the two
+        # entry boxes' left edges still line up despite that, same fix as
+        # MetadataManagerFrame's Preview Point misalignment (see CLAUDE.md).
+        LABEL_W = len("Current Offset:")
+
+        row2 = tk.Frame(body, bg=FRONT_CARD_BG)
+        row2.pack(fill="x", pady=(0, 10))
+        tk.Label(row2, text="Current Offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11), width=LABEL_W, anchor="w").pack(side="left")
+        self.current_entry = _make_light_entry(row2, width=10, state="readonly")
+        self.current_entry.pack(side="left", padx=(10, 0), ipady=4, ipadx=6)
+
+        row3 = tk.Frame(body, bg=FRONT_CARD_BG)
+        row3.pack(fill="x", pady=(0, 12))
+        tk.Label(row3, text="New Offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11), width=LABEL_W, anchor="w").pack(side="left")
         self.offset_var = tk.StringVar(value="0")
-        ttk.Entry(row3, textvariable=self.offset_var, width=10).pack(side="left", padx=5)
-        ttk.Button(row3, text="Preview", command=self.open_preview).pack(side="left", padx=10)
+        _make_light_entry(row3, textvariable=self.offset_var, width=10).pack(
+            side="left", padx=(10, 10), ipady=4, ipadx=6)
+        _make_ghost_button(row3, "Preview", self.open_preview).pack(side="left")
 
         self.resizer_var = tk.BooleanVar(value=False)
         self.blur_var = tk.BooleanVar(value=True)
-        resizer_row = ttk.Frame(self.body)
-        resizer_row.pack(fill="x", padx=10, pady=(5, 0), anchor="w")
-        ttk.Checkbutton(resizer_row, text="Taiko Video Resizer", variable=self.resizer_var,
-                         command=lambda: self._sync_video_option_state("resizer")).pack(side="left")
-        InfoIcon(resizer_row, "Resize the full size video to fit under the "
-                              "taiko playfield.").pack(side="left", padx=(2, 0))
+        resizer_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        resizer_row.pack(fill="x", anchor="w", pady=(0, 6))
+        LightCheckbox(resizer_row, "Taiko Video Resizer", self.resizer_var,
+                      command=lambda: self._sync_video_option_state("resizer")).pack(side="left")
+        info(resizer_row, "Resize the full size video to fit under the "
+                           "taiko playfield.").pack(side="left", padx=(6, 0))
 
-        blur_row = ttk.Frame(self.body)
-        blur_row.pack(fill="x", padx=30, anchor="w")
-        self.blur_check = ttk.Checkbutton(blur_row, text="Blur", variable=self.blur_var, state="disabled")
+        blur_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        blur_row.pack(fill="x", anchor="w", padx=(24, 0), pady=(0, 10))
+        self.blur_check = LightCheckbox(blur_row, "Blur", self.blur_var)
         self.blur_check.pack(side="left")
-        InfoIcon(blur_row, "Aesthetic blur for video.").pack(side="left", padx=(2, 0))
+        self.blur_check.set_enabled(False)
+        info(blur_row, "Aesthetic blur for video.").pack(side="left", padx=(6, 0))
 
         # Taiko Video SB Code — a storyboard-based alternative to the
         # resizer above (can't be used together: checking one unchecks the
@@ -2530,16 +3811,20 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         # calibrating video positioning) — Apply computes and writes the
         # SB code directly, see apply().
         self.sb_var = tk.BooleanVar(value=False)
-        sb_row = ttk.Frame(self.body)
-        sb_row.pack(fill="x", padx=10, pady=(5, 0), anchor="w")
-        ttk.Checkbutton(sb_row, text="Taiko Video SB Code", variable=self.sb_var,
-                         command=lambda: self._sync_video_option_state("sb")).pack(side="left")
-        InfoIcon(sb_row, "Commonly used in hybrid mapsets.").pack(side="left", padx=(2, 0))
+        sb_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        sb_row.pack(fill="x", anchor="w", pady=(0, 12))
+        LightCheckbox(sb_row, "Taiko Video SB Code", self.sb_var,
+                      command=lambda: self._sync_video_option_state("sb")).pack(side="left")
+        info(sb_row, "Commonly used in hybrid mapsets.").pack(side="left", padx=(6, 0))
 
-        self.diff_list = DiffCheckList(self.body, app)
-        self.diff_list.pack(fill="both", expand=True, padx=10, pady=5)
+        tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
+        self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
 
-        add_apply_row(self.body, self.apply)
+        btn_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        btn_row.pack(fill="x")
+        _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
 
     def _sync_video_option_state(self, source):
         """Taiko Video Resizer and Taiko Video SB Code are mutually
@@ -2549,7 +3834,7 @@ class VideoOffsetShifterFrame(BaseToolFrame):
             self.sb_var.set(False)
         elif source == "sb" and self.sb_var.get():
             self.resizer_var.set(False)
-        self.blur_check.configure(state="normal" if self.resizer_var.get() else "disabled")
+        self.blur_check.set_enabled(self.resizer_var.get())
 
     def on_shown(self):
         self.refresh()
@@ -2560,7 +3845,7 @@ class VideoOffsetShifterFrame(BaseToolFrame):
     def refresh(self):
         folder, diffs = self.app.get_diff_files()
         videos = logic.list_song_folder_videos(folder) if folder else []
-        self.video_combo["values"] = videos
+        self.video_combo.set_values(videos)
         current_video = None
         if folder and diffs:
             bm = osu_parser.Beatmap(os.path.join(folder, diffs[0]))
@@ -2572,6 +3857,10 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         else:
             self.video_var.set("")
         self.diff_list.refresh()
+        # See OffsetShifterFrame.refresh for why this outer card needs an
+        # explicit redraw after the nested diff checklist's own height
+        # changes — the diff_list's own card only resyncs itself.
+        self.card.redraw()
         self._prefill_current_offset(folder, diffs)
 
     def _prefill_current_offset(self, folder, diffs):
@@ -2591,6 +3880,21 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         self.current_entry.configure(state="readonly")
         if current is not None:
             self.offset_var.set(current_str)
+
+    def browse_video(self):
+        folder, _ = self.app.get_diff_files()
+        if not folder:
+            messagebox.showwarning("No map loaded", "Load a map before browsing for a video file.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select video file",
+            filetypes=[("Video files", "*.mp4 *.m4v *.avi *.mov *.flv *.wmv *.webm"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        final_name = logic.import_external_video_file(folder, path)
+        self.refresh()
+        self.video_var.set(final_name)
 
     def open_preview(self):
         existing = getattr(self, "_preview_win", None)
@@ -2734,6 +4038,13 @@ class PatternCard(tk.Frame):
 
     DON_COLOR = "#e2434f"
     KAT_COLOR = "#2e9fd0"
+    BORDER_IDLE = "#cccccc"
+    BORDER_HOVER = LIGHT_ACCENT
+    BORDER_SELECTED = LIGHT_ACCENT
+    # Reserved ring widths — see __init__'s nested-Frame border comment.
+    # Fixed forever once the card is built; only the colors toggle.
+    BASE_THICKNESS = 1
+    HALO_THICKNESS = 2
     NORMAL_RADIUS = 10
     FINISHER_RADIUS = 14
     PX_PER_BEAT = 60  # primary layout scale (_layout_positions_by_beats):
@@ -2768,12 +4079,39 @@ class PatternCard(tk.Frame):
     TAIL_RADIUS_SCALE = 0.6
 
     def __init__(self, master, entry, gallery):
-        super().__init__(master, relief="solid", borderwidth=1, bg="white",
-                          padx=8, pady=6, cursor="hand2",
-                          highlightthickness=2, highlightbackground="white")
+        # The border is nested plain-color Frames (a "colored padding as
+        # border" trick), not highlightthickness/highlightbackground on
+        # this Frame directly — highlightthickness briefly WAS used here,
+        # but it's unreliable for a widget embedded in a scrollable Canvas
+        # via create_window: confirmed for real, toggling it on selection
+        # could render a stretched ring reaching toward the gallery's far
+        # edge even though winfo_width() reported the correct size the
+        # whole time (a native rendering bug, not a geometry one — Tk's
+        # highlight-ring renderer, not this app's own layout math, drew
+        # the wrong thing). Nested Frames sidestep it entirely: every
+        # layer's padding below is reserved once, here, at construction,
+        # and never changes again — only .configure(bg=...) toggles
+        # afterward (see _refresh_border_color), which never triggers a
+        # geometry renegotiation. `halo` is the extra ring that only
+        # becomes visible (colored) once selected, layered just outside
+        # the always-present `border` ring — both render the same color
+        # when selected, so they read as one continuous thicker ring
+        # rather than two nested boxes.
+        super().__init__(master, bg=FRONT_CARD_BG, highlightthickness=0, cursor="hand2")
+        self.halo = tk.Frame(self, bg=FRONT_CARD_BG, cursor="hand2")
+        self.halo.pack(fill="both", expand=True)
+        self.border = tk.Frame(self.halo, bg=self.BORDER_IDLE, cursor="hand2")
+        self.border.pack(fill="both", expand=True,
+                          padx=self.HALO_THICKNESS, pady=self.HALO_THICKNESS)
+        self.content = tk.Frame(self.border, bg="white", cursor="hand2", padx=8, pady=6)
+        self.content.pack(fill="both", expand=True,
+                           padx=self.BASE_THICKNESS, pady=self.BASE_THICKNESS)
         self.entry = entry
         self.name = entry["name"]
         self.gallery = gallery
+        self._is_selected = False
+        self._is_hovering = False
+        self._border_hover_job = None
 
         notes = entry["objects"]
         # Circle x-positions are proportional to each note's actual
@@ -2818,7 +4156,7 @@ class PatternCard(tk.Frame):
         pad = self.FINISHER_RADIUS + 5
         canvas_h = 2 * self.FINISHER_RADIUS + 6
         canvas_w = (sorted_positions[-1] if sorted_positions else 0) + 2 * pad
-        canvas = tk.Canvas(self, width=canvas_w, height=canvas_h, bg="white", highlightthickness=0)
+        canvas = tk.Canvas(self.content, width=canvas_w, height=canvas_h, bg="white", highlightthickness=0)
         canvas.pack()
         cy = canvas_h // 2
         for note in notes:
@@ -2837,16 +4175,16 @@ class PatternCard(tk.Frame):
                 canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
                                     fill=color, outline="black")
 
-        name_label = tk.Label(self, text=entry["name"], bg="white", font=("Segoe UI", 12, "bold"))
+        name_label = tk.Label(self.content, text=entry["name"], bg="white", font=("Segoe UI", 12, "bold"))
         name_label.pack()
-        snap_label = tk.Label(self, text=entry.get("snap_divisor", "Unknown"),
+        snap_label = tk.Label(self.content, text=entry.get("snap_divisor", "Unknown"),
                                bg="white", fg="#777777", font=("Segoe UI", 9))
         snap_label.pack()
         _add_hover_tooltip(snap_label, f'Duration: {entry["duration_ms"]} ms')
 
         # A square fills the canvas edge-to-edge exactly, unlike the old
         # circle — no leftover flat-colored corners to worry about.
-        self.badge = tk.Canvas(self, width=16, height=16, bg="white", highlightthickness=0, cursor="hand2")
+        self.badge = tk.Canvas(self.content, width=16, height=16, bg="white", highlightthickness=0, cursor="hand2")
         self.badge.create_rectangle(0, 0, 16, 16, fill="#d32f2f", outline="")
         self.badge.create_line(4, 4, 12, 12, fill="white", width=2)
         self.badge.create_line(12, 4, 4, 12, fill="white", width=2)
@@ -2870,7 +4208,7 @@ class PatternCard(tk.Frame):
         # binding everywhere and debouncing the hide (see _on_leave) keeps
         # the badge from flickering while the mouse moves around inside
         # the same card.
-        for widget in (self, canvas, name_label, snap_label):
+        for widget in (self, self.halo, self.border, self.content, canvas, name_label, snap_label):
             widget.bind("<Button-1>", lambda e: self.gallery.begin_card_drag(self.name, e))
             widget.bind("<Control-Button-1>", lambda _e: self.gallery.toggle_select(self.name))
             widget.bind("<Shift-Button-1>", lambda _e: self.gallery.shift_select(self.name))
@@ -2894,13 +4232,54 @@ class PatternCard(tk.Frame):
             self._hover_hide_job = None
         if len(self.gallery.selected_pattern_names) < 2:
             self.badge.place(relx=1.0, rely=0.0, x=0, y=0, anchor="ne")
+        if self._border_hover_job is not None:
+            self.after_cancel(self._border_hover_job)
+            self._border_hover_job = None
+        self._set_hover_border(True)
 
     def _on_leave(self, _e=None):
         self._hover_hide_job = self.after(50, self.hide_badge)
+        # Same debounce reasoning as the badge above — Enter/Leave fire in
+        # rapid pairs as the pointer crosses from the card's own background
+        # onto each child widget sitting on top of it, so an undebounced
+        # reset here would flicker the border color the same way an
+        # undebounced badge would flicker its visibility.
+        self._border_hover_job = self.after(50, self._clear_hover_border)
 
     def hide_badge(self):
         self._hover_hide_job = None
         self.badge.place_forget()
+
+    def _clear_hover_border(self):
+        self._border_hover_job = None
+        self._set_hover_border(False)
+
+    def _set_hover_border(self, hovering: bool):
+        self._is_hovering = hovering
+        self._refresh_border_color()
+
+    def _refresh_border_color(self):
+        # Selection takes priority over hover, which takes priority over
+        # the plain idle color — a single source of truth so set_selected
+        # and the hover handlers never fight over which one last touched
+        # either ring's color. Only .configure(bg=...) happens here, on
+        # already-fixed-size Frames (see __init__) — no geometry change,
+        # ever, so this can't trigger the highlightthickness rendering bug
+        # __init__'s comment describes. `halo` only becomes visible
+        # (colored) when selected; it stays blended into the surrounding
+        # gallery background otherwise, so idle/hover show just the thin
+        # `border` ring while selected shows both rings as one thicker one.
+        if self._is_selected:
+            halo_color = self.BORDER_SELECTED
+            border_color = self.BORDER_SELECTED
+        elif self._is_hovering:
+            halo_color = FRONT_CARD_BG
+            border_color = self.BORDER_HOVER
+        else:
+            halo_color = FRONT_CARD_BG
+            border_color = self.BORDER_IDLE
+        self.halo.configure(bg=halo_color)
+        self.border.configure(bg=border_color)
 
     # ------------------------------------------------------------------
     # Right-click context menu — always targets this specific card,
@@ -2916,19 +4295,16 @@ class PatternCard(tk.Frame):
         # just this one card and silently ignore the rest of the selection.
         if len(self.gallery.selected_pattern_names) >= 2:
             return
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="Rename", command=self._on_rename)
-        menu.add_separator()
-        menu.add_command(label="Edit", command=self._on_edit)
-        menu.add_command(label="Duplicate", command=self._on_duplicate)
-        menu.add_command(label="Duplicate Inverted", command=self._on_duplicate_inverted)
-        menu.add_command(label="Duplicate Reversed", command=self._on_duplicate_reversed)
-        menu.add_separator()
-        menu.add_command(label="Delete", command=self._on_delete_via_menu, foreground="#d32f2f")
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        _show_light_context_menu(self, event.x_root, event.y_root, [
+            ("Rename", self._on_rename),
+            "separator",
+            ("Edit", self._on_edit),
+            ("Duplicate", self._on_duplicate),
+            ("Duplicate Inverted", self._on_duplicate_inverted),
+            ("Duplicate Reversed", self._on_duplicate_reversed),
+            "separator",
+            ("Delete", self._on_delete_via_menu, "#d32f2f"),
+        ])
 
     def _on_rename(self):
         new_name = simpledialog.askstring("Rename Pattern", "New name:",
@@ -2977,7 +4353,8 @@ class PatternCard(tk.Frame):
         self.gallery.request_delete_single(self.name)
 
     def set_selected(self, selected: bool):
-        self.configure(highlightbackground=self.KAT_COLOR if selected else "white")
+        self._is_selected = selected
+        self._refresh_border_color()
 
     def _draw_span(self, canvas, head_x, cy, note, offset_to_x, pad, kind):
         """Renders a slider/spinner: head + body + tail if a duration is
@@ -3148,9 +4525,11 @@ class ManualPatternWindow(tk.Toplevel):
         self._editing_original_name = existing_name
         existing_entry = logic.get_pattern(existing_name) if existing_name else None
         if existing_entry is not None:
-            self.title(f"Edit Pattern — {existing_entry['name']}")
+            header_text = f"Edit Pattern — {existing_entry['name']}"
         else:
-            self.title("Manually Add Pattern")
+            header_text = "Manually Add Pattern"
+        self.title(header_text)
+        self.configure(bg=FRONT_BG)
         self.resizable(False, False)
 
         # Each note is {"kind": "note"|"slider"|"spinner", "pos": Fraction,
@@ -3190,59 +4569,87 @@ class ManualPatternWindow(tk.Toplevel):
         # editing that ran longer than this gets truncated to fit (see
         # _notes_from_entry) rather than the window growing to match it.
 
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=12, pady=(10, 4))
-        ttk.Label(top, text="Pattern name:").pack(side="left")
-        self.name_var = tk.StringVar(value=existing_entry["name"] if existing_entry is not None else "")
-        ttk.Entry(top, textvariable=self.name_var, width=26).pack(side="left", padx=(4, 16))
+        header_row = tk.Frame(self, bg=FRONT_BG)
+        header_row.pack(fill="x", padx=16, pady=(14, 6))
+        tk.Label(header_row, text=header_text, bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 14, "bold")).pack(side="left")
 
-        divisor_row = ttk.Frame(top)
+        top = tk.Frame(self, bg=FRONT_BG)
+        top.pack(fill="x", padx=16, pady=(0, 6))
+        tk.Label(top, text="Pattern name:", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).pack(side="left")
+        self.name_var = tk.StringVar(value=existing_entry["name"] if existing_entry is not None else "")
+        _make_light_entry(top, textvariable=self.name_var, width=26).pack(
+            side="left", padx=(6, 16), ipady=3)
+
+        divisor_row = tk.Frame(top, bg=FRONT_BG)
         divisor_row.pack(side="right")
-        ttk.Button(divisor_row, text="‹", width=2,
-                   command=lambda: self._step_divisor(-1)).pack(side="left")
-        self.divisor_combo = ttk.Combobox(divisor_row, textvariable=self.divisor_var,
-                                           values=self.DIVISOR_OPTIONS, width=5, state="readonly")
-        self.divisor_combo.pack(side="left", padx=2)
-        ttk.Button(divisor_row, text="›", width=2,
-                   command=lambda: self._step_divisor(1)).pack(side="left")
+        _make_ghost_button(divisor_row, "‹", lambda: self._step_divisor(-1),
+                            width=2, padx=8, pady=4).pack(side="left")
+        self.divisor_combo = LightDropdown(divisor_row, self.divisor_var,
+                                            values=self.DIVISOR_OPTIONS, width=5)
+        self.divisor_combo.pack(side="left", padx=4)
+        _make_ghost_button(divisor_row, "›", lambda: self._step_divisor(1),
+                            width=2, padx=8, pady=4).pack(side="left")
         # Live-applies as soon as the divisor changes — via the dropdown,
         # the ‹›  steppers (which just call divisor_var.set()), or
         # Ctrl+scroll on the canvas — no separate Apply button anymore.
         self.divisor_var.trace_add("write", self._on_divisor_changed)
 
-        # Mode selector — Radiobuttons sharing mode_var give a segmented-
-        # button look via the "Toolbutton" style (a checked one renders
-        # sunken/pressed). Selecting one sets mode_var directly, which the
-        # trace below applies immediately; no separate command= needed.
-        mode_row = ttk.Frame(self)
-        mode_row.pack(fill="x", padx=12, pady=(0, 4))
+        # Mode selector — a small segmented-button row built from plain
+        # tk.Button rather than ttk.Radiobutton + the "Toolbutton" style
+        # the row used before: Windows' native theme renders Toolbutton
+        # chrome (sunken/raised) the same way it renders a Checkbutton's
+        # tick — ignoring color style overrides (see CLAUDE.md "Why custom
+        # widgets instead of ttk styles"). Clicking one still just sets
+        # mode_var directly, same as before; the existing trace below still
+        # drives the actual mode switch, this one only repaints colors.
+        mode_row = tk.Frame(self, bg=FRONT_BG)
+        mode_row.pack(fill="x", padx=16, pady=(0, 6))
+        self._mode_buttons = {}
         for value, label in (("select", "Select (1)"), ("note", "Note (2)"), ("special", "Special (3/4)")):
-            ttk.Radiobutton(mode_row, text=label, value=value, variable=self.mode_var,
-                             style="Toolbutton").pack(side="left", padx=(0, 4))
+            btn = tk.Button(mode_row, text=label, font=("Segoe UI", 10, "bold"),
+                             relief="flat", bd=0, cursor="hand2", padx=14, pady=6,
+                             command=lambda v=value: self.mode_var.set(v))
+            btn.pack(side="left", padx=(0, 6))
+            self._mode_buttons[value] = btn
         self.mode_var.trace_add("write", self._on_mode_changed)
+        self.mode_var.trace_add("write", self._sync_mode_buttons)
+        self._sync_mode_buttons()
 
-        status_row = ttk.Frame(self)
-        status_row.pack(fill="x", padx=12, pady=(0, 4))
+        status_row = tk.Frame(self, bg=FRONT_BG)
+        status_row.pack(fill="x", padx=16, pady=(0, 8))
         self.status_var = tk.StringVar()
-        ttk.Label(status_row, textvariable=self.status_var, font=("Segoe UI", 11, "bold")).pack(side="left")
-        InfoIcon(status_row, "The control is the same as on osu!stable's "
-                              "default.").pack(side="left", padx=(6, 0))
+        tk.Label(status_row, textvariable=self.status_var, bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        status_info = InfoIcon(status_row, "The control is the same as on osu!stable's "
+                                            "default.")
+        status_info.configure(bg=FRONT_BG)
+        status_info.pack(side="left", padx=(6, 0))
 
         canvas_w = self.MARGIN * 2 + self.BEATS_SHOWN * self.PX_PER_BEAT
+        # bg stays literal "white" (== FRONT_CARD_BG) — deliberately not
+        # themed any further: _blend_toward_bg's phantom-preview blending
+        # and the invisible tick/tail hit-test rectangles drawn in _redraw/
+        # _draw_span_sprite both assume this canvas's background is
+        # exactly #ffffff (see their own docstrings) and would silently
+        # break — the hit rectangles would become visible, and the phantom
+        # would blend toward the wrong color — if this became any other
+        # shade. Only the outer highlight ring is safe to recolor.
         self.canvas = tk.Canvas(self, width=canvas_w, height=self.CANVAS_H, bg="white",
-                                 highlightthickness=1, highlightbackground="#999999", cursor="hand2")
-        self.canvas.pack(padx=12, pady=(0, 8))
+                                 highlightthickness=1, highlightbackground=FRONT_BORDER, cursor="hand2")
+        self.canvas.pack(padx=16, pady=(0, 10))
         self.canvas.bind("<Motion>", self._on_canvas_motion)
         self.canvas.bind("<Leave>", self._on_canvas_leave)
         self.canvas.bind("<Control-MouseWheel>", self._on_ctrl_scroll)
         self.canvas.bind("<Control-Button-4>", self._on_ctrl_scroll)
         self.canvas.bind("<Control-Button-5>", self._on_ctrl_scroll)
 
-        btn_row = ttk.Frame(self)
-        btn_row.pack(fill="x", padx=12, pady=(0, 12))
-        ttk.Button(btn_row, text="Save Pattern", command=self._save).pack(side="right")
-        ttk.Label(btn_row, text="E: finisher toggle - R or W: don/kat toggle",
-                  foreground="#777777", font=("Segoe UI", 9)).pack(side="left")
+        btn_row = tk.Frame(self, bg=FRONT_BG)
+        btn_row.pack(fill="x", padx=16, pady=(0, 16))
+        tk.Label(btn_row, text="E: finisher toggle - R or W: don/kat toggle", bg=FRONT_BG,
+                 fg=FRONT_TEXT_MUTED, font=("Segoe UI", 9)).pack(side="left")
+        _make_accent_button(btn_row, "Save Pattern", self._save).pack(side="right")
 
         self.bind("<r>", self._on_r_key)
         self.bind("<R>", self._on_r_key)
@@ -3443,6 +4850,20 @@ class ManualPatternWindow(tk.Toplevel):
             self.selected_note_ids = set()
             self._range_anchor_id = None
         self._redraw()
+
+    def _sync_mode_buttons(self, *_args):
+        """Repaints the mode_row segmented buttons so the active mode
+        reads as a solid indigo-filled button and the other two as soft
+        ghost buttons — the color half of the "Toolbutton" look this row
+        used to get for free from ttk, now done by hand (see __init__)."""
+        active = self.mode_var.get()
+        for value, btn in self._mode_buttons.items():
+            if value == active:
+                btn.configure(bg=LIGHT_ACCENT, fg="#ffffff",
+                               activebackground=LIGHT_ACCENT_HOVER, activeforeground="#ffffff")
+            else:
+                btn.configure(bg=LIGHT_ACCENT_SOFT, fg=LIGHT_ACCENT,
+                               activebackground=LIGHT_ACCENT_SOFT, activeforeground=LIGHT_ACCENT)
 
     def _on_r_key(self, _event=None):
         if self._guard_focus():
@@ -4096,39 +5517,65 @@ class ManualPatternWindow(tk.Toplevel):
 class PatternGalleryFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        add_header(self.body, "Pattern Gallery",
-                   "Build up your own reusable pattern library")
+        _style_light_body(self)
 
-        # Split across two rows — at a big enough font size or narrow
-        # enough window, cramming the name field, both buttons, and the
-        # info icon onto one line pushed "Manually Add Pattern" (and
-        # sometimes "Capture from osu!" too) out past the tool body's
-        # actual visible width with no way to reach it. `width=20` (down
-        # from the original 30) is still safely under the available width
-        # even at the largest font-size setting and the app's minimum
-        # window size — no need for fill/expand to guarantee that here,
-        # so the field can stay a normal, un-stretched size instead of
-        # ballooning to fill whatever room a wide window leaves over.
-        name_row = ttk.Frame(self.body)
-        name_row.pack(fill="x", padx=10, pady=(10, 4))
-        ttk.Label(name_row, text="Pattern name:").pack(side="left")
+        header_row = tk.Frame(self.body, bg=FRONT_BG)
+        header_row.pack(fill="x", padx=24, pady=(20, 4))
+        tk.Label(header_row, text="Pattern Gallery", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        header_info = InfoIcon(header_row, "Build up your own reusable pattern library")
+        header_info.configure(bg=FRONT_BG)
+        header_info.pack(side="left", padx=(6, 0))
+
+        # ---- Library card: name/capture controls + the card gallery -------
+        self.card1 = RoundedCard(self.body)
+        self.card1.pack(fill="x", padx=24, pady=(0, 12))
+        body1 = self.card1.body
+
+        # Split across two rows — at a narrow enough window, cramming the
+        # name field, both buttons, and the info icon onto one line pushed
+        # "Manually Add Pattern" (and sometimes "Capture from osu!" too)
+        # out past the tool body's actual visible width with no way to
+        # reach it. `width=20` (down from the original 30) is still safely
+        # under the available width even at the app's minimum window size
+        # — no need for fill/expand to guarantee that here, so the field
+        # can stay a normal, un-stretched size instead of ballooning to
+        # fill whatever room a wide window leaves over.
+        name_row = tk.Frame(body1, bg=FRONT_CARD_BG)
+        name_row.pack(fill="x", pady=(0, 12))
+        tk.Label(name_row, text="Pattern name:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).pack(side="left")
         self.name_var = tk.StringVar()
-        self.name_entry = ttk.Entry(name_row, textvariable=self.name_var, width=20)
-        self.name_entry.pack(side="left", padx=5)
+        self.name_entry = _make_light_entry(name_row, textvariable=self.name_var, width=20)
+        self.name_entry.pack(side="left", padx=(10, 0), ipady=4, ipadx=6)
 
-        capture_row = ttk.Frame(self.body)
-        capture_row.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(capture_row, text="Capture from osu!", command=self.capture).pack(side="left", padx=5)
-        InfoIcon(capture_row, "To capture pattern from osu!, copy it and "
-                               "save the map. Then click the button to "
-                               "import pattern to your gallery").pack(side="left")
-        ttk.Button(capture_row, text="Manually Add Pattern",
-                   command=self.open_manual_pattern_editor).pack(side="left", padx=(15, 5))
+        capture_row = tk.Frame(body1, bg=FRONT_CARD_BG)
+        capture_row.pack(fill="x", pady=(0, 16))
+        _make_ghost_button(capture_row, "Capture from osu!", self.capture).pack(side="left")
+        capture_info = InfoIcon(capture_row, "To capture pattern from osu!, copy it and "
+                                              "save the map. Then click the button to "
+                                              "import pattern to your gallery")
+        capture_info.configure(bg=FRONT_CARD_BG)
+        capture_info.pack(side="left", padx=(8, 0))
+        _make_ghost_button(capture_row, "Manually Add Pattern",
+                            self.open_manual_pattern_editor).pack(side="left", padx=(15, 0))
 
-        gallery_frame = ttk.Frame(self.body)
-        gallery_frame.pack(fill="x", padx=10, pady=(0, 5))
-        self.gallery_canvas = tk.Canvas(gallery_frame, height=140, bg="white",
-                                         highlightthickness=1, highlightbackground="#999999")
+        gallery_frame = tk.Frame(body1, bg=FRONT_CARD_BG)
+        gallery_frame.pack(fill="x")
+        # takefocus=0 + explicit highlightcolor: a plain click anywhere in
+        # this canvas (even on an embedded PatternCard) gives it keyboard
+        # focus by Tk's own default click behavior, and a focused widget's
+        # highlightthickness ring switches from highlightbackground to
+        # highlightcolor — which was never set here, so it fell back to
+        # Tk's stock black focus color. Confirmed for real: selecting a
+        # card drew a bold black rectangle around the *entire* gallery
+        # strip, unrelated to the card's own border entirely. Matching
+        # highlightcolor to highlightbackground makes focused/unfocused
+        # render identically; takefocus=0 additionally stops this canvas
+        # from taking focus at all, since it has no keyboard interaction.
+        self.gallery_canvas = tk.Canvas(gallery_frame, height=140, bg=FRONT_CARD_BG,
+                                         highlightthickness=1, highlightbackground=FRONT_BORDER,
+                                         highlightcolor=FRONT_BORDER, takefocus=0)
         self.gallery_canvas.pack(side="top", fill="x")
         gallery_scroll = ttk.Scrollbar(gallery_frame, orient="horizontal", command=self.gallery_canvas.xview)
         gallery_scroll.pack(side="top", fill="x")
@@ -4141,7 +5588,7 @@ class PatternGalleryFrame(BaseToolFrame):
         # bare background can be under the press.
         self.gallery_canvas.bind("<Button-1>", self.begin_bg_drag)
 
-        self.gallery_inner = tk.Frame(self.gallery_canvas, bg="white")
+        self.gallery_inner = tk.Frame(self.gallery_canvas, bg=FRONT_CARD_BG)
         self.gallery_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
         self.gallery_inner.bind(
             "<Configure>",
@@ -4178,11 +5625,11 @@ class PatternGalleryFrame(BaseToolFrame):
         # A red multi-delete button that only appears once 2+ cards are
         # selected (see _update_bulk_delete_button) — deleting a single
         # card instead uses the little badge in its own top-right corner.
-        self.bulk_delete_row = ttk.Frame(self.body)
-        self.bulk_delete_row.pack(fill="x", padx=10, pady=(0, 5))
+        self.bulk_delete_row = tk.Frame(body1, bg=FRONT_CARD_BG)
+        self.bulk_delete_row.pack(fill="x", pady=(8, 0))
         self.bulk_delete_btn = tk.Button(
             self.bulk_delete_row, bg="#d32f2f", fg="white", relief="flat",
-            padx=10, pady=3, font=("Segoe UI", 10, "bold"),
+            padx=10, pady=6, font=("Segoe UI", 10, "bold"),
             activebackground="#b71c1c", activeforeground="white",
             command=self.request_delete_selected)
 
@@ -4192,37 +5639,47 @@ class PatternGalleryFrame(BaseToolFrame):
         # bare background, never on a button/entry/card sitting on it).
         self.body.bind("<Button-1>", lambda _e: self.deselect_all())
 
-        ttk.Separator(self.body, orient="horizontal").pack(fill="x", padx=10, pady=(0, 10))
+        # ---- Insert-into-map card ------------------------------------------
+        self.card2 = RoundedCard(self.body)
+        self.card2.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        body2 = self.card2.body
 
-        insert_header = ttk.Frame(self.body)
-        insert_header.pack(fill="x", padx=10)
-        ttk.Label(insert_header, text="Insert into map", font=("Segoe UI", 14, "bold")).pack(side="left")
-        InfoIcon(insert_header, "Append your pattern in your gallery to a "
-                                 "map.").pack(side="left", padx=(6, 0))
+        insert_header = tk.Frame(body2, bg=FRONT_CARD_BG)
+        insert_header.pack(fill="x", pady=(0, 14))
+        tk.Label(insert_header, text="Insert into map", bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
+                 font=("Segoe UI", 13, "bold")).pack(side="left")
+        insert_info = InfoIcon(insert_header, "Append your pattern in your gallery to a map.")
+        insert_info.configure(bg=FRONT_CARD_BG)
+        insert_info.pack(side="left", padx=(6, 0))
 
-        target_row = ttk.Frame(self.body)
-        target_row.pack(fill="x", padx=10, pady=(6, 2), anchor="w")
-        ttk.Label(target_row, text="Target time:").pack(side="left")
+        target_row = tk.Frame(body2, bg=FRONT_CARD_BG)
+        target_row.pack(fill="x", anchor="w", pady=(0, 10))
+        tk.Label(target_row, text="Target time:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).pack(side="left")
         vcmd_time = (self.register(_validate_partial_time), "%P")
         self.target_time_var = tk.StringVar()
-        self.target_time_entry = ttk.Entry(target_row, textvariable=self.target_time_var, width=15,
-                                            validate="key", validatecommand=vcmd_time)
-        self.target_time_entry.pack(side="left", padx=5)
+        self.target_time_entry = _make_light_entry(
+            target_row, textvariable=self.target_time_var, width=15,
+            validate="key", validatecommand=vcmd_time)
+        self.target_time_entry.pack(side="left", padx=(10, 0), ipady=4, ipadx=6)
         self.target_time_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.target_time_var))
-        InfoIcon(target_row, "This field is auto-filled after copying a "
-                              "timestamp.").pack(side="left", padx=(4, 0))
+        target_info = InfoIcon(target_row, "This field is auto-filled after copying a timestamp.")
+        target_info.configure(bg=FRONT_CARD_BG)
+        target_info.pack(side="left", padx=(6, 0))
 
         self.match_bpm_var = tk.BooleanVar(value=True)
-        match_bpm_row = ttk.Frame(self.body)
-        match_bpm_row.pack(fill="x", padx=10, pady=(2, 5), anchor="w")
-        ttk.Checkbutton(match_bpm_row, text="Match target map's BPM",
-                         variable=self.match_bpm_var).pack(side="left")
+        match_bpm_row = tk.Frame(body2, bg=FRONT_CARD_BG)
+        match_bpm_row.pack(fill="x", anchor="w", pady=(0, 12))
+        LightCheckbox(match_bpm_row, "Match target map's BPM", self.match_bpm_var).pack(side="left")
 
-        self.diff_list = DiffRadioList(self.body, app)
-        self.diff_list.pack(fill="both", expand=False, padx=10, pady=5)
+        tk.Label(body2, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        self.diff_list = DiffRadioList(body2, app, light=True, label_inside=False)
+        self.diff_list.pack(fill="both", expand=False, pady=(0, 16))
 
-        ttk.Button(self.body, text="Insert Selected Pattern", command=self.insert_selected).pack(
-            anchor="e", padx=10, pady=10)
+        btn_row = tk.Frame(body2, bg=FRONT_CARD_BG)
+        btn_row.pack(fill="x")
+        _make_accent_button(btn_row, "Insert Selected Pattern", self.insert_selected).pack(side="right")
 
         self._clipboard_poll_job = None
         self._last_clipboard_seen = None
@@ -4230,6 +5687,7 @@ class PatternGalleryFrame(BaseToolFrame):
     def on_shown(self):
         self.refresh()
         self.diff_list.refresh(preselect_file=self._live_diff_filename())
+        self.card2.redraw()
         self._last_clipboard_seen = None
         self._poll_clipboard()
         self.bind_all("<Control-d>", self._on_ctrl_d)
@@ -4255,6 +5713,21 @@ class PatternGalleryFrame(BaseToolFrame):
         focused = self.focus_get()
         if isinstance(focused, (tk.Entry, tk.Spinbox, tk.Text)):
             return
+        # Also skip it whenever a *different* window currently holds the
+        # grab — e.g. double-clicking a card to Edit it opens
+        # ManualPatternWindow (grab_set()) without deselecting the card
+        # behind it, so without this check, pressing Delete while that
+        # editor window is focused (even on a non-text widget inside it,
+        # like the divisor dropdown) would delete the very pattern being
+        # edited, out from under the open editor. Checked via
+        # grab_current() rather than focus_get()'s toplevel, because
+        # focus_get() queried from a widget *outside* an active grab
+        # reliably comes back None instead of naming the real focused
+        # widget — confirmed for real, a focus_get()-based version of this
+        # guard silently never fired while the grabbing editor was open.
+        grabbed = self.grab_current()
+        if grabbed is not None and grabbed.winfo_toplevel() is not self.winfo_toplevel():
+            return
         if not self.selected_pattern_names:
             return
         if len(self.selected_pattern_names) == 1:
@@ -4264,6 +5737,7 @@ class PatternGalleryFrame(BaseToolFrame):
 
     def on_map_changed(self):
         self.diff_list.refresh(preselect_file=self._live_diff_filename())
+        self.card2.redraw()
 
     def _live_diff_filename(self):
         """Best-effort: the filename of whichever difficulty is currently
@@ -4763,6 +6237,10 @@ class PatternGalleryFrame(BaseToolFrame):
             self.bulk_delete_btn.pack(anchor="e")
         else:
             self.bulk_delete_btn.pack_forget()
+        # This row's own visibility just changed card1's total content
+        # height (see OffsetShifterFrame.refresh for why the outer card
+        # needs an explicit redraw whenever something inside it resizes).
+        self.card1.redraw()
 
     def _card_at(self, x_root, y_root):
         """Pure geometry lookup rather than winfo_containing() — the
@@ -4908,35 +6386,57 @@ class PatternGalleryFrame(BaseToolFrame):
 class FileNameCheckerFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        add_header(self.body, "File Name Checker",
-                   "Check and rename the mismatched capitalisation in file "
-                   "name compared to the map's metadata.")
+        _style_light_body(self)
 
-        ttk.Label(self.body, text="Only use this tool if your file names' capitalisation is "
-                              "mismatched from the map's metadata.",
-                  justify="left").pack(anchor="w", padx=10, pady=10)
+        header_row = tk.Frame(self.body, bg=FRONT_BG)
+        header_row.pack(fill="x", padx=24, pady=(20, 4))
+        tk.Label(header_row, text="File Name Checker", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        header_info = InfoIcon(header_row,
+                                "Check and rename the mismatched capitalisation in file "
+                                "name compared to the map's metadata.")
+        header_info.configure(bg=FRONT_BG)
+        header_info.pack(side="left", padx=(6, 0))
 
-        self.diff_list = DiffCheckList(self.body, app)
-        self.diff_list.pack(fill="both", expand=True, padx=10, pady=5)
+        tk.Label(self.body, text="Only use this tool if your file names' capitalisation is "
+                                  "mismatched from the map's metadata.",
+                 bg=FRONT_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 11),
+                 justify="left").pack(anchor="w", padx=24, pady=(4, 16))
+
+        self.card = RoundedCard(self.body)
+        self.card.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        body = self.card.body
+
+        tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
+        self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
 
         # "word" wrap can't break a single unbroken "word" — and a file
         # name here often has no spaces (underscores instead), so a long
         # one would just run past the widget's right edge instead of
         # wrapping. "char" guarantees a wrap point regardless.
-        self.result_text = tk.Text(self.body, height=10, wrap="char", font=("Segoe UI", 14))
-        self.result_text.pack(fill="both", expand=False, padx=10, pady=5)
+        result_frame = tk.Frame(body, bg=FRONT_CARD_BG, highlightthickness=1,
+                                 highlightbackground=FRONT_BORDER, highlightcolor=FRONT_BORDER)
+        result_frame.pack(fill="both", expand=False, pady=(0, 16))
+        self.result_text = tk.Text(result_frame, height=10, wrap="char", font=("Segoe UI", 11),
+                                    relief="flat", bd=0, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                                    insertbackground=FRONT_TEXT, padx=10, pady=8)
+        self.result_text.pack(fill="both", expand=True)
 
-        btns = ttk.Frame(self.body)
-        btns.pack(anchor="e", padx=10, pady=10)
-        ttk.Button(btns, text="Check", command=self.check).pack(side="left", padx=5)
-        ttk.Button(btns, text="Rename", command=self.apply).pack(side="left")
+        btns = tk.Frame(body, bg=FRONT_CARD_BG)
+        btns.pack(fill="x")
+        _make_accent_button(btns, "Rename", self.apply).pack(side="right")
+        _make_ghost_button(btns, "Check", self.check).pack(side="right", padx=(0, 8))
 
     def on_shown(self):
         self.diff_list.refresh()
+        self.card.redraw()
         self.result_text.delete("1.0", "end")
 
     def on_map_changed(self):
         self.diff_list.refresh()
+        self.card.redraw()
 
     def check(self):
         if not self.require_map():
@@ -4962,6 +6462,7 @@ class FileNameCheckerFrame(BaseToolFrame):
         renamed = logic.apply_filename_fixes(folder, targets)
         self.notify_done(f"Renamed {renamed} file(s) to match metadata capitalisation.")
         self.diff_list.refresh()
+        self.card.redraw()
         self.result_text.delete("1.0", "end")
 
 
@@ -4969,18 +6470,27 @@ class FileNameCheckerFrame(BaseToolFrame):
 class EarlyVolumeSettingFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        add_header(self.body, "Early Volume Settings",
-                   "Shift the volume lines backward to keep hitsounds "
-                   "synchronized when players hit notes too early.")
+        _style_light_body(self)
+
+        header_row = tk.Frame(self.body, bg=FRONT_BG)
+        header_row.pack(fill="x", padx=24, pady=(20, 4))
+        tk.Label(header_row, text="Early Volume Settings", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        header_info = InfoIcon(header_row,
+                                "Shift the volume lines backward to keep hitsounds "
+                                "synchronized when players hit notes too early.")
+        header_info.configure(bg=FRONT_BG)
+        header_info.pack(side="left", padx=(6, 0))
 
         vcmd_time = (self.register(_validate_partial_time), "%P")
 
-        row = ttk.Frame(self.body)
-        row.pack(fill="x", padx=10, pady=10)
-        ttk.Label(row, text="Selected diff:").pack(side="left")
+        diff_row = tk.Frame(self.body, bg=FRONT_BG)
+        diff_row.pack(fill="x", padx=24, pady=(4, 16))
+        tk.Label(diff_row, text="Selected diff:", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11)).pack(side="left")
         self.diff_var = tk.StringVar()
-        self.diff_combo = ttk.Combobox(row, textvariable=self.diff_var, state="readonly", width=25)
-        self.diff_combo.pack(side="left", padx=5)
+        self.diff_combo = LightDropdown(diff_row, self.diff_var, width=25)
+        self.diff_combo.pack(side="left", padx=(10, 0))
         self.diff_map = {}
 
         self.volume_threshold_var = tk.StringVar(value="10%")
@@ -4989,46 +6499,71 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         self.from_var = tk.StringVar()
         self.to_var = tk.StringVar()
 
-        opts = ttk.Frame(self.body)
-        opts.pack(fill="x", padx=10, pady=2, anchor="w")
+        card = RoundedCard(self.body)
+        card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        opts = card.body
 
-        r1 = ttk.Frame(opts)
-        r1.pack(fill="x", anchor="w", pady=2)
-        ttk.Label(r1, text="Volume change threshold").pack(side="left")
-        ttk.Combobox(r1, textvariable=self.volume_threshold_var, values=logic.VOLUME_THRESHOLD_CHOICES,
-                     state="readonly", width=6).pack(side="left", padx=8)
-        InfoIcon(r1, "Sets the minimum volume change required to move a "
-                     "volume line backward.").pack(side="left")
+        def info(parent, text, **kw):
+            icon = InfoIcon(parent, text, **kw)
+            icon.configure(bg=FRONT_CARD_BG)
+            return icon
 
-        r2 = ttk.Frame(opts)
-        r2.pack(fill="x", anchor="w", pady=2)
-        ttk.Label(r2, text="Early volume threshold").pack(side="left")
-        ttk.Combobox(r2, textvariable=self.early_threshold_var, values=logic.EARLY_THRESHOLD_CHOICES,
-                     state="readonly", width=6).pack(side="left", padx=8)
-        InfoIcon(r2, "Sets how far a volume line is shifted backward "
-                     "relative to the note.").pack(side="left")
+        def row(indent=0, pady=6):
+            r = tk.Frame(opts, bg=FRONT_CARD_BG)
+            r.pack(fill="x", anchor="w", padx=(indent, 0), pady=pady)
+            return r
 
-        r3 = ttk.Frame(opts)
-        r3.pack(fill="x", anchor="w", pady=(10, 2))
-        self.section_only_cb = ttk.Checkbutton(
-            r3, text="Apply to this section only",
-            variable=self.section_only_var, command=self._sync_section_state)
+        def label(parent, text, **kw):
+            defaults = dict(bg=FRONT_CARD_BG, fg=FRONT_TEXT, font=("Segoe UI", 11))
+            defaults.update(kw)
+            return tk.Label(parent, text=text, **defaults)
+
+        # Independently packed rows, not a shared grid — same label width
+        # on both (fixed to the longer text's own character count,
+        # left-anchored) so the two dropdowns' left edges still line up
+        # despite that, same fix as MetadataManagerFrame's Preview Point
+        # misalignment (see CLAUDE.md).
+        THRESHOLD_LABEL_W = len("Volume change threshold")
+
+        r1 = row()
+        label(r1, "Volume change threshold", width=THRESHOLD_LABEL_W, anchor="w").pack(side="left")
+        LightDropdown(r1, self.volume_threshold_var, values=logic.VOLUME_THRESHOLD_CHOICES,
+                      width=6, page_bg=FRONT_CARD_BG).pack(side="left", padx=8)
+        info(r1, "Sets the minimum volume change required to move a "
+                 "volume line backward.").pack(side="left")
+
+        r2 = row()
+        label(r2, "Early volume threshold", width=THRESHOLD_LABEL_W, anchor="w").pack(side="left")
+        LightDropdown(r2, self.early_threshold_var, values=logic.EARLY_THRESHOLD_CHOICES,
+                      width=6, page_bg=FRONT_CARD_BG).pack(side="left", padx=8)
+        info(r2, "Sets how far a volume line is shifted backward "
+                 "relative to the note.").pack(side="left")
+
+        r3 = row(pady=(14, 6))
+        self.section_only_cb = LightCheckbox(
+            r3, "Apply to this section only", self.section_only_var,
+            command=self._sync_section_state)
         self.section_only_cb.pack(side="left")
 
-        r4 = ttk.Frame(opts)
-        r4.pack(fill="x", anchor="w", padx=(24, 0), pady=2)
-        ttk.Label(r4, text="From").pack(side="left")
-        self.from_entry = ttk.Entry(r4, textvariable=self.from_var, width=15,
-                                     validate="key", validatecommand=vcmd_time, state="disabled")
-        self.from_entry.pack(side="left", padx=5)
+        r4 = row(indent=24)
+        self.from_label = label(r4, "From", fg=FRONT_TEXT_MUTED)
+        self.from_label.pack(side="left")
+        self.from_entry = _make_light_entry(
+            r4, textvariable=self.from_var, width=15,
+            validate="key", validatecommand=vcmd_time, state="disabled")
+        self.from_entry.pack(side="left", padx=5, ipady=4)
         self.from_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.from_var))
-        ttk.Label(r4, text="to").pack(side="left")
-        self.to_entry = ttk.Entry(r4, textvariable=self.to_var, width=15,
-                                   validate="key", validatecommand=vcmd_time, state="disabled")
-        self.to_entry.pack(side="left", padx=5)
+        self.to_label = label(r4, "to", fg=FRONT_TEXT_MUTED)
+        self.to_label.pack(side="left")
+        self.to_entry = _make_light_entry(
+            r4, textvariable=self.to_var, width=15,
+            validate="key", validatecommand=vcmd_time, state="disabled")
+        self.to_entry.pack(side="left", padx=5, ipady=4)
         self.to_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.to_var))
 
-        ttk.Button(self.body, text="Apply", command=self.apply).pack(anchor="e", padx=10, pady=10)
+        btn_row = tk.Frame(opts, bg=FRONT_CARD_BG)
+        btn_row.pack(fill="x", pady=(8, 0))
+        _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
 
     def on_shown(self):
         self.refresh()
@@ -5040,7 +6575,7 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         folder, diffs = self.app.get_diff_files()
         self.diff_map = osu_parser.get_diff_display_map(folder, diffs) if folder else {}
         labels = sorted(self.diff_map.keys(), key=osu_parser.taiko_diff_sort_key)
-        self.diff_combo["values"] = labels
+        self.diff_combo.set_values(labels)
 
         target_label = None
         if sync_to_current:
@@ -5057,9 +6592,13 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
             self.diff_var.set(labels[0])
 
     def _sync_section_state(self):
-        state = "normal" if self.section_only_var.get() else "disabled"
+        enabled = self.section_only_var.get()
+        state = "normal" if enabled else "disabled"
         self.from_entry.configure(state=state)
         self.to_entry.configure(state=state)
+        fg = FRONT_TEXT if enabled else FRONT_TEXT_MUTED
+        self.from_label.configure(fg=fg)
+        self.to_label.configure(fg=fg)
 
     def apply(self):
         if not self.require_map():

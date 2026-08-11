@@ -1264,6 +1264,38 @@ def list_song_folder_images(folder: str) -> List[str]:
     return sorted([f for f in os.listdir(folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
 
 
+def _unique_dest_filename(folder: str, filename: str) -> str:
+    """Appends " (2)", " (3)", ... before the extension until `filename`
+    doesn't already exist in `folder` — used so importing an externally
+    browsed file never silently clobbers an unrelated same-named file
+    already sitting in the map folder."""
+    base, ext = os.path.splitext(filename)
+    candidate = filename
+    n = 2
+    while os.path.exists(os.path.join(folder, candidate)):
+        candidate = f"{base} ({n}){ext}"
+        n += 1
+    return candidate
+
+
+def import_external_bg_image(folder: str, src_path: str) -> str:
+    """Copies a background image picked from outside the map folder (BG
+    Settings' Browse button) into the map folder, so the rest of BG
+    Settings (offset math, preview, apply) can treat it exactly like any
+    other image already sitting there. Returns the final filename inside
+    `folder` — same as `src_path`'s own basename unless a different file
+    with that name was already present, in which case the copy is
+    renamed rather than overwriting it."""
+    filename = os.path.basename(src_path)
+    dest = os.path.join(folder, filename)
+    if os.path.exists(dest) and not os.path.samefile(src_path, dest):
+        filename = _unique_dest_filename(folder, filename)
+        dest = os.path.join(folder, filename)
+    if not os.path.exists(dest):
+        shutil.copy2(src_path, dest)
+    return filename
+
+
 OSU_W, OSU_H = 854, 480          # osu!'s canonical widescreen pixel space
 BAND_H = 255                      # visible background band height within it
 PLAYFIELD_H = OSU_H - BAND_H      # taiko playfield/HUD bar height (the rest)
@@ -1406,6 +1438,21 @@ def list_song_folder_videos(folder: str) -> List[str]:
     if not folder or not os.path.isdir(folder):
         return []
     return sorted([f for f in os.listdir(folder) if f.lower().endswith((".mp4", ".m4v", ".avi", ".mov", ".flv", ".wmv", ".webm"))])
+
+
+def import_external_video_file(folder: str, src_path: str) -> str:
+    """Same as import_external_bg_image but for Video Settings' Browse
+    button — copies an externally picked video into the map folder (with
+    the same collision-safe rename via _unique_dest_filename) so it can be
+    treated like any other video already sitting there."""
+    filename = os.path.basename(src_path)
+    dest = os.path.join(folder, filename)
+    if os.path.exists(dest) and not os.path.samefile(src_path, dest):
+        filename = _unique_dest_filename(folder, filename)
+        dest = os.path.join(folder, filename)
+    if not os.path.exists(dest):
+        shutil.copy2(src_path, dest)
+    return filename
 
 
 def resize_taiko_video(folder: str, video_file: str, blur: bool) -> str:
