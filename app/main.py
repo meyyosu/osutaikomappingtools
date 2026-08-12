@@ -18,7 +18,8 @@ import tempfile
 import threading
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
+from tkinter import font as tkfont
 
 import osu_parser
 import tools_logic as logic
@@ -58,7 +59,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.4"
+APP_VERSION = "1.7"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -227,28 +228,138 @@ def download_and_apply_update(asset_url: str, expected_size=None, timeout: int =
     os.close(bat_fd)
     bat_contents = (
         "@echo off\r\n"
+        "setlocal\r\n"
+        "set waittries=0\r\n"
         ":wait\r\n"
         f'tasklist /FI "PID eq {pid}" 2>NUL | find "{pid}" >NUL\r\n'
         'if "%ERRORLEVEL%"=="0" (\r\n'
+        "    set /a waittries+=1\r\n"
+        # Caps the wait instead of looping forever — a real PID can only
+        # be reused by an unrelated process after this one exits, but if
+        # that ever races this check, waiting forever would leave the
+        # download stranded exactly like the failure this script exists
+        # to avoid. 60 tries (~60s) is generous for a normal exit.
+        "    if %waittries% GEQ 60 goto proceed\r\n"
         "    timeout /t 1 /nobreak >NUL\r\n"
         "    goto wait\r\n"
         ")\r\n"
+        ":proceed\r\n"
         # A short extra pause after the process disappears from tasklist —
         # the OS can take a moment to fully release the file handle.
         "timeout /t 1 /nobreak >NUL\r\n"
-        f'move /y "{tmp_path}" "{exe_path}" >NUL\r\n'
+        "set movetries=0\r\n"
+        ":trymove\r\n"
+        f'move /y "{tmp_path}" "{exe_path}" >NUL 2>&1\r\n'
+        # move deletes its source on success — its own ERRORLEVEL isn't
+        # always reliable across every Windows version/path-quoting edge
+        # case, but the source file genuinely being gone is: this is what
+        # actually caught the original bug (move failing silently — e.g.
+        # antivirus still scanning the freshly-downloaded exe — while the
+        # script carried on as if nothing was wrong, leaving the ".new"
+        # file behind with the old exe never replaced).
+        f'if not exist "{tmp_path}" goto moved\r\n'
+        "set /a movetries+=1\r\n"
+        "if %movetries% GEQ 10 goto moved\r\n"
+        "timeout /t 1 /nobreak >NUL\r\n"
+        "goto trymove\r\n"
+        ":moved\r\n"
+        # A short settle delay between the successful move and actually
+        # launching the freshly-written exe — confirmed for real: without
+        # this, the very first auto-relaunch could hit "Failed to load
+        # Python DLL" (PyInstaller's own bootloader failing to unpack
+        # itself) immediately after the swap, while manually double-
+        # clicking the exact same exe moments later worked fine every
+        # time. Consistent with something (most likely antivirus
+        # real-time scanning) still briefly touching the file right after
+        # it's written, clearing up well within a couple seconds.
+        "timeout /t 2 /nobreak >NUL\r\n"
         f'start "" "{exe_path}"\r\n'
         'del "%~f0"\r\n'
     )
     with open(bat_path, "w", encoding="utf-8") as f:
         f.write(bat_contents)
 
-    DETACHED_PROCESS = 0x00000008
-    subprocess.Popen(
-        ["cmd", "/c", bat_path],
-        creationflags=DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-        cwd=exe_dir,
-    )
+    # DETACHED_PROCESS was the actual root cause of the "leaves a .new
+    # file, never replaces the old exe, never relaunches" bug: it means
+    # the child gets *no console at all*, and this bat script's own
+    # internal `tasklist | find` pipe silently breaks without one —
+    # confirmed for real, reproduced in isolation: with
+    # DETACHED_PROCESS | CREATE_NO_WINDOW, the script never got past its
+    # first pipe; with CREATE_NO_WINDOW alone (still no visible window,
+    # but a real hidden console backs it so internal pipes/redirects work
+    # normally), the exact same script completed every step correctly.
+    # Don't reintroduce DETACHED_PROCESS here.
+    #
+    # CREATE_BREAKAWAY_FROM_JOB matters whenever this app itself is
+    # running inside a Windows Job Object — e.g. launched from VS Code's/
+    # Windows Terminal's integrated terminal, or under some IDE/launcher
+    # setups — since a job can be configured to kill every process it
+    # owns the instant the job's own process (this app) exits. Without
+    # breaking away, this cmd.exe/bat helper could get killed in the same
+    # instant os._exit(0) fires below, before it ever reaches its "wait
+    # for PID to vanish, then move+relaunch" loop. Falls back to the
+    # plain flags if breakaway is refused (some jobs explicitly disallow
+    # it) — that reintroduces the job-object risk in that narrower case,
+    # but every other launch context still gets it.
+    # The relaunched exe lands at the *same path* as this currently-running
+    # one (only its contents changed, via the move above) — and a PyInstaller
+    # onefile bootloader, by default, treats a child process pointed at a
+    # path it recognizes as "a worker of the same already-running app" and
+    # tries to reuse this process's own extraction state instead of
+    # unpacking fresh. That's wrong here (the file underneath that path is
+    # a different build now) and is exactly what caused a real, confirmed
+    # failure: the auto-relaunched exe hit "Failed to load Python DLL"
+    # immediately after a successful swap, while manually double-clicking
+    # the identical file moments later always worked fine. PYINSTALLER_
+    # RESET_ENVIRONMENT is PyInstaller's own documented flag for forcing a
+    # spawned process to treat itself as fresh rather than inherited;
+    # _MEIPASS2/_PYI_ARCHIVE_FILE are stripped too for older bootloader
+    # versions that use those directly instead. Applies to the whole
+    # cmd.exe -> bat -> start chain, since env inherits all the way down
+    # to whichever process actually launches the new exe.
+    clean_env = dict(os.environ)
+    clean_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    for var in ("_MEIPASS2", "_PYI_ARCHIVE_FILE", "_PYI_APPLICATION_HOME_DIR"):
+        clean_env.pop(var, None)
+
+    base_flags = subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            creationflags=base_flags | subprocess.CREATE_BREAKAWAY_FROM_JOB,
+            cwd=exe_dir,
+            env=clean_env,
+        )
+    except OSError:
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            creationflags=base_flags,
+            cwd=exe_dir,
+            env=clean_env,
+        )
+
+
+def _truncate_to_width(text: str, font_obj: "tkfont.Font", max_width: int) -> str:
+    """Shrinks `text` to the longest prefix (plus a trailing "…") that
+    still fits within `max_width` pixels under `font_obj`, or returns
+    `text` unchanged if it already fits. Binary search over the cut
+    point rather than trimming one character at a time — this runs on
+    every title-bar resize/map-selection, and a long map title is a lot
+    of characters to shrink linearly."""
+    if font_obj.measure(text) <= max_width:
+        return text
+    ellipsis = "…"
+    lo, hi = 0, len(text)
+    best = ellipsis
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = text[:mid].rstrip() + ellipsis
+        if font_obj.measure(candidate) <= max_width:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def _position_over_window(win, reference_widget, width=None, height=None):
@@ -333,6 +444,9 @@ LIVE_SYNC_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper
 COORD_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_coords.json")
 WINDOW_GEOMETRY_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_geometry.txt")
 FIRST_RUN_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_firstrun.txt")
+METADATA_AUTOFILL_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_metadata_autofill.txt")
+EARLY_VOLUME_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_early_volume.json")
+SONG_INDEX_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_songindex_cache.json")
 
 # Explicit position (not just size) — leaving this to the window manager's
 # default centering risked the bottom of a 950px-tall window running under
@@ -391,6 +505,31 @@ def save_song_index_mode(mode: str):
         pass
 
 
+def load_song_index_cache() -> dict:
+    """Returns {"songs_folder": str, "entries": {mapset_folder_name: {"mtime": float,
+    "meta": dict|None}}} — `meta` is whatever read_basic_metadata() returned for
+    that mapset's taiko diff, or None if the folder has no taiko diff at all
+    (cached too, so a non-taiko mapset isn't re-scanned every launch either).
+    Falls back to an empty cache (nothing reused, same as before this cache
+    existed) on any missing/corrupt file rather than raising."""
+    try:
+        with open(SONG_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+            return {"songs_folder": data.get("songs_folder", ""), "entries": data["entries"]}
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        pass
+    return {"songs_folder": "", "entries": {}}
+
+
+def save_song_index_cache(songs_folder: str, entries: dict):
+    try:
+        with open(SONG_INDEX_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"songs_folder": songs_folder, "entries": entries}, f)
+    except OSError:
+        pass
+
+
 def load_confirm_pattern_delete() -> bool:
     try:
         with open(CONFIRM_PATTERN_DELETE_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -419,6 +558,48 @@ def save_live_sync_config(value: bool):
     try:
         with open(LIVE_SYNC_CONFIG_PATH, "w", encoding="utf-8") as f:
             f.write("1" if value else "0")
+    except OSError:
+        pass
+
+
+def load_metadata_autofill_config() -> bool:
+    try:
+        with open(METADATA_AUTOFILL_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip() != "0"
+    except OSError:
+        return True
+
+
+def save_metadata_autofill_config(value: bool):
+    try:
+        with open(METADATA_AUTOFILL_CONFIG_PATH, "w", encoding="utf-8") as f:
+            f.write("1" if value else "0")
+    except OSError:
+        pass
+
+
+EARLY_VOLUME_DEFAULTS = {
+    "volume_threshold": "10%", "early_threshold": "15ms",
+    "section_only": False, "from": "", "to": "",
+}
+
+
+def load_early_volume_config() -> dict:
+    settings = dict(EARLY_VOLUME_DEFAULTS)
+    try:
+        with open(EARLY_VOLUME_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            settings.update({k: data[k] for k in EARLY_VOLUME_DEFAULTS if k in data})
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        pass
+    return settings
+
+
+def save_early_volume_config(settings: dict):
+    try:
+        with open(EARLY_VOLUME_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({k: settings[k] for k in EARLY_VOLUME_DEFAULTS if k in settings}, f)
     except OSError:
         pass
 
@@ -547,12 +728,18 @@ class App(tk.Tk):
         self._indexing = False
         self._indexed_once = False
         self._indexed_full = False
+        self._index_cancel_event = None
+        self._index_was_cancelled = False
         self.live_sync_enabled = load_live_sync_config()
         self._last_live_sync_key = None
+        self.metadata_autofill = load_metadata_autofill_config()
+        self.early_volume_settings = load_early_volume_config()
 
         self._busy_depth = 0
         self._busy_win = None
         self._busy_configure_binding = None
+        self._busy_click_binding = None
+        self._busy_focusin_binding = None
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self.bind_all("<Button-1>", self._on_global_click_unfocus, add="+")
 
@@ -569,6 +756,14 @@ class App(tk.Tk):
         self.after(1000, self._poll_live_osu_map)
         self.after(200, self._maybe_show_first_time_setup)
         self.after(1500, self._auto_check_for_update)
+
+    def save_metadata_autofill(self, value: bool):
+        self.metadata_autofill = value
+        save_metadata_autofill_config(value)
+
+    def save_early_volume_settings(self, settings: dict):
+        self.early_volume_settings = settings
+        save_early_volume_config(settings)
 
     _UNFOCUS_EXEMPT_TYPES = (tk.Entry, tk.Spinbox, tk.Text, ttk.Entry, ttk.Spinbox, ttk.Combobox)
 
@@ -625,9 +820,10 @@ class App(tk.Tk):
             self._download_and_install_update(result)
 
     def _download_and_install_update(self, result):
+        from screens import _show_alert
         asset_url = result.get("asset_url")
         if not asset_url:
-            messagebox.showwarning(
+            _show_alert(self,
                 "Update available",
                 "This release doesn't have a downloadable build attached — "
                 "opening the download page instead.",
@@ -650,7 +846,7 @@ class App(tk.Tk):
             os._exit(0)
 
         def on_error(err_msg):
-            messagebox.showerror("Update failed", err_msg)
+            _show_alert(self, "Update failed", err_msg)
 
         self.run_cancellable_job("Downloading update... Please wait...", work,
                                   on_success=on_success, on_error=on_error,
@@ -668,15 +864,20 @@ class App(tk.Tk):
         self.destroy()
 
     def set_busy(self, busy: bool, message: str = "Processing... Please wait...", on_cancel=None):
-        """Shows/hides the fading busy banner and blocks all input to the
-        rest of the app while a long-running background job (currently:
-        ffmpeg encodes for Add Silence / the taiko video resizer, or
-        downloading an update) is in flight. Depth-counted so nested/
-        overlapping calls can't hide the banner out from under a still-
-        running job. Must be called from the main thread — worker threads
-        should route through self.after(0, ...). `on_cancel`, if given,
-        adds a Cancel button to the banner (only meaningful for the call
-        that actually creates it, i.e. when this is the first nested
+        """Shows/hides the fading busy banner while a long-running
+        background job (currently: ffmpeg encodes for Add Silence / the
+        taiko video resizer, or downloading an update) is in flight. Purely
+        informational — it no longer grabs input or forces focus (an
+        earlier version did both, plus `-topmost`, which together meant
+        the banner would grab keyboard/mouse input app-wide *and* still
+        float above whatever other window the user had since switched to;
+        neither was intended, so both were removed), so the rest of the
+        app stays fully usable while it's showing. Depth-counted so
+        nested/overlapping calls can't hide the banner out from under a
+        still-running job. Must be called from the main thread — worker
+        threads should route through self.after(0, ...). `on_cancel`, if
+        given, adds a Cancel button to the banner (only meaningful for the
+        call that actually creates it, i.e. when this is the first nested
         call) — most jobs using this banner aren't actually cancellable,
         so it's opt-in per call rather than always shown."""
         if busy:
@@ -760,7 +961,6 @@ class App(tk.Tk):
             return
         win = tk.Toplevel(self)
         win.overrideredirect(True)
-        win.attributes("-topmost", True)
         win.attributes("-alpha", 0.0)
         bg = "#ffc107"
         win.configure(bg=bg)
@@ -774,14 +974,23 @@ class App(tk.Tk):
         self._position_busy_overlay()
         self._busy_configure_binding = self.bind(
             "<Configure>", lambda e: self._position_busy_overlay(), add="+")
-        # Order matters: lift, then focus_force, then grab_set (see the
-        # "Modal Toplevel windows must guard against duplicate opens"
-        # convention this mirrors) — grab_set is what actually blocks
-        # clicks/keys reaching the rest of the app while this is up.
+        # `transient` + `lift` keep it stacked above the main window without
+        # `-topmost` (which used to float it above every other app on the
+        # desktop) and without `grab_set`/`focus_force` (which used to block
+        # input to the rest of the app and steal keyboard focus outright) —
+        # see set_busy's own docstring for why all three were dropped. But
+        # `lift()` only reorders the stacking *once*, at this instant — on
+        # Windows, clicking anywhere in the main window brings *it* to the
+        # front of its own (non-topmost) Z-band, which can genuinely put it
+        # back above this still-unraised banner. Re-lifting on every click/
+        # focus-in on the main window (not bind_all — only this window, not
+        # every popup) keeps the banner on top through that without ever
+        # needing `-topmost` (still scoped to just this app, so it can't
+        # float above some other app the user has since switched to).
         win.transient(self)
         win.lift()
-        win.focus_force()
-        win.grab_set()
+        self._busy_click_binding = self.bind("<Button-1>", lambda e: win.lift(), add="+")
+        self._busy_focusin_binding = self.bind("<FocusIn>", lambda e: win.lift(), add="+")
         self._fade_busy_overlay(0, 15, reverse=False)
 
     def _position_busy_overlay(self):
@@ -803,10 +1012,15 @@ class App(tk.Tk):
         if step < steps:
             win.after(max(1, 250 // steps), lambda: self._fade_busy_overlay(step + 1, steps, reverse))
         elif reverse:
-            win.grab_release()
             if self._busy_configure_binding is not None:
                 self.unbind("<Configure>", self._busy_configure_binding)
                 self._busy_configure_binding = None
+            if self._busy_click_binding is not None:
+                self.unbind("<Button-1>", self._busy_click_binding)
+                self._busy_click_binding = None
+            if self._busy_focusin_binding is not None:
+                self.unbind("<FocusIn>", self._busy_focusin_binding)
+                self._busy_focusin_binding = None
             win.destroy()
             self._busy_win = None
 
@@ -835,14 +1049,26 @@ class App(tk.Tk):
         else:  # "partial" (default)
             self.build_song_index()
 
+    def _needs_manual_index_start(self):
+        """True whenever nothing is indexed yet and it's not going to fix
+        itself on its own — either Manual Index mode was picked (which
+        never auto-indexes) or the last index attempt was explicitly
+        cancelled partway through. A cancelled Partial/Full-mode index is
+        deliberately treated the same as Manual mode from this point on:
+        letting search_songs() quietly restart the very build the user
+        just cancelled would make Cancel feel like it didn't do anything.
+        Cleared the moment a new index build actually starts (see
+        build_song_index) or once one finishes (self._indexed_once)."""
+        return (self.song_index_mode == "manual" or self._index_was_cancelled) and not self._indexed_once
+
     def _refresh_manual_index_button(self):
         """Shows the "Start Indexing" button in the same spot the progress
-        bar/"Index Full Library" button normally live, but only when
-        Manual mode is selected and nothing has been indexed yet — once
-        indexing has happened once, this button's job is done and the
-        usual "Index Full Library" button (for a full re-index) takes over
-        that spot instead."""
-        if self.song_index_mode == "manual" and not self._indexed_once and not self._indexing:
+        bar/"Index Full Library" button normally live, whenever nothing's
+        indexed yet and nothing is going to index it automatically (see
+        _needs_manual_index_start) — once indexing has happened once, this
+        button's job is done and the usual "Index Full Library" button
+        (for a full re-index) takes over that spot instead."""
+        if self._needs_manual_index_start() and not self._indexing:
             if not self.index_status_frame.winfo_ismapped():
                 self.index_status_frame.pack(side="left", padx=(4, 0))
             self.start_indexing_button.pack(side="left")
@@ -853,11 +1079,12 @@ class App(tk.Tk):
     def _sync_search_availability(self):
         """Search only makes sense once there's something to search — grays
         out the search box and its magnifying-glass button (with an
-        explanatory tooltip) while actively indexing, or while Manual
-        Index mode is selected and nothing has been indexed yet at all."""
+        explanatory tooltip) while actively indexing, or whenever nothing's
+        indexed yet and nothing will index it automatically (see
+        _needs_manual_index_start)."""
         if self._indexing:
             state = "disabled"
-        elif self.song_index_mode == "manual" and not self._indexed_once:
+        elif self._needs_manual_index_start():
             state = "disabled"
         else:
             state = "normal"
@@ -949,32 +1176,44 @@ class App(tk.Tk):
             if self._indexing:
                 return ("Your osu! songs folder is currently being indexed. "
                          "Search will become available once indexing is complete.")
-            if self.song_index_mode == "manual" and not self._indexed_once:
+            if self._needs_manual_index_start():
                 return "Search requires indexing your osu! Songs folder. Click \u201cStart Indexing\u201d to begin."
             return "Search"
 
         _add_tooltip(search_btn, _search_tooltip_text)
         _add_tooltip(search_entry, _search_tooltip_text)
 
-        # Indexing status (progress bar + label), hidden until a Songs
-        # folder index build actually starts. The "index full library"
-        # button lives in this same spot when nothing else needs it.
+        # Indexing status: a compact label, swapped for "Index Complete!"
+        # text once a build finishes, plus a self-contained two-row group
+        # (text + cancel button on top, determinate progress bar beneath)
+        # shown only while a build is actually running. Both live in this
+        # same corner of the title bar, matching where the old
+        # indeterminate-spinner version used to sit (an earlier version
+        # tried a full-width banner across the whole window instead;
+        # reverted as excessive for what's a routine background refresh).
+        # The progress group is packed/unpacked as one unit — same as
+        # index_full_button/start_indexing_button below — so mixing its
+        # internal side="top" rows with this frame's own side="left"
+        # children never has to happen at the same packing level.
+        from screens import _IndexProgressBar
         self.index_status_frame = tk.Frame(bar, bg=UI_BG)
-        self.index_progress = ttk.Progressbar(self.index_status_frame, mode="indeterminate", length=80)
         self.index_status_var = tk.StringVar(value="")
         self.index_status_label = tk.Label(self.index_status_frame, textvariable=self.index_status_var,
                                             bg=UI_BG, fg=UI_TEXT_MUTED, font=("Segoe UI", 10))
         self.index_status_label.pack(side="left")
 
-        def _index_tooltip_text():
-            # Only relevant while actually indexing — stays quiet during
-            # the "Index Complete!" cooldown or once idle.
-            if self._indexing:
-                return "Currently indexing your osu! Songs folder for search. Please wait…"
-            return None
+        self._index_progress_group = tk.Frame(self.index_status_frame, bg=UI_BG)
+        progress_top_row = tk.Frame(self._index_progress_group, bg=UI_BG)
+        progress_top_row.pack(side="top", fill="x")
+        tk.Label(progress_top_row, text="Index in progress", bg=UI_BG, fg=UI_TEXT_MUTED,
+                 font=("Segoe UI", 10)).pack(side="left")
+        self._index_cancel_btn = self._make_icon_button(
+            progress_top_row, "✕", self._cancel_indexing, font=("Segoe UI", 9))
+        self._index_cancel_btn.pack(side="right")
+        _add_tooltip(self._index_cancel_btn, "Cancel indexing", align="right")
+        self.index_progress_bar = _IndexProgressBar(self._index_progress_group, bg=UI_BG, width=140)
+        self.index_progress_bar.pack(side="top", fill="x", pady=(2, 0))
 
-        _add_tooltip(self.index_progress, _index_tooltip_text, align="right")
-        _add_tooltip(self.index_status_label, _index_tooltip_text, align="right")
         self.index_full_button = self._make_accent_button(
             self.index_status_frame, "Index Full Library",
             lambda: self.build_song_index(full=True))
@@ -997,11 +1236,20 @@ class App(tk.Tk):
         lightning_btn.pack(side="left", padx=(0, 6), pady=13)
         _add_tooltip(lightning_btn, "Open map from osu!", align="center")
 
-        title_lbl = tk.Label(bar, textvariable=self.now_selecting_var, anchor="w",
-                              justify="left", bg=UI_SOFT, fg=UI_TEXT, font=("Segoe UI", 11),
+        # No textvariable here (unlike most labels in this app) — the
+        # displayed text is a *truncated* view of now_selecting_var's real
+        # value (see _update_now_selecting_wraplength, which now truncates
+        # with an ellipsis instead of wrapping), so this label's own text
+        # is set explicitly from that logic rather than mirroring the
+        # StringVar directly.
+        title_font = ("Segoe UI", 11)
+        title_lbl = tk.Label(bar, anchor="w",
+                              justify="left", bg=UI_SOFT, fg=UI_TEXT, font=title_font,
                               padx=16, pady=10, highlightthickness=1,
                               highlightbackground=UI_BORDER, highlightcolor=UI_BORDER)
         title_lbl.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=13)
+        self._now_selecting_font = tkfont.Font(font=title_font)
+        self.now_selecting_var.trace_add("write", self._update_now_selecting_wraplength)
         self._titlebar = bar
         self._now_selecting_label = title_lbl
 
@@ -1042,15 +1290,54 @@ class App(tk.Tk):
         self.index_status_frame.bind("<Configure>", self._update_now_selecting_wraplength)
         self._update_now_selecting_wraplength()
 
-    def _update_now_selecting_wraplength(self, _event=None):
-        """Recomputes and applies the "Now Selecting" label's wraplength so
-        its text wraps onto extra lines instead of demanding more width
-        than is actually left over in the title bar. Deferred via
-        after_idle rather than applied synchronously from the <Configure>
-        handler that triggers it — setting wraplength directly inside a
-        Configure callback firing as *part of* the very pack computation
-        it's reacting to corrupted the layout of every widget packed after
-        the label (confirmed empirically: they collapsed to 0-1px wide)."""
+    def _show_indexing_status(self):
+        """Shows the compact indexing-progress group — "Index in progress"
+        + a cancel button on one row, a determinate progress bar on the
+        row beneath it — inline in the title bar's index_status_frame
+        corner, the same spot the old indeterminate-spinner version used
+        to occupy (a full-width banner across the whole window was tried
+        first and reverted as excessive for what's a routine background
+        refresh)."""
+        self.index_progress_bar.set_progress(0.0)
+        self._index_cancel_btn.configure(state="normal")
+        self.index_full_button.pack_forget()
+        self.start_indexing_button.pack_forget()
+        self.index_status_var.set("")
+        if not self.index_status_frame.winfo_ismapped():
+            self.index_status_frame.pack(side="left", padx=(4, 0))
+        self._index_progress_group.pack(side="left")
+        self._sync_search_availability()
+
+    def _hide_indexing_status(self):
+        self._index_progress_group.pack_forget()
+
+    def _cancel_indexing(self):
+        """Just flips the shared cancel flag — the indexing worker thread
+        checks it once per folder scanned (cheap, so response is near-
+        instant) and posts `_on_index_cancelled` back to the main thread
+        itself once it actually notices, rather than tearing anything down
+        here directly (the thread is still running and touching
+        self.song_index-adjacent locals at this point)."""
+        self._index_cancel_btn.configure(state="disabled")
+        if self._index_cancel_event is not None:
+            self._index_cancel_event.set()
+
+    def _update_now_selecting_wraplength(self, *_args):
+        """Recomputes and applies the "Now Selecting" label's displayed
+        text so it's truncated with an ellipsis instead of wrapping onto
+        extra lines when it demands more width than is actually left over
+        in the title bar — wrapping made the whole title bar grow taller
+        (and every button in it shift down) whenever a long map title was
+        selected. Deferred via after_idle rather than applied synchronously
+        from the <Configure> handler that triggers it — setting this
+        directly inside a Configure callback firing as *part of* the very
+        pack computation it's reacting to corrupted the layout of every
+        widget packed after the label (confirmed empirically: they
+        collapsed to 0-1px wide). Also fires on now_selecting_var's own
+        trace (a new map/diff selected) since the *text* to fit changed,
+        not just the available width — the old wraplength-only version
+        never needed this, since a StringVar-bound label re-wraps its new
+        text automatically, but a manually truncated one doesn't."""
         def _apply():
             if not self.winfo_exists():
                 return
@@ -1062,7 +1349,9 @@ class App(tk.Tk):
             # track each one's actual padx individually.
             reserved = sum(w.winfo_reqwidth() for w in siblings) + 12 * len(siblings) + 20
             available = max(150, self._titlebar.winfo_width() - reserved)
-            self._now_selecting_label.configure(wraplength=available)
+            full_text = self.now_selecting_var.get()
+            self._now_selecting_label.configure(
+                text=_truncate_to_width(full_text, self._now_selecting_font, available))
         self.after_idle(_apply)
 
     def open_settings(self):
@@ -1073,6 +1362,7 @@ class App(tk.Tk):
         from screens import (make_scrollable_toplevel_body, InfoIcon, show_toast, RoundedCard,
                               LightCheckbox, LightRadiobutton, _make_light_entry,
                               _make_accent_button, _make_ghost_button,
+                              _show_alert, _ask_yesno, _ask_yesnocancel,
                               FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
@@ -1143,7 +1433,7 @@ class App(tk.Tk):
         def do_set():
             path = folder_var.get().strip()
             if not is_valid_osu_songs_folder(path):
-                messagebox.showwarning(
+                _show_alert(win,
                     "Invalid folder",
                     "That doesn't look like an osu! Songs folder — the path must "
                     "end in \"osu!\\Songs\" (e.g. C:\\osu!\\Songs). Pick the actual "
@@ -1248,7 +1538,7 @@ class App(tk.Tk):
             need_ffprobe_bin = not logic.ffprobe_available()
             need_vlc = not logic.vlc_available()
             if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc:
-                messagebox.showinfo("Download resources", "ffmpeg, ffprobe and VLC are already installed.")
+                _show_alert(win, "Download resources", "ffmpeg, ffprobe and VLC are already installed.")
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
@@ -1282,14 +1572,14 @@ class App(tk.Tk):
                 reset_button()
                 if win.winfo_exists():
                     if errors:
-                        messagebox.showerror("Download resources", "\n\n".join(errors))
+                        _show_alert(win, "Download resources", "\n\n".join(errors))
                     else:
-                        messagebox.showinfo("Download resources", f"{' and '.join(installed)} installed successfully.")
+                        _show_alert(win, "Download resources", f"{' and '.join(installed)} installed successfully.")
 
             def on_error(err_msg):
                 reset_button()
                 if win.winfo_exists():
-                    messagebox.showerror("Download resources", err_msg)
+                    _show_alert(win, "Download resources", err_msg)
 
             self.run_cancellable_job(
                 "Installing ffmpeg + ffprobe and VLC (may take a few minutes)... Please wait...",
@@ -1336,7 +1626,7 @@ class App(tk.Tk):
             show_toast(win, "Settings Applied", display_ms=1000)
 
         def do_restart():
-            if not messagebox.askyesno(
+            if not _ask_yesno(win,
                 "Restart to apply",
                 "This will save your settings and restart the app. Continue?",
             ):
@@ -1356,7 +1646,7 @@ class App(tk.Tk):
             win._closing = True
             try:
                 if has_unsaved_changes():
-                    resp = messagebox.askyesnocancel(
+                    resp = _ask_yesnocancel(win,
                         "Unsaved changes",
                         "You have unsaved settings changes. Save before closing?",
                     )
@@ -1376,14 +1666,14 @@ class App(tk.Tk):
                     return
                 check_update_btn.configure(state="normal", text="Check for Update")
                 if result is None:
-                    messagebox.showwarning(
+                    _show_alert(win,
                         "Check for Update",
                         "Could not check for updates. Check your internet connection and try again.",
                     )
                 elif result["is_newer"]:
                     self._offer_update_install(result)
                 else:
-                    messagebox.showinfo("Check for Update", f"You're up to date (v{APP_VERSION}).")
+                    _show_alert(win, "Check for Update", f"You're up to date (v{APP_VERSION}).")
 
             self._check_for_update_async(done)
 
@@ -1432,7 +1722,7 @@ class App(tk.Tk):
             return
         from screens import (make_scrollable_toplevel_body, InfoIcon, show_toast, RoundedCard,
                               _make_light_entry, _make_accent_button, _make_ghost_button,
-                              FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
+                              _show_alert, FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
         win.title("First time setup")
@@ -1494,7 +1784,7 @@ class App(tk.Tk):
         def do_set():
             path = folder_var.get().strip()
             if not is_valid_osu_songs_folder(path):
-                messagebox.showwarning(
+                _show_alert(win,
                     "Invalid folder",
                     "That doesn't look like an osu! Songs folder — the path must "
                     "end in \"osu!\\Songs\" (e.g. C:\\osu!\\Songs). Pick the actual "
@@ -1553,7 +1843,7 @@ class App(tk.Tk):
             need_ffprobe_bin = not logic.ffprobe_available()
             need_vlc = not logic.vlc_available()
             if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc:
-                messagebox.showinfo("Download resources", "ffmpeg, ffprobe and VLC are already installed.")
+                _show_alert(win, "Download resources", "ffmpeg, ffprobe and VLC are already installed.")
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
@@ -1587,14 +1877,14 @@ class App(tk.Tk):
                 reset_button()
                 if win.winfo_exists():
                     if errors:
-                        messagebox.showerror("Download resources", "\n\n".join(errors))
+                        _show_alert(win, "Download resources", "\n\n".join(errors))
                     else:
-                        messagebox.showinfo("Download resources", f"{' and '.join(installed)} installed successfully.")
+                        _show_alert(win, "Download resources", f"{' and '.join(installed)} installed successfully.")
 
             def on_error(err_msg):
                 reset_button()
                 if win.winfo_exists():
-                    messagebox.showerror("Download resources", err_msg)
+                    _show_alert(win, "Download resources", err_msg)
 
             self.run_cancellable_job(
                 "Installing ffmpeg + ffprobe and VLC (may take a few minutes)... Please wait...",
@@ -1607,7 +1897,7 @@ class App(tk.Tk):
         # ------------------------------------------------------------------
         def do_all_set():
             if not is_valid_osu_songs_folder(pending["folder"]):
-                messagebox.showwarning(
+                _show_alert(win,
                     "osu! Songs folder not set",
                     "You must set osu! Songs folder before proceeding.",
                 )
@@ -1661,11 +1951,12 @@ class App(tk.Tk):
         self.search_songs(query)
 
     def set_osu_folder(self):
+        from screens import _show_alert
         folder = filedialog.askdirectory(title="Select your osu! Songs folder")
         if folder:
             self.osu_songs_folder = folder
             save_osu_folder_config(folder)
-            messagebox.showinfo(APP_TITLE, f"osu! Songs folder set to:\n{folder}")
+            _show_alert(self, APP_TITLE, f"osu! Songs folder set to:\n{folder}")
             # A new folder needs its own fresh index — don't carry over
             # "already fully indexed" from whatever folder was set before.
             self.song_index = []
@@ -1678,8 +1969,9 @@ class App(tk.Tk):
         """Manually browse for any beatmap folder with the file explorer —
         handy when auto-detection (lightning button) isn't available or
         you want to work on a map that isn't currently open in osu!."""
+        from screens import _show_alert
         if not self.osu_songs_folder or not os.path.isdir(self.osu_songs_folder):
-            messagebox.showwarning(APP_TITLE, "Set your osu! folder first (the hexagon button).")
+            _show_alert(self, APP_TITLE, "Set your osu! folder first (the hexagon button).")
             return
         folder = filedialog.askdirectory(
             title="Select a beatmap folder",
@@ -1702,8 +1994,9 @@ class App(tk.Tk):
         osu! stable client by reading its process memory (Windows only,
         best-effort — see osu_memory.py). Falls back to asking the user to
         pick the folder manually if that isn't possible for any reason."""
+        from screens import _show_alert
         if not self.osu_songs_folder or not os.path.isdir(self.osu_songs_folder):
-            messagebox.showwarning(APP_TITLE, "Set your osu! folder first (the hexagon button).")
+            _show_alert(self, APP_TITLE, "Set your osu! folder first (the hexagon button).")
             return
 
         detected = None
@@ -1768,47 +2061,106 @@ class App(tk.Tk):
         background per beatmap set) in a background thread so the UI never
         freezes, even for large Songs folders. By default only indexes the
         `limit` most recently modified mapsets (a reasonable proxy for
-        "latest downloaded") — call with full=True to index everything."""
+        "latest downloaded") — call with full=True to index everything.
+        Per-folder scan results are cached to disk (SONG_INDEX_CACHE_PATH,
+        see load/save_song_index_cache) across runs, keyed by mapset folder
+        mtime — an unchanged folder is skipped entirely on the next scan
+        (whether that scan is Partial or Full; both draw from the same
+        cache), a new/modified folder is (re)scanned, and a folder that's
+        been deleted since the last scan is dropped from the cache. Only
+        the per-folder taiko/metadata check is cached — which entries
+        actually end up in the visible index (top `limit` vs. everything)
+        is still recomputed fresh every call.
+        Cancellable via the compact indicator's ✕ button (see
+        _cancel_indexing) — both loops below check the shared cancel event
+        every iteration, cheap enough that response feels immediate even
+        though nothing here can forcibly interrupt whichever single file
+        read is in flight at the moment Cancel is clicked."""
         if self._indexing or not self.osu_songs_folder or not os.path.isdir(self.osu_songs_folder):
             return
         self._indexing = True
+        self._index_was_cancelled = False
+        cancel_event = threading.Event()
+        self._index_cancel_event = cancel_event
         self._refresh_manual_index_button()
-        self._show_index_status("Index in progress")
+        self._show_indexing_status()
 
         def work():
             index = []
             try:
                 names = os.listdir(self.osu_songs_folder)
+                listdir_ok = True
             except OSError:
                 names = []
+                listdir_ok = False
+
+            # Reuse whatever was cached from the last run — but only if it
+            # was built against this same Songs folder; a cache from a
+            # different folder is meaningless here and just left to be
+            # naturally overwritten below. Keyed by mapset folder *name* to
+            # {"mtime", "meta"}: as long as a folder's own mtime hasn't
+            # changed since it was last scanned, its (possibly expensive,
+            # multi-file) taiko/metadata check can be skipped entirely —
+            # `meta=None` is cached too, so a non-taiko mapset isn't
+            # re-scanned on every launch either.
+            cache = load_song_index_cache()
+            cache_entries = cache["entries"] if cache["songs_folder"] == self.osu_songs_folder else {}
+
+            total = len(names)
+            # Capped so a huge Songs folder doesn't flood the Tk event
+            # queue with one self.after() per folder — ~200 progress-bar
+            # updates over the whole scan is plenty smooth.
+            update_every = max(1, total // 200)
 
             # Determine which folders are taiko mapsets *before* limiting to
             # the most recent N — otherwise a library with lots of non-taiko
             # sets could yield far fewer than `limit` taiko entries. Checking
             # each diff's [General] Mode field is cheap (the reader stops
             # well before parsing notes/timing points), so doing this for
-            # every folder up front is still fast overall.
+            # every folder up front is still fast overall — and with the
+            # cache above, only ever actually happens for a folder that's
+            # new or has changed since the last scan.
             taiko_entries = []  # (mtime, name, folder, meta)
-            for name in names:
+            seen_names = set()
+            for i, name in enumerate(names):
+                if cancel_event.is_set():
+                    self.after(0, self._on_index_cancelled)
+                    return
+                if total and (i % update_every == 0 or i == total - 1):
+                    frac = (i + 1) / total
+                    self.after(0, lambda f=frac: self.index_progress_bar.set_progress(f))
                 folder = os.path.join(self.osu_songs_folder, name)
                 if not os.path.isdir(folder):
                     continue
-                osu_files = osu_parser.list_difficulty_files(folder)
-                if not osu_files:
-                    continue
-                meta = None
-                for osu_file in osu_files:
-                    candidate_meta = osu_parser.read_basic_metadata(os.path.join(folder, osu_file))
-                    if candidate_meta and candidate_meta.get("Mode") == "1":
-                        meta = candidate_meta
-                        break
-                if not meta:
-                    continue
+                seen_names.add(name)
                 try:
                     mtime = os.path.getmtime(folder)
                 except OSError:
                     mtime = 0
+
+                cached = cache_entries.get(name)
+                if cached is not None and cached.get("mtime") == mtime:
+                    meta = cached.get("meta")
+                else:
+                    osu_files = osu_parser.list_difficulty_files(folder)
+                    meta = None
+                    for osu_file in osu_files:
+                        candidate_meta = osu_parser.read_basic_metadata(os.path.join(folder, osu_file))
+                        if candidate_meta and candidate_meta.get("Mode") == "1":
+                            meta = candidate_meta
+                            break
+                    cache_entries[name] = {"mtime": mtime, "meta": meta}
+
+                if not meta:
+                    continue
                 taiko_entries.append((mtime, name, folder, meta))
+
+            if listdir_ok:
+                # Drop cache entries for mapsets that no longer exist (e.g.
+                # an old indexed map that was deleted) so the cache file
+                # doesn't grow stale entries forever.
+                cache_entries = {k: v for k, v in cache_entries.items() if k in seen_names}
+                save_song_index_cache(self.osu_songs_folder, cache_entries)
 
             if full:
                 taiko_entries.sort(key=lambda e: e[1])  # alphabetical when doing everything
@@ -1817,6 +2169,9 @@ class App(tk.Tk):
                 taiko_entries = taiko_entries[:limit]
 
             for _mtime, name, folder, meta in taiko_entries:
+                if cancel_event.is_set():
+                    self.after(0, self._on_index_cancelled)
+                    return
                 artist, title = meta["Artist"], meta["Title"]
                 romanised_artist = meta.get("RomanisedArtist", "") or artist
                 romanised_title = meta.get("RomanisedTitle", "") or title
@@ -1844,37 +2199,45 @@ class App(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_index_status(self, text: str):
-        self.index_status_var.set(text)
-        self.index_full_button.pack_forget()
+    def _on_index_complete(self):
+        self._index_cancel_event = None
+        self._hide_indexing_status()
+        self.index_status_var.set("Index Complete!")
         if not self.index_status_frame.winfo_ismapped():
             self.index_status_frame.pack(side="left", padx=(4, 0))
-        self.index_progress.pack(side="left", padx=(0, 4))
-        self.index_progress.start(10)
-        self.search_entry.configure(state="disabled")
-        self.search_btn.configure(state="disabled")
-
-    def _on_index_complete(self):
-        self.index_progress.stop()
-        self.index_status_var.set("Index Complete!")
         self._refresh_manual_index_button()
         # Clear the status a couple seconds later so it doesn't linger
         # forever, but only if another index build hasn't started since.
         self.after(2500, self._clear_index_status_if_idle)
 
+    def _on_index_cancelled(self):
+        self._indexing = False
+        self._index_cancel_event = None
+        # Marks this the same as "Manual Index, nothing indexed yet" from
+        # here on (see _needs_manual_index_start) — otherwise a
+        # Partial/Full-mode cancel would leave search silently re-
+        # triggering the very build that was just cancelled the next time
+        # it's used, which would make Cancel look like it did nothing.
+        self._index_was_cancelled = True
+        self._hide_indexing_status()
+        self.index_status_var.set("")
+        self._refresh_manual_index_button()
+        from screens import show_toast
+        show_toast(self, "Indexing cancelled", bg="#d32f2f", fg="#ffffff")
+
     def _clear_index_status_if_idle(self):
         if self._indexing:
             return
-        self.index_progress.pack_forget()
         self.index_status_var.set("")
         if self._indexed_once and not self._indexed_full:
             # A full re-index is still worth offering — show the button
-            # right where the progress bar was.
+            # right where the status text was.
             self.index_full_button.pack(side="left")
         else:
             self.index_status_frame.pack_forget()
 
     def search_songs(self, query, _retries=0):
+        from screens import _show_alert
         existing = getattr(self, "_search_win", None)
         if existing is not None and existing.winfo_exists():
             existing.lift()
@@ -1883,19 +2246,23 @@ class App(tk.Tk):
 
         if self._indexing:
             if _retries > 100:  # ~20s safety cap
-                messagebox.showinfo(APP_TITLE, "Still indexing — try searching again in a moment.")
+                _show_alert(self, APP_TITLE, "Still indexing — try searching again in a moment.")
                 return
             self.after(200, lambda: self.search_songs(query, _retries + 1))
             return
         if not self.song_index:
             if not self.osu_songs_folder:
-                messagebox.showwarning(APP_TITLE, "Set your osu! Songs folder first (⚙ Settings).")
+                _show_alert(self, APP_TITLE, "Set your osu! Songs folder first (⚙ Settings).")
                 return
             if self._indexed_once:
-                messagebox.showinfo(APP_TITLE, "No beatmaps found in your Songs folder.")
+                _show_alert(self, APP_TITLE, "No beatmaps found in your Songs folder.")
                 return
-            if self.song_index_mode == "manual":
-                messagebox.showinfo(
+            if self._needs_manual_index_start():
+                # Manual mode never auto-indexes, and a cancelled
+                # Partial/Full-mode attempt is treated the same way here —
+                # silently restarting the very build the user just
+                # cancelled would make Cancel feel like it didn't work.
+                _show_alert(self,
                     APP_TITLE,
                     "Song Index on Startup is set to Manual Index — click "
                     "Start Indexing (next to the search box) first.",
@@ -1908,7 +2275,7 @@ class App(tk.Tk):
         q = query.strip().lower()
         matches = [entry for entry in self.song_index if q in entry["blob"]]
         if not matches:
-            messagebox.showinfo(APP_TITLE, f'No songs matched "{query}".')
+            _show_alert(self, APP_TITLE, f'No songs matched "{query}".')
             return
         from screens import SongSearchResultsWindow
         self._search_win = SongSearchResultsWindow(self, matches, self._select_map_folder)
@@ -1950,6 +2317,8 @@ class App(tk.Tk):
             label = f"Now Selecting: {artist} - {title}"
             if meta["Version"]:
                 label += f" [{meta['Version']}]"
+            if meta["Mapper"]:
+                label += f" ({meta['Mapper']})"
         else:
             label = f"Now Selecting: {os.path.basename(folder)} (no .osu files found)"
         self.now_selecting_var.set(label)
@@ -1967,9 +2336,10 @@ class App(tk.Tk):
         """Opens the currently selected map's folder in the OS file
         explorer — the same "no map selected" message used everywhere
         else in the app if nothing's selected yet."""
+        from screens import _show_alert
         folder = self.current_map_folder.get()
         if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("No map selected", "Please select a map first!")
+            _show_alert(self, "No map selected", "Please select a map first!")
             return
         try:
             if sys.platform == "win32":
@@ -1979,19 +2349,20 @@ class App(tk.Tk):
             else:
                 subprocess.Popen(["xdg-open", folder])
         except OSError as e:
-            messagebox.showwarning(APP_TITLE, f"Couldn't open the folder:\n{e}")
+            _show_alert(self, APP_TITLE, f"Couldn't open the folder:\n{e}")
 
     def open_beatmap_page(self):
         """Opens the currently selected map's page on the osu! website, if
         it's a submitted map (BeatmapSetID present in the .osu file)."""
+        from screens import _show_alert
         folder, diffs = self.get_diff_files()
         if not folder or not diffs:
-            messagebox.showwarning("No map selected", "Please select a map first!")
+            _show_alert(self, "No map selected", "Please select a map first!")
             return
         bm = osu_parser.Beatmap(os.path.join(folder, diffs[0]))
         set_id = bm.get_beatmapset_id()
         if set_id is None:
-            messagebox.showinfo(APP_TITLE, "This map has no beatmap page — it looks unsubmitted.")
+            _show_alert(self, APP_TITLE, "This map has no beatmap page — it looks unsubmitted.")
             return
         webbrowser.open(f"https://osu.ppy.sh/beatmapsets/{set_id}")
 

@@ -585,14 +585,24 @@ def copy_kiai(folder: str, source_diff: str, target_diffs: List[str]):
         path = os.path.join(folder, fname)
         bm = Beatmap(path)
 
-        # Update the kiai bit on whichever of the target's own timing
-        # points is closest to each source timing point, leaving every
-        # other bit of `effects` (and every other field) untouched.
+        # Set the kiai bit on every target timing point to whatever the
+        # source's kiai state actually was AT that point's own time — the
+        # most recent source point at-or-before it (the "governing" state),
+        # not merely whichever source point happens to be nearest in raw
+        # time distance. Matching by nearest-distance let a target point
+        # "see into the future": a point sitting inside an active kiai
+        # section but closer in time to the upcoming off-toggle than to the
+        # on-toggle that started it would get switched off early, while a
+        # point just past the off-toggle could stay matched to an earlier
+        # on-toggle if it happened to be numerically closer to it than to
+        # the off-toggle — silently dropping the off transition depending
+        # on how densely the target's own timing points happened to be
+        # spaced. Every other bit of `effects` (and every other field) is
+        # left untouched.
         for tp in bm.timing_points:
-            match = _closest_timing_point(tp.time, src_points)
-            if match is not None:
-                src_kiai = match.effects & 1
-                tp.effects = (tp.effects & ~1) | src_kiai
+            _, _, _, src_effects = _effective_state_at(tp.time, src_points)
+            src_kiai = src_effects & 1
+            tp.effects = (tp.effects & ~1) | src_kiai
 
         # Add a new green line for any source kiai toggle point that has
         # no counterpart at all in the target, so a kiai section that only

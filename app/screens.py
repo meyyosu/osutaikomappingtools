@@ -11,7 +11,7 @@ import threading
 import webbrowser
 from fractions import Fraction
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, filedialog, simpledialog
 from tkinter import font as tkfont
 
 import osu_parser
@@ -202,11 +202,28 @@ def show_toast(widget, message: str, bg="#b5e61d", fg="#000000",
     """A small borderless banner that fades in over the main window, holds
     for `display_ms`, then fades back out and destroys itself — used for
     routine 'it worked' confirmations so the user doesn't have to click a
-    dialog closed every time they hit Apply."""
+    dialog closed every time they hit Apply. Deliberately not `-topmost`
+    (an earlier version was) — that made it float above every other
+    window on the desktop, including other apps, the instant it fired
+    even if the user had already switched away from this app. `transient`
+    keeps it stacked above its owner window without doing that. It never
+    calls `grab_set()` either, so it was never modal — clicking through to
+    the rest of the app while a toast is fading was already fine."""
     top = widget.winfo_toplevel()
     toast = tk.Toplevel(top)
     toast.overrideredirect(True)
-    toast.attributes("-topmost", True)
+    toast.transient(top)
+    # `overrideredirect` opts this window out of window-manager handling
+    # entirely — including the "new windows come to the front" behavior a
+    # normal window gets automatically. Without `-topmost` masking it (see
+    # above), that meant the toast could spawn stacked *behind* the main
+    # window and stay fully invisible for its whole lifetime unless
+    # something else happened to raise it — confirmed for real: a fresh
+    # toast rendered with a valid geometry and alpha but never appeared
+    # on screen. `transient` alone only sets an ownership relationship
+    # (taskbar grouping, minimize-together); it doesn't affect initial
+    # stacking order the way `lift()` does.
+    toast.lift()
     toast.attributes("-alpha", 0.0)
     toast.configure(bg=bg)
     tk.Label(toast, text=message, bg=bg, fg=fg, font=("Segoe UI", 14, "bold"),
@@ -263,40 +280,127 @@ def _reveal_in_explorer(path: str):
         pass
 
 
+class _DialogChoiceButton(tk.Canvas):
+    """One full-width rounded-rect choice button for `_ask_choice_dialog`
+    — text-only (no icon; see CLAUDE.md/this class's own history — an
+    earlier version drew a hand-drawn icon per button, removed on request
+    since ttk.Button's plain text-button look was preferred here).
+    `primary` renders the option as the highlighted/recommended choice
+    (soft indigo fill, bold indigo label) the way the mockup this was
+    built from always highlights the first/safest option; every other
+    option gets the same soft highlight only on hover, as ordinary hover
+    feedback rather than a "recommended" marker."""
+
+    HEIGHT = 46
+    RADIUS = 12
+
+    def __init__(self, parent, label: str, primary: bool, command):
+        super().__init__(parent, height=self.HEIGHT, highlightthickness=0,
+                          bg=FRONT_CARD_BG, cursor="hand2")
+        self._label = label
+        self._primary = primary
+        self._command = command
+        self._hover = False
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<Button-1>", lambda _e: self._command())
+
+    def _set_hover(self, hover: bool):
+        self._hover = hover
+        self._redraw()
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.HEIGHT
+        if w <= 1:
+            return
+        highlighted = self._primary or self._hover
+        fill = LIGHT_ACCENT_SOFT if highlighted else FRONT_CARD_BG
+        outline = LIGHT_ACCENT_SOFT if highlighted else FRONT_BORDER
+        text_color = LIGHT_ACCENT if self._primary else FRONT_TEXT
+        font = ("Segoe UI", 11, "bold") if self._primary else ("Segoe UI", 11)
+        _draw_rounded_rect(self, 1, 1, w - 1, h - 1, self.RADIUS,
+                            fill=fill, outline=outline, width=1.4)
+        self.create_text(w / 2, h / 2, text=self._label, fill=text_color, font=font)
+
+
 def _ask_choice_dialog(parent, title: str, message: str, options: list) -> str:
-    """Generic modal prompt with a message and one full-width button per
-    (label, value) in `options` — plain `messagebox` dialogs don't support
-    custom button labels, so this is a small dedicated Toplevel instead.
-    Blocks until closed (via `wait_window`) and returns whichever value
-    was clicked; closing via the window's X button or Escape returns
-    `options[-1][1]` (every caller puts "cancel" last, matching how a
-    dismissed dialog should always read as "cancel")."""
+    """Modal prompt styled as a light card: a bold title + close control,
+    a divider, the message, then one full-width rounded button per
+    (label, value) in `options` — plain `messagebox` dialogs don't
+    support custom button labels, so this is a small dedicated Toplevel
+    instead. Blocks until closed (via `wait_window`) and returns
+    whichever value was clicked; closing via the close control or Escape
+    returns `options[-1][1]` (every caller puts "cancel" last, matching
+    how a dismissed dialog should always read as "cancel")."""
     cancel_value = options[-1][1]
     result = {"choice": cancel_value}
-    win = tk.Toplevel(parent)
-    win.title(title)
-    win.resizable(False, False)
+    WRAP = 360
+    top = parent.winfo_toplevel()
+    # Whichever widget had keyboard focus before this dialog opened (e.g.
+    # the search box that triggered it) — restored explicitly once the
+    # dialog closes, below. Needed because of a real Tk/Windows gotcha:
+    # destroying an `overrideredirect` Toplevel that held `grab_set()` and
+    # OS keyboard focus does not reliably hand focus back to the owner
+    # window on its own — confirmed for real (search box became untypeable
+    # after dismissing the "No songs matched" alert, staying that way even
+    # after clicking back into it, until the window was refocused some
+    # other way). `focus_get()` can itself raise if the current focus
+    # owner is a widget on a different, already-destroyed Toplevel.
+    try:
+        previously_focused = top.focus_get()
+    except tk.TclError:
+        previously_focused = None
 
-    body = ttk.Frame(win)
-    body.pack(fill="both", expand=True, padx=18, pady=16)
-    ttk.Label(body, text=message, wraplength=360, justify="left").pack(anchor="w", pady=(0, 14))
+    win = tk.Toplevel(parent)
+    win.withdraw()
+    win.overrideredirect(True)
+    win.configure(bg=FRONT_CARD_BG, highlightthickness=1, highlightbackground=FRONT_BORDER)
 
     def choose(value):
         result["choice"] = value
         win.destroy()
 
+    header = tk.Frame(win, bg=FRONT_CARD_BG)
+    header.pack(fill="x", padx=20, pady=(18, 0))
+    tk.Label(header, text=title, font=("Segoe UI", 14, "bold"), bg=FRONT_CARD_BG,
+             fg=FRONT_TEXT).pack(side="left")
+
+    close_btn = tk.Label(header, text="✕", font=("Segoe UI", 11), bg=FRONT_CARD_BG,
+                          fg=FRONT_TEXT_MUTED, cursor="hand2")
+    close_btn.pack(side="right", anchor="n")
+    close_btn.bind("<Button-1>", lambda _e: choose(cancel_value))
+    close_btn.bind("<Enter>", lambda _e: close_btn.configure(fg=FRONT_TEXT))
+    close_btn.bind("<Leave>", lambda _e: close_btn.configure(fg=FRONT_TEXT_MUTED))
+
+    tk.Frame(win, bg=FRONT_BORDER, height=1).pack(fill="x", padx=20, pady=(16, 16))
+
+    tk.Label(win, text=message, font=("Segoe UI", 11), bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+             wraplength=WRAP, justify="left", anchor="w").pack(fill="x", padx=20)
+
+    btn_col = tk.Frame(win, bg=FRONT_CARD_BG)
+    btn_col.pack(fill="x", padx=20, pady=(20, 20))
     for i, (label, value) in enumerate(options):
-        ttk.Button(body, text=label, command=lambda v=value: choose(v)).pack(
-            fill="x", pady=(2, 0) if i == len(options) - 1 else 2)
+        btn = _DialogChoiceButton(btn_col, label, i == 0, lambda v=value: choose(v))
+        btn.pack(fill="x", pady=(0, 8) if i < len(options) - 1 else 0)
 
     win.protocol("WM_DELETE_WINDOW", lambda: choose(cancel_value))
     win.bind("<Escape>", lambda e: choose(cancel_value))
     win.transient(parent.winfo_toplevel())
-    _position_over_window(win, parent, width=400)
+    _position_over_window(win, parent)
+    win.deiconify()
     win.lift()
     win.focus_force()
     win.grab_set()
     parent.wait_window(win)
+    top.focus_force()
+    if previously_focused is not None:
+        try:
+            previously_focused.focus_set()
+        except tk.TclError:
+            pass  # the previously-focused widget no longer exists
     return result["choice"]
 
 
@@ -335,6 +439,42 @@ def _ask_vlc_required_choice(parent) -> str:
         parent, "VLC required",
         "The live video preview needs VLC, which wasn't found on this system.",
         [("Install automatically", "install"), ("Cancel", "cancel")])
+
+
+def _show_alert(parent, title: str, message: str, ok_label: str = "OK"):
+    """The light-theme replacement for `messagebox.showinfo`/
+    `showwarning`/`showerror` — all three collapsed into one plain
+    single-button card, since dropping the per-severity icon (see
+    `_ask_choice_dialog`'s own history) removed the only visual reason to
+    tell them apart; the title/message text alone already carries
+    whichever of "it worked"/"needs attention"/"failed" applies (e.g.
+    "Invalid value", "No map selected", "Error"). Built directly on
+    `_ask_choice_dialog` with a single option, so it shares its exact
+    look. Blocks until dismissed; the return value is never meaningful
+    (mirrors messagebox's own show* functions, whose return value every
+    caller here already ignored)."""
+    _ask_choice_dialog(parent, title, message, [(ok_label, "ok")])
+
+
+def _ask_yesno(parent, title: str, message: str, yes_label: str = "Yes", no_label: str = "No") -> bool:
+    """The light-theme replacement for `messagebox.askyesno`. Returns
+    True/False; closing via the close control or Escape returns False,
+    matching `askyesno`'s own falsy-on-dismiss behavior."""
+    return _ask_choice_dialog(parent, title, message, [(yes_label, True), (no_label, False)])
+
+
+def _ask_okcancel(parent, title: str, message: str, ok_label: str = "OK") -> bool:
+    """The light-theme replacement for `messagebox.askokcancel`. Returns
+    True/False; closing via the close control or Escape returns False."""
+    return _ask_choice_dialog(parent, title, message, [(ok_label, True), ("Cancel", False)])
+
+
+def _ask_yesnocancel(parent, title: str, message: str):
+    """The light-theme replacement for `messagebox.askyesnocancel`.
+    Returns True/False/None (Cancel); closing via the close control or
+    Escape returns None, matching `askyesnocancel`'s own dismiss-is-
+    Cancel behavior."""
+    return _ask_choice_dialog(parent, title, message, [("Yes", True), ("No", False), ("Cancel", None)])
 
 
 def _scale_value_at_x(scale, x: int) -> float:
@@ -800,6 +940,44 @@ def _draw_rounded_rect(canvas, x1, y1, x2, y2, r=12, **kwargs):
     return canvas.create_polygon(_rounded_rect_points(x1, y1, x2, y2, r), smooth=True, **kwargs)
 
 
+class _IndexProgressBar(tk.Canvas):
+    """A thin rounded-pill determinate progress bar — plain ttk.Progressbar
+    can't get real rounded ends or a custom track/fill color pair without
+    fighting native theme chrome (same "native chrome can't be restyled"
+    wall this theme hits everywhere else), so this draws two stacked
+    rounded rects on a Canvas instead. Used by main.py's compact indexing
+    indicator; lives here (not in main.py) purely so it can share
+    `_draw_rounded_rect` directly instead of importing a lone function for
+    one shape. Pass `width` for a fixed-size bar packed with `side=`
+    (e.g. sitting inline in a title bar corner); omit it to have the bar
+    size itself to whatever width its parent hands it via `fill="x"`."""
+
+    HEIGHT = 10
+    TRACK_COLOR = "#e7e8f0"
+    FILL_COLOR = "#22c55e"
+
+    def __init__(self, parent, bg, width=None):
+        super().__init__(parent, width=width, height=self.HEIGHT, highlightthickness=0, bg=bg)
+        self._frac = 0.0
+        self.bind("<Configure>", lambda _e: self._redraw())
+
+    def set_progress(self, frac: float):
+        self._frac = max(0.0, min(1.0, frac))
+        self._redraw()
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.HEIGHT
+        if w <= 1:
+            return
+        r = h / 2
+        _draw_rounded_rect(self, 0, 0, w, h, r, fill=self.TRACK_COLOR, outline="")
+        fill_w = w * self._frac
+        if fill_w >= 1:
+            _draw_rounded_rect(self, 0, 0, max(fill_w, h), h, r, fill=self.FILL_COLOR, outline="")
+
+
 # Module-level "currently open" tracking for _show_light_context_menu, mirroring
 # LightDropdown._open_instance — only one of these popups is ever open at a
 # time, and the outside-click dismiss handler below is bound to bind_all
@@ -996,16 +1174,61 @@ class RoundedCard(ttk.Frame):
 
 
 # =============================================================================
+_checkbox_icon_cache = {}
+
+
+def _render_checkbox_icon(checked: bool, enabled: bool, size: int, accent: str):
+    """Renders a smooth, anti-aliased rounded-square checkbox glyph via
+    PIL — supersampled at 4x then downsampled with LANCZOS. Replaces an
+    earlier version that drew the box+tick straight on a `tk.Canvas`
+    (`create_polygon`/`create_line`, no anti-aliasing at all): confirmed
+    via a raw-pixel screenshot zoom that it rendered as a near-square box
+    (the corner radius was too small relative to the box to read as a
+    curve at all at 16px) with a visibly stair-stepped, blocky checkmark
+    — not a rendering bug exactly, just the hard ceiling of drawing
+    diagonal lines on an unantialiased Canvas at that size. Same
+    "Tk can't do this, fall back to PIL" reasoning as `_render_gradient_text`
+    above. Cached by (checked, enabled, size, accent): this app only ever
+    uses a handful of distinct combinations, so every LightCheckbox
+    sharing the same state reuses the same rendered image."""
+    key = (checked, enabled, size, accent)
+    cached = _checkbox_icon_cache.get(key)
+    if cached is not None:
+        return cached
+    from PIL import Image, ImageDraw, ImageTk
+    supersample = 4
+    s = size * supersample
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    radius = round(s * 0.28)
+    if checked:
+        fill = accent if enabled else "#eceef4"
+        draw.rounded_rectangle([0, 0, s - 1, s - 1], radius=radius, fill=fill)
+        tick_color = "#ffffff" if enabled else "#c7c7d6"
+        pts = [(0.24 * s, 0.52 * s), (0.42 * s, 0.70 * s), (0.76 * s, 0.30 * s)]
+        draw.line(pts, fill=tick_color, width=round(s * 0.11), joint="curve")
+    else:
+        border = max(1, round(s * 0.09))
+        fill = "#ffffff" if enabled else "#f7f7fa"
+        draw.rounded_rectangle([border / 2, border / 2, s - 1 - border / 2, s - 1 - border / 2],
+                                radius=radius, fill=fill, outline=FRONT_BORDER, width=border)
+    img = img.resize((size, size), Image.LANCZOS)
+    icon = ImageTk.PhotoImage(img)
+    _checkbox_icon_cache[key] = icon
+    return icon
+
+
 class LightCheckbox(tk.Frame):
-    """A custom-drawn checkbox (small Canvas box + Label), used by
+    """A custom checkbox (PIL-rendered icon Label + text Label), used by
     DiffCheckList in light mode instead of tk.Checkbutton. Tk's classic
     Checkbutton indicator on Windows draws its checkmark glyph in a fixed
     color that ignores every color-related option (confirmed empirically:
     `selectcolor` does recolor the box fill, as used before this widget
     existed, but there is no equivalent for the tick itself) — the same
     "native chrome ignores styling" wall hit elsewhere in this redesign,
-    so a fully custom-drawn box+tick is the only reliable way to get a
-    legible white tick against the indigo fill.
+    so a fully custom box+tick is the only reliable way to get a legible
+    white tick against the indigo fill. See `_render_checkbox_icon` for
+    why the box itself is a rendered image rather than Canvas drawing.
 
     `command`, if given, is called (no args) after every toggle — same
     shape as ttk.Checkbutton's own `command=`, used for the recurring
@@ -1015,8 +1238,7 @@ class LightCheckbox(tk.Frame):
     ttk.Checkbutton this replaces — MapCleanerFrame's various `_sync_*`
     methods call this instead."""
 
-    SIZE = 16
-    RADIUS = 4
+    SIZE = 18
     DISABLED_FG = FRONT_TEXT_MUTED
 
     def __init__(self, master, text, variable, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
@@ -1027,12 +1249,11 @@ class LightCheckbox(tk.Frame):
         self.command = command
         self._fg = fg
         self.enabled = True
-        self.canvas = tk.Canvas(self, width=self.SIZE, height=self.SIZE,
-                                 bg=bg, highlightthickness=0, cursor="hand2")
-        self.canvas.pack(side="left", padx=(0, 8))
+        self.icon = tk.Label(self, bg=bg, bd=0, cursor="hand2")
+        self.icon.pack(side="left", padx=(0, 8))
         self.label = tk.Label(self, text=text, bg=bg, fg=fg, font=font, cursor="hand2")
         self.label.pack(side="left")
-        self.canvas.bind("<Button-1>", self._toggle)
+        self.icon.bind("<Button-1>", self._toggle)
         self.label.bind("<Button-1>", self._toggle)
         # Redraws whenever the variable changes for *any* reason, not just
         # this checkbox's own click — needed for e.g. a "mutually exclusive
@@ -1063,26 +1284,14 @@ class LightCheckbox(tk.Frame):
     def set_enabled(self, enabled: bool):
         self.enabled = enabled
         cursor = "hand2" if enabled else "arrow"
-        self.canvas.configure(cursor=cursor)
+        self.icon.configure(cursor=cursor)
         self.label.configure(cursor=cursor, fg=self._fg if enabled else self.DISABLED_FG)
         self._redraw()
 
     def _redraw(self):
-        self.canvas.delete("all")
-        checked = self.variable.get()
-        if self.enabled:
-            fill = self.accent if checked else "#ffffff"
-            outline = self.accent if checked else FRONT_BORDER
-            tick = "#ffffff"
-        else:
-            fill = "#eceef4" if checked else "#f7f7fa"
-            outline = FRONT_BORDER
-            tick = "#c7c7d6"
-        _draw_rounded_rect(self.canvas, 1, 1, self.SIZE - 1, self.SIZE - 1, self.RADIUS,
-                            fill=fill, outline=outline, width=1.5)
-        if checked:
-            self.canvas.create_line(4, 8, 7, 11, 12, 4, fill=tick,
-                                     width=2, capstyle="round", joinstyle="round")
+        img = _render_checkbox_icon(self.variable.get(), self.enabled, self.SIZE, self.accent)
+        self.icon.configure(image=img)
+        self._icon_ref = img  # extra reference alongside the module-level cache
 
 
 # =============================================================================
@@ -1752,7 +1961,7 @@ class DiffCheckList(ttk.LabelFrame):
     the card — for a caller (e.g. CopySection) that wants to put its own
     label above the card instead, as part of a larger enclosing layout."""
 
-    def __init__(self, master, app, label="Apply to:", light=False, label_inside=True):
+    def __init__(self, master, app, label="Apply to:", light=False, label_inside=True, nested=False):
         self.light = light
         if light:
             # Deliberately calls ttk.Frame.__init__ instead of going through
@@ -1764,12 +1973,31 @@ class DiffCheckList(ttk.LabelFrame):
             # layout itself, not conditional on the label text being empty.
             # A plain ttk::frame widget has no such reserved region.
             ttk.Frame.__init__(self, master)
-            self._card = RoundedCard(self)
-            self._card.pack(fill="both", expand=True)
+            if nested:
+                # `nested=True` (opt-in — every pre-existing caller is
+                # unaffected) is for a caller whose own master is already
+                # sitting inside another RoundedCard's body (CopySection,
+                # for Volume/Kiai Copier) — a second RoundedCard here would
+                # just be a card drawn inside a card, adding a whole extra
+                # ring of padding for no visual benefit, and it was real,
+                # measurable bloat: Volume/Kiai Copier stacks two full
+                # CopySection blocks, each double-carded this way, and the
+                # combined height didn't fit the app's own default window
+                # size — a scrollbar appeared on a fresh launch even
+                # before any pattern/diff content grew it further. A plain
+                # Frame matching the surrounding card's own background
+                # draws nothing extra and needs no separate redraw() call.
+                self._card = None
+                card_body = tk.Frame(self, bg=FRONT_CARD_BG)
+                card_body.pack(fill="both", expand=True)
+            else:
+                self._card = RoundedCard(self)
+                self._card.pack(fill="both", expand=True)
+                card_body = self._card.body
             if label_inside:
-                tk.Label(self._card.body, text=label.rstrip(":").strip(), bg=FRONT_CARD_BG,
+                tk.Label(card_body, text=label.rstrip(":").strip(), bg=FRONT_CARD_BG,
                          fg=FRONT_TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-            self.inner = tk.Frame(self._card.body, bg=FRONT_CARD_BG)
+            self.inner = tk.Frame(card_body, bg=FRONT_CARD_BG)
             self.inner.pack(fill="both", expand=True)
         else:
             super().__init__(master, text=label)
@@ -1798,7 +2026,7 @@ class DiffCheckList(ttk.LabelFrame):
             col = i // self.MAX_ROWS_PER_COLUMN
             cb.grid(row=row, column=col, sticky="w", padx=(0, 16), pady=1)
             self.vars[label] = v
-        if self.light:
+        if self.light and self._card is not None:
             self._card.redraw()
 
     def selected(self):
@@ -1977,10 +2205,10 @@ class BaseToolFrame(ttk.Frame):
     def require_map(self) -> bool:
         folder, diffs = self.app.get_diff_files()
         if not folder:
-            messagebox.showwarning("No map selected", "Please select a map first!")
+            _show_alert(self, "No map selected", "Please select a map first!")
             return False
         if not diffs:
-            messagebox.showwarning("No difficulties found", f"No .osu files found in:\n{folder}")
+            _show_alert(self, "No difficulties found", f"No .osu files found in:\n{folder}")
             return False
         return True
 
@@ -2092,9 +2320,9 @@ class MetadataManagerFrame(BaseToolFrame):
         row0 = tk.Frame(self.body, bg=FRONT_BG)
         row0.pack(anchor="w", padx=24, pady=(4, 16))
         _make_ghost_button(row0, "Import Meta", self.import_meta).pack(side="left")
-        self.autofill_var = tk.BooleanVar(value=True)
-        LightCheckbox(row0, "Auto-fill", self.autofill_var, bg=FRONT_BG).pack(
-            side="left", padx=(12, 0))
+        self.autofill_var = tk.BooleanVar(value=self.app.metadata_autofill)
+        LightCheckbox(row0, "Auto-fill", self.autofill_var, bg=FRONT_BG,
+                      command=self._on_autofill_changed).pack(side="left", padx=(12, 0))
 
         form = tk.Frame(self.body, bg=FRONT_BG)
         form.pack(fill="x", padx=24)
@@ -2181,6 +2409,9 @@ class MetadataManagerFrame(BaseToolFrame):
         self.diff_list.refresh()
         self._auto_import()
 
+    def _on_autofill_changed(self):
+        self.app.save_metadata_autofill(self.autofill_var.get())
+
     def _auto_import(self):
         """Silently fills the fields from whatever map is currently
         loaded — called whenever this tool is shown or the loaded map
@@ -2217,7 +2448,7 @@ class MetadataManagerFrame(BaseToolFrame):
         folder, _ = self.app.get_diff_files()
         targets = self.diff_list.selected()
         if not targets:
-            messagebox.showwarning("Nothing selected", "Tick at least one difficulty.")
+            _show_alert(self, "Nothing selected", "Tick at least one difficulty.")
             return
         meta = {k: e.get() for k, e in self.fields.items()}
         # Tags is stored as a single line in the .osu file; collapse any
@@ -2257,7 +2488,7 @@ class CopySection(ttk.Frame):
 
         if light:
             header_row = tk.Frame(body, bg=FRONT_CARD_BG)
-            header_row.pack(fill="x", pady=(0, 10))
+            header_row.pack(fill="x", pady=(0, 6))
             tk.Label(header_row, text=title, bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
                      font=("Segoe UI", 13, "bold")).pack(side="left")
             if info_text:
@@ -2266,7 +2497,7 @@ class CopySection(ttk.Frame):
                 info_icon.pack(side="left", padx=(6, 0))
 
             row = tk.Frame(body, bg=FRONT_CARD_BG)
-            row.pack(fill="x", pady=(0, 12))
+            row.pack(fill="x", pady=(0, 8))
             tk.Label(row, text=source_label_text, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
                      font=("Segoe UI", 11)).pack(side="left")
             self.source_var = tk.StringVar()
@@ -2275,9 +2506,13 @@ class CopySection(ttk.Frame):
             self.diff_map = {}
 
             tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
-                     font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 6))
-            self.diff_list = DiffCheckList(body, owner.app, light=True, label_inside=False)
-            self.diff_list.pack(fill="both", expand=True, pady=(0, 12))
+                     font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 4))
+            # nested=True — this section already sits inside its own outer
+            # RoundedCard (self._card, above), so the diff list doesn't
+            # need its own separate nested card too. See DiffCheckList's
+            # own docstring for why that mattered here specifically.
+            self.diff_list = DiffCheckList(body, owner.app, light=True, label_inside=False, nested=True)
+            self.diff_list.pack(fill="both", expand=True, pady=(0, 8))
 
             btn_row = tk.Frame(body, bg=FRONT_CARD_BG)
             btn_row.pack(fill="x")
@@ -2310,9 +2545,9 @@ class CopySection(ttk.Frame):
             self.source_var.set(labels[0])
         self.diff_list.refresh()
         if self.light:
-            # The nested diff_list card just resized itself (its own
-            # refresh() redraws its own card) — this outer card also needs
-            # to catch up, since its own body's total height just changed.
+            # The outer card's own body just resized (the diff list is no
+            # longer its own separate card — see the nested=True note
+            # above — so there's nothing further to redraw() for it here).
             self._card.redraw()
 
     def apply(self):
@@ -2323,10 +2558,10 @@ class CopySection(ttk.Frame):
         source = self.diff_map.get(source_label)
         targets = self.diff_list.selected()
         if not source:
-            messagebox.showwarning("No source", f"Choose a difficulty to copy {self.noun.lower()} from.")
+            _show_alert(self, "No source", f"Choose a difficulty to copy {self.noun.lower()} from.")
             return
         if not targets:
-            messagebox.showwarning("Nothing selected", "Tick at least one difficulty.")
+            _show_alert(self, "Nothing selected", "Tick at least one difficulty.")
             return
         self.copy_func(folder, source, targets)
         self.owner.notify_done(f"{self.noun} copied from {source_label} to {len(targets)} difficulty file(s).")
@@ -2343,13 +2578,13 @@ class VolumeKiaiCopierFrame(BaseToolFrame):
             info_text="Copy the volume changes of a difficulty and apply them "
                        "to any difficulties in the set.",
             light=True)
-        self.volume_section.pack(fill="both", expand=True, padx=24, pady=(16, 6))
+        self.volume_section.pack(fill="both", expand=True, padx=24, pady=(10, 4))
         self.kiai_section = CopySection(
             self.body, self, "Kiai Copier", "Copy kiai from:", logic.copy_kiai, "Kiai",
             info_text="Copy the kiai portions of a difficulty and apply them "
                        "to any difficulties in the set.",
             light=True)
-        self.kiai_section.pack(fill="both", expand=True, padx=24, pady=(6, 16))
+        self.kiai_section.pack(fill="both", expand=True, padx=24, pady=(4, 10))
 
     def on_shown(self):
         self.refresh()
@@ -2695,7 +2930,7 @@ class MapCleanerFrame(BaseToolFrame):
         folder, _ = self.app.get_diff_files()
         fname = self.diff_map.get(self.diff_var.get())
         if not fname:
-            messagebox.showwarning("No difficulty", "Choose a difficulty to clean.")
+            _show_alert(self, "No difficulty", "Choose a difficulty to clean.")
             return
 
         # Validate base SV
@@ -2709,7 +2944,7 @@ class MapCleanerFrame(BaseToolFrame):
                         raise ValueError()
                     base_sv_val = val
                 except ValueError:
-                    messagebox.showerror("Invalid value", "Base SV must be a number between 0.4 and 3.6.")
+                    _show_alert(self, "Invalid value", "Base SV must be a number between 0.4 and 3.6.")
                     return
             else:
                 base_sv_val = 1.4
@@ -2723,7 +2958,7 @@ class MapCleanerFrame(BaseToolFrame):
                     raise ValueError()
                 push_green_ms = val
             except ValueError:
-                messagebox.showerror("Invalid value", "Push milliseconds must be an integer between 5 and 20.")
+                _show_alert(self, "Invalid value", "Push milliseconds must be an integer between 5 and 20.")
                 return
 
         # Validate resnap section range
@@ -2732,7 +2967,7 @@ class MapCleanerFrame(BaseToolFrame):
             from_result = logic.parse_time_input(self.resnap_from_var.get())
             to_result = logic.parse_time_input(self.resnap_to_var.get())
             if from_result is None or to_result is None:
-                messagebox.showwarning("Warning", "Invalid timestamp input")
+                _show_alert(self, "Warning", "Invalid timestamp input")
                 return
             from_ms, from_clean = from_result
             to_ms, to_clean = to_result
@@ -2947,16 +3182,16 @@ class OffsetShifterFrame(BaseToolFrame):
         folder, _ = self.app.get_diff_files()
         targets = self.diff_list.selected()
         if not targets:
-            messagebox.showwarning("Nothing selected", "Tick at least one difficulty.")
+            _show_alert(self, "Nothing selected", "Tick at least one difficulty.")
             return
         try:
             delta = int(float(self.change_var.get()))
         except ValueError:
-            messagebox.showerror("Invalid value", "Change must be a number.")
+            _show_alert(self, "Invalid value", "Change must be a number.")
             return
         add_silence = self.add_silence_var.get()
         if delta == 0 and not add_silence:
-            messagebox.showinfo("No change", "Change is 0 — nothing to apply.")
+            _show_alert(self, "No change", "Change is 0 — nothing to apply.")
             return
 
         install_first = False
@@ -2989,7 +3224,7 @@ class OffsetShifterFrame(BaseToolFrame):
                     # See the matching comment on the cancellable path
                     # below re: capturing `e` as a string before deferring.
                     err_msg = str(e)
-                    self.after(0, lambda: messagebox.showerror("Error", err_msg))
+                    self.after(0, lambda: _show_alert(self, "Error", err_msg))
                     return
                 self.after(0, finish_ok)
 
@@ -3014,7 +3249,7 @@ class OffsetShifterFrame(BaseToolFrame):
             # 3110), but this callback only runs later, once Tkinter gets
             # around to it — run_cancellable_job already does this
             # capture for us before calling on_error.
-            messagebox.showerror("Error", err_msg)
+            _show_alert(self, "Error", err_msg)
 
         self.app.run_cancellable_job(busy_msg, work, on_success=lambda _r: finish_ok(),
                                       on_error=on_error)
@@ -3024,7 +3259,7 @@ class OffsetShifterFrame(BaseToolFrame):
         if self.reencode_source_var.get() == "other":
             src_path = self.reencode_other_path
             if not src_path:
-                messagebox.showwarning("No file selected", "Pick an audio file to re-encode first.")
+                _show_alert(self, "No file selected", "Pick an audio file to re-encode first.")
                 return
             folder, external_path = None, src_path
         else:
@@ -3066,7 +3301,7 @@ class OffsetShifterFrame(BaseToolFrame):
                 self.notify_done(f"Audio re-encoded to {bitrate}kbps ({result}).")
 
         def on_error(err_msg):
-            messagebox.showerror("Error", err_msg)
+            _show_alert(self, "Error", err_msg)
 
         busy_msg = ("Installing ffmpeg + ffprobe (may take a few minutes)... Please wait..."
                      if install_first else "Re-encoding audio... Please wait...")
@@ -3158,7 +3393,7 @@ class BgOffsetShifterFrame(BaseToolFrame):
     def browse_bg(self):
         folder, _ = self.app.get_diff_files()
         if not folder:
-            messagebox.showwarning("No map loaded", "Load a map before browsing for a background image.")
+            _show_alert(self, "No map loaded", "Load a map before browsing for a background image.")
             return
         path = filedialog.askopenfilename(
             title="Select background image",
@@ -3190,7 +3425,7 @@ class BgOffsetShifterFrame(BaseToolFrame):
             return
         folder, _ = self.app.get_diff_files()
         if not folder or not self.bg_var.get():
-            messagebox.showwarning("No background", "Pick a background image first.")
+            _show_alert(self, "No background", "Pick a background image first.")
             return
         try:
             offset = int(float(self.offset_var.get()))
@@ -3207,21 +3442,21 @@ class BgOffsetShifterFrame(BaseToolFrame):
         folder, _ = self.app.get_diff_files()
         targets = self.diff_list.selected()
         if not self.bg_var.get():
-            messagebox.showwarning("No background", "Pick a background image.")
+            _show_alert(self, "No background", "Pick a background image.")
             return
         if not targets:
-            messagebox.showwarning("Nothing selected", "Tick at least one difficulty.")
+            _show_alert(self, "Nothing selected", "Tick at least one difficulty.")
             return
         try:
             offset = int(float(self.offset_var.get()))
         except ValueError:
-            messagebox.showerror("Invalid value", "Offset must be a number.")
+            _show_alert(self, "Invalid value", "Offset must be a number.")
             return
         try:
             final_name = logic.apply_bg_offset(folder, targets, self.bg_var.get(), offset,
                                                 self.convert_jpg_var.get())
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            _show_alert(self, "Error", str(e))
             return
         self.notify_done(f"Background updated ({final_name}) and applied to {len(targets)} difficulty file(s).")
         self.refresh()
@@ -3884,7 +4119,7 @@ class VideoOffsetShifterFrame(BaseToolFrame):
     def browse_video(self):
         folder, _ = self.app.get_diff_files()
         if not folder:
-            messagebox.showwarning("No map loaded", "Load a map before browsing for a video file.")
+            _show_alert(self, "No map loaded", "Load a map before browsing for a video file.")
             return
         path = filedialog.askopenfilename(
             title="Select video file",
@@ -3904,7 +4139,7 @@ class VideoOffsetShifterFrame(BaseToolFrame):
             return
         folder, _ = self.app.get_diff_files()
         if not folder or not self.video_var.get():
-            messagebox.showwarning("No video", "Pick a video file first.")
+            _show_alert(self, "No video", "Pick a video file first.")
             return
 
         if logic.vlc_available():
@@ -3923,7 +4158,7 @@ class VideoOffsetShifterFrame(BaseToolFrame):
             self._launch_preview_window(folder)
 
         def on_error(err_msg):
-            messagebox.showerror("Error", err_msg)
+            _show_alert(self, "Error", err_msg)
 
         self.app.run_cancellable_job(
             "Installing VLC (may take a few minutes)... Please wait...",
@@ -3950,12 +4185,12 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         folder, _ = self.app.get_diff_files()
         targets = self.diff_list.selected()
         if not targets:
-            messagebox.showwarning("Nothing selected", "Tick at least one difficulty.")
+            _show_alert(self, "Nothing selected", "Tick at least one difficulty.")
             return
         try:
             delta = int(float(self.offset_var.get()))
         except ValueError:
-            messagebox.showerror("Invalid value", "Offset must be a number.")
+            _show_alert(self, "Invalid value", "Offset must be a number.")
             return
 
         video_file = self.video_var.get() or None
@@ -3994,7 +4229,7 @@ class VideoOffsetShifterFrame(BaseToolFrame):
                     final_video = apply_offset_step(video_file)
                 except Exception as e:
                     err_msg = str(e)
-                    self.after(0, lambda: messagebox.showerror("ffmpeg error", err_msg))
+                    self.after(0, lambda: _show_alert(self, "ffmpeg error", err_msg))
                     return
                 self.after(0, lambda: finish_ok(final_video))
 
@@ -4018,7 +4253,7 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         def on_error(err_msg):
             # See the matching comment in OffsetShifterFrame._start_apply_thread —
             # `e` is gone by the time this deferred callback runs.
-            messagebox.showerror("ffmpeg error", err_msg)
+            _show_alert(self, "ffmpeg error", err_msg)
 
         self.app.run_cancellable_job(busy_msg, work, on_success=finish_ok, on_error=on_error)
 
@@ -4315,7 +4550,7 @@ class PatternCard(tk.Frame):
         if not new_name or new_name == self.name:
             return
         if any(p["name"] == new_name for p in logic.load_pattern_library()):
-            messagebox.showwarning("Name taken", f'A pattern named "{new_name}" already exists.')
+            _show_alert(self, "Name taken", f'A pattern named "{new_name}" already exists.')
             return
         logic.rename_pattern_in_gallery(self.name, new_name)
         self.gallery.refresh()
@@ -4673,7 +4908,7 @@ class ManualPatternWindow(tk.Toplevel):
         self._redraw()
 
         if load_truncated:
-            messagebox.showwarning(
+            _show_alert(self,
                 "Pattern truncated",
                 f'"{existing_entry["name"]}" had notes beyond this editor\'s '
                 f"{self.BEATS_SHOWN}-beat timeline — they've been removed so "
@@ -5496,10 +5731,10 @@ class ManualPatternWindow(tk.Toplevel):
         # pattern is an actual conflict.
         if any(p["name"] == name and p["name"] != self._editing_original_name
                for p in logic.load_pattern_library()):
-            messagebox.showwarning("Name taken", f'A pattern named "{name}" already exists.')
+            _show_alert(self, "Name taken", f'A pattern named "{name}" already exists.')
             return
         if not self.notes:
-            messagebox.showwarning("No notes", "Place at least one note first.")
+            _show_alert(self, "No notes", "Place at least one note first.")
             return
         notes = [{"offset_beats": float(n["pos"]), "kind": n["kind"], "is_kat": n["is_kat"],
                   "is_finisher": n["is_finisher"],
@@ -6265,7 +6500,7 @@ class PatternGalleryFrame(BaseToolFrame):
         return None
 
     def _confirm_delete(self, message):
-        return (not self.app.confirm_pattern_delete) or messagebox.askyesno("Delete pattern", message)
+        return (not self.app.confirm_pattern_delete) or _ask_yesno(self, "Delete pattern", message)
 
     def request_delete_single(self, name):
         if not self._confirm_delete(f'Delete pattern "{name}"?'):
@@ -6299,36 +6534,36 @@ class PatternGalleryFrame(BaseToolFrame):
         if not name:
             name = logic.default_pattern_name()
         if any(p["name"] == name for p in logic.load_pattern_library()):
-            messagebox.showwarning("Name taken", f'A pattern named "{name}" already exists.')
+            _show_alert(self, "Name taken", f'A pattern named "{name}" already exists.')
             return
         try:
             clip = self.clipboard_get()
         except tk.TclError:
-            messagebox.showwarning("Clipboard empty", "Nothing to read from the clipboard.")
+            _show_alert(self, "Clipboard empty", "Nothing to read from the clipboard.")
             return
         songs_folder = getattr(self.app, "osu_songs_folder", None)
         if not songs_folder:
-            messagebox.showwarning("No Songs folder", "Set your osu! Songs folder first (Settings).")
+            _show_alert(self, "No Songs folder", "Set your osu! Songs folder first (Settings).")
             return
-        if not messagebox.askokcancel(
+        if not _ask_okcancel(self,
                 "Save your map first",
                 "Save your map (Ctrl+S) before proceeding!"):
             return
         try:
             _entry, truncated, had_concurrent = logic.capture_pattern_from_osu_selection(name, clip, songs_folder)
         except ValueError as e:
-            messagebox.showerror("Couldn't capture pattern", str(e))
+            _show_alert(self, "Couldn't capture pattern", str(e))
             return
         self.name_var.set("")
         self.refresh()
         if had_concurrent:
-            messagebox.showwarning(
+            _show_alert(self,
                 "Concurrent notes dropped",
                 f'"{name}" had two or more notes sharing the same timestamp — '
                 f"only one was kept at each of those times, the rest were discarded.")
         if truncated:
             max_beats = int(logic.CAPTURED_PATTERN_MAX_BEATS)
-            messagebox.showwarning(
+            _show_alert(self,
                 "Pattern truncated",
                 f'"{name}" was longer than {max_beats} beats — notes past that '
                 f"point were discarded so the pattern stays a short, reusable snippet.")
@@ -6337,9 +6572,9 @@ class PatternGalleryFrame(BaseToolFrame):
     def delete_selected(self):
         name = self.selected_pattern_name
         if not name:
-            messagebox.showwarning("Nothing selected", "Select a pattern to delete first.")
+            _show_alert(self, "Nothing selected", "Select a pattern to delete first.")
             return
-        if not messagebox.askyesno("Delete pattern", f'Delete pattern "{name}"?'):
+        if not _ask_yesno(self, "Delete pattern", f'Delete pattern "{name}"?'):
             return
         logic.delete_pattern_from_gallery(name)
         self.refresh()
@@ -6348,31 +6583,31 @@ class PatternGalleryFrame(BaseToolFrame):
         if not self.require_map():
             return
         if not self.selected_pattern_names:
-            messagebox.showwarning("Nothing selected", "Select a pattern to insert first.")
+            _show_alert(self, "Nothing selected", "Select a pattern to insert first.")
             return
         if len(self.selected_pattern_names) > 1:
-            messagebox.showwarning("Multiple patterns selected", "Select exactly one pattern to insert.")
+            _show_alert(self, "Multiple patterns selected", "Select exactly one pattern to insert.")
             return
         name = next(iter(self.selected_pattern_names))
         pattern = logic.get_pattern(name)
         if pattern is None:
-            messagebox.showerror("Not found", "That pattern no longer exists.")
+            _show_alert(self, "Not found", "That pattern no longer exists.")
             self.refresh()
             return
 
         target_file = self.diff_list.selected()
         if not target_file:
-            messagebox.showwarning("Nothing selected", "Choose a difficulty to insert into.")
+            _show_alert(self, "Nothing selected", "Choose a difficulty to insert into.")
             return
 
         target_result = logic.parse_time_input(self.target_time_var.get())
         if target_result is None:
-            messagebox.showwarning("Warning", "Invalid timestamp input")
+            _show_alert(self, "Warning", "Invalid timestamp input")
             return
         target_ms, cleaned = target_result
         self.target_time_var.set(cleaned)
 
-        if not messagebox.askokcancel(
+        if not _ask_okcancel(self,
                 "Save your map first",
                 "Save your map (Ctrl+S) before proceeding!"):
             return
@@ -6493,11 +6728,19 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         self.diff_combo.pack(side="left", padx=(10, 0))
         self.diff_map = {}
 
-        self.volume_threshold_var = tk.StringVar(value="10%")
-        self.early_threshold_var = tk.StringVar(value="15ms")
-        self.section_only_var = tk.BooleanVar(value=False)
-        self.from_var = tk.StringVar()
-        self.to_var = tk.StringVar()
+        # Restores whatever was last set here (see _persist_settings) —
+        # this whole form otherwise reset to the same hardcoded defaults
+        # every relaunch, forcing a re-enter of thresholds/section range
+        # that's usually the same across sessions for a given mapper.
+        saved = self.app.early_volume_settings
+        self.volume_threshold_var = tk.StringVar(value=saved["volume_threshold"])
+        self.early_threshold_var = tk.StringVar(value=saved["early_threshold"])
+        self.section_only_var = tk.BooleanVar(value=saved["section_only"])
+        self.from_var = tk.StringVar(value=saved["from"])
+        self.to_var = tk.StringVar(value=saved["to"])
+        for var in (self.volume_threshold_var, self.early_threshold_var,
+                    self.section_only_var, self.from_var, self.to_var):
+            var.trace_add("write", self._persist_settings)
 
         card = RoundedCard(self.body)
         card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
@@ -6565,6 +6808,12 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         btn_row.pack(fill="x", pady=(8, 0))
         _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
 
+        # section_only_cb's own command= only fires on a user click — this
+        # syncs the From/To fields' enabled state to match whatever was
+        # actually loaded from disk above, since that can now be True on a
+        # fresh open with nothing clicked yet.
+        self._sync_section_state()
+
     def on_shown(self):
         self.refresh()
 
@@ -6600,13 +6849,22 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         self.from_label.configure(fg=fg)
         self.to_label.configure(fg=fg)
 
+    def _persist_settings(self, *_args):
+        self.app.save_early_volume_settings({
+            "volume_threshold": self.volume_threshold_var.get(),
+            "early_threshold": self.early_threshold_var.get(),
+            "section_only": self.section_only_var.get(),
+            "from": self.from_var.get(),
+            "to": self.to_var.get(),
+        })
+
     def apply(self):
         if not self.require_map():
             return
         folder, _ = self.app.get_diff_files()
         fname = self.diff_map.get(self.diff_var.get())
         if not fname:
-            messagebox.showwarning("No difficulty", "Choose a difficulty.")
+            _show_alert(self, "No difficulty", "Choose a difficulty.")
             return
         targets = [fname]
 
@@ -6618,7 +6876,7 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
             from_result = logic.parse_time_input(self.from_var.get())
             to_result = logic.parse_time_input(self.to_var.get())
             if from_result is None or to_result is None:
-                messagebox.showwarning("Warning", "Invalid timestamp input")
+                _show_alert(self, "Warning", "Invalid timestamp input")
                 return
             from_ms, from_clean = from_result
             to_ms, to_clean = to_result
