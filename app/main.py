@@ -59,7 +59,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -2098,11 +2098,14 @@ class App(tk.Tk):
             # was built against this same Songs folder; a cache from a
             # different folder is meaningless here and just left to be
             # naturally overwritten below. Keyed by mapset folder *name* to
-            # {"mtime", "meta"}: as long as a folder's own mtime hasn't
-            # changed since it was last scanned, its (possibly expensive,
-            # multi-file) taiko/metadata check can be skipped entirely —
-            # `meta=None` is cached too, so a non-taiko mapset isn't
-            # re-scanned on every launch either.
+            # {"mtime", "meta", "diff_names"}: as long as a folder's own
+            # mtime hasn't changed since it was last scanned, its (possibly
+            # expensive, multi-file) taiko/metadata check can be skipped
+            # entirely — `meta=None` is cached too, so a non-taiko mapset
+            # isn't re-scanned on every launch either. A cache written
+            # before "diff_names" existed is missing that key, so it's
+            # treated as stale below and re-scanned once rather than
+            # silently searching without diff names forever.
             cache = load_song_index_cache()
             cache_entries = cache["entries"] if cache["songs_folder"] == self.osu_songs_folder else {}
 
@@ -2120,7 +2123,7 @@ class App(tk.Tk):
             # every folder up front is still fast overall — and with the
             # cache above, only ever actually happens for a folder that's
             # new or has changed since the last scan.
-            taiko_entries = []  # (mtime, name, folder, meta)
+            taiko_entries = []  # (mtime, name, folder, meta, diff_names)
             seen_names = set()
             for i, name in enumerate(names):
                 if cancel_event.is_set():
@@ -2139,21 +2142,32 @@ class App(tk.Tk):
                     mtime = 0
 
                 cached = cache_entries.get(name)
-                if cached is not None and cached.get("mtime") == mtime:
+                if cached is not None and cached.get("mtime") == mtime and "diff_names" in cached:
                     meta = cached.get("meta")
+                    diff_names = cached.get("diff_names") or []
                 else:
+                    # Collect every taiko diff's own [Version] name (not
+                    # just the first one) so a difficulty like "Ura Oni" or
+                    # a custom name is searchable even when it doesn't
+                    # appear anywhere in the set's artist/title/tags —
+                    # `meta` itself still comes from whichever taiko diff
+                    # is found first, matching the previous behaviour.
                     osu_files = osu_parser.list_difficulty_files(folder)
                     meta = None
+                    diff_names = []
                     for osu_file in osu_files:
                         candidate_meta = osu_parser.read_basic_metadata(os.path.join(folder, osu_file))
                         if candidate_meta and candidate_meta.get("Mode") == "1":
-                            meta = candidate_meta
-                            break
-                    cache_entries[name] = {"mtime": mtime, "meta": meta}
+                            if meta is None:
+                                meta = candidate_meta
+                            version = (candidate_meta.get("Version") or "").strip()
+                            if version:
+                                diff_names.append(version)
+                    cache_entries[name] = {"mtime": mtime, "meta": meta, "diff_names": diff_names}
 
                 if not meta:
                     continue
-                taiko_entries.append((mtime, name, folder, meta))
+                taiko_entries.append((mtime, name, folder, meta, diff_names))
 
             if listdir_ok:
                 # Drop cache entries for mapsets that no longer exist (e.g.
@@ -2168,7 +2182,7 @@ class App(tk.Tk):
                 taiko_entries.sort(key=lambda e: e[0], reverse=True)  # most recently modified first
                 taiko_entries = taiko_entries[:limit]
 
-            for _mtime, name, folder, meta in taiko_entries:
+            for _mtime, name, folder, meta, diff_names in taiko_entries:
                 if cancel_event.is_set():
                     self.after(0, self._on_index_cancelled)
                     return
@@ -2177,9 +2191,17 @@ class App(tk.Tk):
                 romanised_title = meta.get("RomanisedTitle", "") or title
                 display = f"{artist} - {title}".strip(" -") or name
                 display_romanised = f"{romanised_artist} - {romanised_title}".strip(" -") or name
+                # Generic diff names ("Oni", "Muzukashii", ...) are filtered
+                # out here rather than at collection time, so the cached
+                # diff_names list stays the full, unfiltered set of names —
+                # this filtering step then applies correctly regardless of
+                # whether diff_names came from a fresh scan or an
+                # already-cached entry, with no cache schema bump needed.
+                custom_diff_names = [n for n in diff_names if not osu_parser.is_generic_taiko_diff_name(n)]
                 blob = " ".join([
                     artist, title, romanised_artist, romanised_title,
                     meta.get("Mapper", ""), meta.get("Tags", ""), name,
+                    " ".join(custom_diff_names),
                 ]).lower()
                 bg_path = None
                 if meta.get("BackgroundFile"):

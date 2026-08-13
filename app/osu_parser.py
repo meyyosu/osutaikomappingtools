@@ -235,52 +235,77 @@ class Beatmap:
         return n if n > 0 else None
 
     # Background / video events -----------------------------------------
-    def get_background_filename(self) -> Optional[str]:
-        for line in self.sections.get("Events", []):
+    def _events_content_start(self) -> int:
+        """Index of the first non-comment line in [Events] — osu!'s own
+        '//Section name' comment headers are cosmetic only, but a newly
+        inserted Background/Video event line still reads more naturally
+        landing after them than jammed in front."""
+        lines = self.sections.get("Events", [])
+        i = 0
+        while i < len(lines) and lines[i].strip().startswith("//"):
+            i += 1
+        return i
+
+    def _background_line_index(self) -> Optional[int]:
+        for i, line in enumerate(self.sections.get("Events", [])):
             parts = line.split(",")
             if len(parts) >= 3 and parts[0].strip().strip('"') == "0":
-                return parts[2].strip().strip('"')
+                return i
         return None
 
+    def get_background_filename(self) -> Optional[str]:
+        idx = self._background_line_index()
+        if idx is None:
+            return None
+        parts = self.sections["Events"][idx].split(",")
+        return parts[2].strip().strip('"')
+
     def set_background_filename(self, new_name: str):
-        lines = self.sections.get("Events", [])
-        for i, line in enumerate(lines):
-            parts = line.split(",")
-            if len(parts) >= 3 and parts[0].strip().strip('"') == "0":
-                parts[2] = f'"{new_name}"'
-                lines[i] = ",".join(parts)
-                return
+        lines = self.sections.setdefault("Events", [])
+        if "Events" not in self.section_order:
+            self.section_order.append("Events")
+        idx = self._background_line_index()
+        if idx is not None:
+            parts = lines[idx].split(",")
+            parts[2] = f'"{new_name}"'
+            lines[idx] = ",".join(parts)
+            return
+        # No background event line at all yet (e.g. a diff that never had
+        # one) — append a fresh one instead of silently doing nothing.
+        # set_background_offset, called right after by every caller, then
+        # finds this line and fills in the real x/y.
+        lines.insert(self._events_content_start(), f'0,0,"{new_name}",0,0')
 
     def get_background_offset(self) -> "tuple[int, int]":
         """Reads the x,y offset fields from the background event line
         (format: 0,0,"file.jpg",x,y) — an official part of the .osu format
         that the game itself uses to position the background, no image
         editing required."""
-        for line in self.sections.get("Events", []):
-            parts = line.split(",")
-            if len(parts) >= 3 and parts[0].strip().strip('"') == "0":
-                try:
-                    x = int(float(parts[3])) if len(parts) > 3 and parts[3].strip() != "" else 0
-                except ValueError:
-                    x = 0
-                try:
-                    y = int(float(parts[4])) if len(parts) > 4 and parts[4].strip() != "" else 0
-                except ValueError:
-                    y = 0
-                return x, y
-        return 0, 0
+        idx = self._background_line_index()
+        if idx is None:
+            return 0, 0
+        parts = self.sections["Events"][idx].split(",")
+        try:
+            x = int(float(parts[3])) if len(parts) > 3 and parts[3].strip() != "" else 0
+        except ValueError:
+            x = 0
+        try:
+            y = int(float(parts[4])) if len(parts) > 4 and parts[4].strip() != "" else 0
+        except ValueError:
+            y = 0
+        return x, y
 
     def set_background_offset(self, x: int, y: int):
-        lines = self.sections.get("Events", [])
-        for i, line in enumerate(lines):
-            parts = line.split(",")
-            if len(parts) >= 3 and parts[0].strip().strip('"') == "0":
-                while len(parts) < 5:
-                    parts.append("0")
-                parts[3] = str(int(x))
-                parts[4] = str(int(y))
-                lines[i] = ",".join(parts)
-                return
+        idx = self._background_line_index()
+        if idx is None:
+            return  # nothing to offset without a filename — see set_background_filename
+        lines = self.sections["Events"]
+        parts = lines[idx].split(",")
+        while len(parts) < 5:
+            parts.append("0")
+        parts[3] = str(int(x))
+        parts[4] = str(int(y))
+        lines[idx] = ",".join(parts)
 
     def get_video_filename(self) -> Optional[str]:
         for line in self.sections.get("Events", []):
@@ -304,15 +329,24 @@ class Beatmap:
         return None
 
     def set_video_filename(self, new_name: str):
-        lines = self.sections.get("Events", [])
-        for i, line in enumerate(lines):
-            p = line.strip()
-            if p.startswith("Video,") or p.startswith("1,"):
-                parts = p.split(",")
-                if len(parts) >= 3:
-                    parts[2] = f'"{new_name}"'
-                    lines[i] = ",".join(parts)
-                    return
+        lines = self.sections.setdefault("Events", [])
+        if "Events" not in self.section_order:
+            self.section_order.append("Events")
+        idx = self._video_line_index()
+        if idx is not None:
+            parts = lines[idx].split(",")
+            if len(parts) >= 3:
+                parts[2] = f'"{new_name}"'
+                lines[idx] = ",".join(parts)
+            return
+        # No Video event line at all yet (e.g. a diff that never had one) —
+        # append a fresh one instead of silently doing nothing. Time
+        # defaults to 0; set_video_time, called right after by every
+        # caller, then fills in the real offset. Conventionally sits right
+        # after the Background line when there is one.
+        bg_idx = self._background_line_index()
+        insert_at = bg_idx + 1 if bg_idx is not None else self._events_content_start()
+        lines.insert(insert_at, f'Video,0,"{new_name}"')
 
     def shift_video_time(self, delta_ms: float):
         lines = self.sections.get("Events", [])
@@ -574,7 +608,7 @@ def read_basic_metadata(path: str) -> "Optional[dict]":
     stops at [HitObjects] so scanning an entire Songs folder (thousands of
     files) for search purposes doesn't have to parse every note/timing
     point. Returns None if the file can't be read at all."""
-    artist = title = artist_unicode = title_unicode = creator = tags = mode = None
+    artist = title = artist_unicode = title_unicode = creator = tags = mode = version = None
     bg_filename = None
     section = None
     try:
@@ -608,6 +642,8 @@ def read_basic_metadata(path: str) -> "Optional[dict]":
                         creator = v
                     elif k == "Tags":
                         tags = v
+                    elif k == "Version":
+                        version = v
                 elif section == "Events" and bg_filename is None:
                     parts = line.split(",")
                     if len(parts) >= 3 and parts[0].strip().strip('"') == "0":
@@ -622,6 +658,7 @@ def read_basic_metadata(path: str) -> "Optional[dict]":
         "RomanisedTitle": title or title_unicode or "",
         "Mapper": creator or "",
         "Tags": tags or "",
+        "Version": version or "",
         "BackgroundFile": bg_filename,
         "Mode": mode,  # "0"=osu!, "1"=taiko, "2"=catch, "3"=mania; None if absent (defaults to osu!)
     }
@@ -656,6 +693,17 @@ TAIKO_DIFF_PRIORITY = [
     "Kantan", "Futsuu", "Muzukashii", "Oni",
     "Inner Oni", "Outer Oni", "Ura Oni", "Hell Oni", "Heavenly Oni",
 ]
+_GENERIC_TAIKO_DIFF_NAMES = {name.lower() for name in TAIKO_DIFF_PRIORITY}
+
+
+def is_generic_taiko_diff_name(label: str) -> bool:
+    """True for an *exact* (case-insensitive, trimmed) match against one of
+    the standard TAIKO_DIFF_PRIORITY names — "Oni", not "Devil Oni" or
+    "Itsuki's Oni", which are custom names that merely contain the word.
+    Used to keep generic difficulty names out of song search (see
+    build_song_index in main.py) — searching "oni" shouldn't just match
+    every mapset that happens to have a standard Oni difficulty."""
+    return label.strip().lower() in _GENERIC_TAIKO_DIFF_NAMES
 
 
 _NO_MATCH_RANK = len(TAIKO_DIFF_PRIORITY)
