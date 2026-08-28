@@ -59,7 +59,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.8"
+APP_VERSION = "1.11"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -507,25 +507,36 @@ def save_song_index_mode(mode: str):
 
 def load_song_index_cache() -> dict:
     """Returns {"songs_folder": str, "entries": {mapset_folder_name: {"mtime": float,
-    "meta": dict|None}}} — `meta` is whatever read_basic_metadata() returned for
-    that mapset's taiko diff, or None if the folder has no taiko diff at all
-    (cached too, so a non-taiko mapset isn't re-scanned every launch either).
-    Falls back to an empty cache (nothing reused, same as before this cache
-    existed) on any missing/corrupt file rather than raising."""
+    "meta": dict|None}}, "indexed_full": bool} — `meta` is whatever
+    read_basic_metadata() returned for that mapset's taiko diff, or None if
+    the folder has no taiko diff at all (cached too, so a non-taiko mapset
+    isn't re-scanned every launch either). `indexed_full` records whether a
+    full-library index (as opposed to just the 100 most recent mapsets) was
+    successfully completed against `songs_folder` — see build_song_index and
+    App._check_previously_indexed_full, which uses it so Partial Index mode
+    doesn't keep offering "Index Full Library" every launch once that's
+    already been done and cached. Falls back to an empty cache (nothing
+    reused, same as before this cache existed) on any missing/corrupt file
+    rather than raising."""
     try:
         with open(SONG_INDEX_CACHE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("entries"), dict):
-            return {"songs_folder": data.get("songs_folder", ""), "entries": data["entries"]}
+            return {
+                "songs_folder": data.get("songs_folder", ""),
+                "entries": data["entries"],
+                "indexed_full": bool(data.get("indexed_full", False)),
+            }
     except (OSError, ValueError, json.JSONDecodeError, TypeError):
         pass
-    return {"songs_folder": "", "entries": {}}
+    return {"songs_folder": "", "entries": {}, "indexed_full": False}
 
 
-def save_song_index_cache(songs_folder: str, entries: dict):
+def save_song_index_cache(songs_folder: str, entries: dict, indexed_full: bool = False):
     try:
         with open(SONG_INDEX_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"songs_folder": songs_folder, "entries": entries}, f)
+            json.dump({"songs_folder": songs_folder, "entries": entries,
+                       "indexed_full": indexed_full}, f)
     except OSError:
         pass
 
@@ -728,6 +739,7 @@ class App(tk.Tk):
         self._indexing = False
         self._indexed_once = False
         self._indexed_full = False
+        self._previously_indexed_full = self._check_previously_indexed_full()
         self._index_cancel_event = None
         self._index_was_cancelled = False
         self.live_sync_enabled = load_live_sync_config()
@@ -1038,15 +1050,26 @@ class App(tk.Tk):
         self.note_type_coords = coords
         save_coord_config(self.finisher_coords, self.note_type_coords)
 
+    def _check_previously_indexed_full(self) -> bool:
+        """Whether a full-library index of the *current* Songs folder was
+        already completed and persisted in an earlier session (see
+        save_song_index_cache, written at the end of a successful
+        build_song_index(full=True) run). Used by _start_indexing_per_mode
+        so Partial Index mode doesn't keep offering "Index Full Library"
+        every single launch once that's already been done — the per-folder
+        mtime cache makes redoing the full scan cheap anyway."""
+        cache = load_song_index_cache()
+        return bool(cache.get("indexed_full")) and cache.get("songs_folder") == self.osu_songs_folder
+
     def _start_indexing_per_mode(self):
         """Kicks off indexing the way "Song Index on Startup" (in Settings)
         says to — used both at app launch and whenever the Songs folder
         actually changes."""
         if self.song_index_mode == "manual":
             return  # the user has to click the Start Indexing button
-        elif self.song_index_mode == "full":
+        elif self.song_index_mode == "full" or self._previously_indexed_full:
             self.build_song_index(full=True)
-        else:  # "partial" (default)
+        else:  # "partial" (default), never fully indexed before
             self.build_song_index()
 
     def _needs_manual_index_start(self):
@@ -1366,6 +1389,11 @@ class App(tk.Tk):
                               FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
+        # Stay hidden until every section is built and the window is
+        # positioned — otherwise the WM maps it at a default spot/size
+        # first, so it visibly flashes there and reflows as the cards are
+        # added ("ghost window"). Shown via deiconify() at the very end.
+        win.withdraw()
         win.title("Settings")
         win.configure(bg=FRONT_BG)
         win.resizable(False, False)
@@ -1608,6 +1636,7 @@ class App(tk.Tk):
                 self.song_index = []
                 self._indexed_once = False
                 self._indexed_full = False
+                self._previously_indexed_full = self._check_previously_indexed_full()
                 self._start_indexing_per_mode()
             elif mode_changed and not self._indexed_once and not self._indexing:
                 # Folder didn't change, but the mode did — if there's no
@@ -1702,6 +1731,7 @@ class App(tk.Tk):
         win.protocol("WM_DELETE_WINDOW", on_close)
         win.bind("<Escape>", lambda e: on_close())
         win.transient(self)
+        win.deiconify()
         win.lift()
         win.focus_force()
         win.grab_set()
@@ -1725,6 +1755,11 @@ class App(tk.Tk):
                               _show_alert, FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
+        # Stay hidden until every section is built and the window is
+        # positioned — otherwise the WM maps it at a default spot/size
+        # first, so it visibly flashes there and reflows as the cards are
+        # added ("ghost window"). Shown via deiconify() at the very end.
+        win.withdraw()
         win.title("First time setup")
         win.configure(bg=FRONT_BG)
         win.resizable(False, False)
@@ -1908,6 +1943,7 @@ class App(tk.Tk):
                 self.song_index = []
                 self._indexed_once = False
                 self._indexed_full = False
+                self._previously_indexed_full = self._check_previously_indexed_full()
                 self._start_indexing_per_mode()
                 self._refresh_manual_index_button()
             save_first_run_done()
@@ -1923,6 +1959,7 @@ class App(tk.Tk):
         _position_over_window(win, self, width=600, height=target_h)
 
         win.transient(self)
+        win.deiconify()
         win.lift()
         win.focus_force()
         win.grab_set()
@@ -1962,6 +1999,7 @@ class App(tk.Tk):
             self.song_index = []
             self._indexed_once = False
             self._indexed_full = False
+            self._previously_indexed_full = self._check_previously_indexed_full()
             self._start_indexing_per_mode()
             self._refresh_manual_index_button()
 
@@ -2107,7 +2145,15 @@ class App(tk.Tk):
             # treated as stale below and re-scanned once rather than
             # silently searching without diff names forever.
             cache = load_song_index_cache()
-            cache_entries = cache["entries"] if cache["songs_folder"] == self.osu_songs_folder else {}
+            same_folder = cache["songs_folder"] == self.osu_songs_folder
+            cache_entries = cache["entries"] if same_folder else {}
+            # Preserve a previously-completed full index's flag across a
+            # partial scan (which re-saves this same file below to persist
+            # its own folder-mtime progress) — only a successful full scan
+            # (see the "if full:" block further down) is allowed to set this
+            # True, but a partial scan must not silently clear it back to
+            # False just by saving the cache again.
+            previously_indexed_full = same_folder and cache.get("indexed_full", False)
 
             total = len(names)
             # Capped so a huge Songs folder doesn't flood the Tk event
@@ -2174,7 +2220,8 @@ class App(tk.Tk):
                 # an old indexed map that was deleted) so the cache file
                 # doesn't grow stale entries forever.
                 cache_entries = {k: v for k, v in cache_entries.items() if k in seen_names}
-                save_song_index_cache(self.osu_songs_folder, cache_entries)
+                save_song_index_cache(self.osu_songs_folder, cache_entries,
+                                       indexed_full=previously_indexed_full)
 
             if full:
                 taiko_entries.sort(key=lambda e: e[1])  # alphabetical when doing everything
@@ -2217,6 +2264,13 @@ class App(tk.Tk):
             self._indexed_once = True
             if full:
                 self._indexed_full = True
+                self._previously_indexed_full = True
+                # Persist the "this folder has been fully indexed" flag so a
+                # future launch (Partial Index mode included, see
+                # _check_previously_indexed_full) knows not to offer "Index
+                # Full Library" again for no reason — the per-folder mtime
+                # cache already makes redoing this scan cheap either way.
+                save_song_index_cache(self.osu_songs_folder, cache_entries, indexed_full=True)
             self.after(0, self._on_index_complete)
 
         threading.Thread(target=work, daemon=True).start()

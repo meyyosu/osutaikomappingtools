@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 import urllib.error
 import urllib.request
 import zipfile
@@ -704,6 +705,13 @@ def remove_unused_green_lines(bm: Beatmap):
        line's own meter: a 3/4 map has a barline every 3 beats, 4/4 every
        4, etc, restarting at each new red line.
 
+       A line that changes the volume relative to whatever was already
+       in effect is NEVER treated as a silent change here, even if it
+       currently governs no note or barline — a volume-control line is
+       kept regardless (a later edit can add notes it would then affect,
+       and losing an intentional volume change is more harmful than
+       keeping a line that happens to be dormant right now).
+
     A green line that shares its timestamp with a red (uninherited) line
     is always kept, even if it would otherwise look redundant — matching
     a red line explicitly is treated as intentional.
@@ -761,7 +769,11 @@ def remove_unused_green_lines(bm: Beatmap):
 
         affects_note = id(tp) in governing_ids_for_notes
         affects_barline = id(tp) in governing_ids_for_barlines
-        is_silent_change = not affects_note and not affects_barline
+        # A volume change is always meaningful — keep the line even if it
+        # governs nothing playable right now.
+        is_silent_change = (
+            not affects_note and not affects_barline and same_volume
+        )
 
         if on_red_line or not (is_noop or is_silent_change):
             keep.append(tp)
@@ -1073,6 +1085,15 @@ def _concat_file_line(path: str) -> str:
     return f"file 'file:{p}'\n"
 
 
+# osu!'s Ranking Criteria caps an Ogg/Vorbis map audio track at 208 kbps
+# (and floors it at 128). ffprobe reports the *file* bitrate, which sits a
+# hair above the audio payload because of Ogg page overhead, so a request
+# pinned to exactly 208 measures ~209 and fails the check — pin the encode
+# a few kbps under the cap instead.
+OGG_BITRATE_CAP_KBPS = 208
+OGG_BITRATE_CAP_MARGIN_KBPS = 8
+
+
 # codec_name (as reported by ffmpeg's own probe) -> extension whose default
 # ffmpeg encoder can regenerate that same codec for the silent lead-in clip.
 # .mp3 ONLY — confirmed by direct testing (decode the result and diff the
@@ -1174,6 +1195,38 @@ def _reencode_target_ext(source_ext: str, bitrate_kbps: int) -> str:
     return ".ogg" if (source_ext.lower() != ".mp3" or bitrate_kbps == 208) else ".mp3"
 
 
+def _reencode_codec_args(target_ext: str, bitrate_kbps: int) -> List[str]:
+    """ffmpeg codec/bitrate args for a re-encode to `target_ext`.
+
+    For `.ogg` we pin libvorbis to a **constant target bitrate** —
+    `-b:a`/`-minrate`/`-maxrate` all set to the same value. `-b:a` alone is
+    just a loose hint that ffmpeg's libvorbis wrapper then largely ignores
+    (it disables the rate-management engine unless a min *or* max is given),
+    so an unconstrained encode routinely overshoots badly (a "128k" pick
+    landing ~180-190k). Even a wide managed window (tried ±25%) still drifts
+    well over target because libvorbis ABR biases high (a "208k" pick came
+    out ~223k). Pinning min=max=nominal engages full rate management and
+    holds the file's real average to the number the user picked; vorbis
+    quality at these bitrates (128k+) is unaffected in practice for a music
+    track. A pick at (or above) osu!'s 208 kbps Ogg ceiling is nudged a few
+    kbps under first (see `OGG_BITRATE_CAP_*`), since the measured file
+    bitrate lands slightly above the audio payload thanks to Ogg container
+    overhead and "208" exactly would otherwise read as ~209 and fail the
+    Ranking Criteria check.
+
+    `.mp3` (libmp3lame) already treats `-b:a` as constant bitrate, so it
+    needs nothing extra."""
+    if target_ext.lower() == ".ogg":
+        eff = bitrate_kbps
+        if eff >= OGG_BITRATE_CAP_KBPS:
+            eff = OGG_BITRATE_CAP_KBPS - OGG_BITRATE_CAP_MARGIN_KBPS
+        eff = max(128, eff)
+        r = f"{eff}k"
+        return ["-c:a", "libvorbis",
+                "-b:a", r, "-minrate", r, "-maxrate", r]
+    return ["-b:a", f"{bitrate_kbps}k"]
+
+
 def _reencode_audio_file(src: str, bitrate_kbps: int) -> str:
     """Runs the actual ffmpeg re-encode of `src` to `bitrate_kbps`, writing
     the result to a temp file in the same directory and returning that
@@ -1189,7 +1242,9 @@ def _reencode_audio_file(src: str, bitrate_kbps: int) -> str:
     base, ext = os.path.splitext(os.path.basename(src))
     target_ext = _reencode_target_ext(ext, bitrate_kbps)
     tmp_path = os.path.join(folder, f"{base}.tmp_reencode_{os.getpid()}{target_ext}")
-    cmd = [_resolve_binary("ffmpeg"), "-y", "-i", src, "-b:a", f"{bitrate_kbps}k", tmp_path]
+    cmd = [_resolve_binary("ffmpeg"), "-y", "-i", src]
+    cmd += _reencode_codec_args(target_ext, bitrate_kbps)
+    cmd.append(tmp_path)
     _run_ffmpeg(cmd)
     return tmp_path
 
@@ -1307,12 +1362,12 @@ def import_external_bg_image(folder: str, src_path: str) -> str:
 
 
 OSU_W, OSU_H = 854, 480          # osu!'s canonical widescreen pixel space
-BAND_H = 255                      # visible background band height within it
-PLAYFIELD_H = OSU_H - BAND_H      # taiko playfield/HUD bar height (the rest)
+BAND_H = 228                      # visible background band height within it
+PLAYFIELD_H = OSU_H - BAND_H      # taiko playfield/HUD bar height (the rest) — 252/480, i.e. 315px of the 1024x600 preview
 TAIKO_LANE_FRAC = PLAYFIELD_H / OSU_H
 
-PREVIEW_CANVAS_W = 960
-PREVIEW_CANVAS_H = 540
+PREVIEW_CANVAS_W = 1024
+PREVIEW_CANVAS_H = 600
 
 BG_PREVIEW_DIM = 0.7  # cosmetic darken factor for the preview only
 
@@ -1465,6 +1520,108 @@ def import_external_video_file(folder: str, src_path: str) -> str:
     return filename
 
 
+TAIKO_VIDEO_TARGET_SIZE_MB = 20.0   # roughly osu!'s per-file upload limit
+TAIKO_VIDEO_CRF = 20                # x264 "High" quality tier — visually close to lossless for this kind of source
+TAIKO_VIDEO_PRESET = "slow"         # notably smaller than x264's default "medium" preset at the same CRF, for an acceptable extra encode-time cost
+_TWO_PASS_HEADROOM = 0.97           # bitrate safety margin (x264 can slightly overshoot its own average-bitrate target)
+_TWO_PASS_MIN_KBPS = 100
+_TWO_PASS_MAX_TIGHTEN_PASSES = 1    # one corrective re-run if the first two-pass attempt still overshoots
+
+
+def _ffprobe_probe_video_duration(path: str) -> Optional[float]:
+    """Total duration in seconds via ffprobe's structured JSON output —
+    used to convert the Taiko Video Resizer's size budget into a two-pass
+    target bitrate (see _encode_taiko_video_two_pass). None if ffprobe
+    isn't available or the probe fails."""
+    if not ffprobe_available():
+        return None
+    cmd = [
+        _resolve_binary("ffprobe"), "-v", "error",
+        "-show_entries", "format=duration", "-of", "json", path,
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, timeout=30,
+                                 creationflags=_SUBPROCESS_FLAGS)
+        data = json.loads(result.stdout.decode("utf-8", "ignore"))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+    try:
+        return float(data["format"]["duration"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _ffmpeg_probe_video_duration(path: str) -> Optional[float]:
+    """Fallback for when ffprobe isn't resolvable — parses ffmpeg's own
+    `-i` banner (stderr) for the overall `Duration: HH:MM:SS.ss` line,
+    same spirit as _ffmpeg_probe_video_height."""
+    if not ffmpeg_available():
+        return None
+    try:
+        result = subprocess.run([_resolve_binary("ffmpeg"), "-hide_banner", "-i", path],
+                                 capture_output=True, timeout=30,
+                                 creationflags=_SUBPROCESS_FLAGS)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    text = result.stderr.decode("utf-8", "ignore")
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    h, m, s = match.groups()
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def probe_video_duration_seconds(path: str) -> Optional[float]:
+    """Best available probe of a video file's total duration — ffprobe
+    first, falling back to parsing ffmpeg's own `-i` banner when ffprobe
+    isn't resolvable. None if neither is resolvable, the file doesn't
+    exist, or the probe otherwise fails — resize_taiko_video just leaves
+    the quality-first CRF pass in place (even if oversized) in that case,
+    since there's no duration to convert a size budget into a bitrate."""
+    if not path or not os.path.isfile(path):
+        return None
+    return _ffprobe_probe_video_duration(path) or _ffmpeg_probe_video_duration(path)
+
+
+def _encode_taiko_video_two_pass(base_cmd: List[str], encoder_args: List[str], encode_path: str,
+                                  duration: float, target_bytes: int) -> None:
+    """Re-encodes with a real two-pass average-bitrate x264 encode to land
+    at/under target_bytes, used when the quality-first CRF pass came out
+    too big. The target bitrate is derived directly from the byte budget
+    and the source's own duration (with a small headroom margin —
+    _TWO_PASS_HEADROOM — covering both x264's own overshoot tendency and
+    AVI's per-frame container overhead, which is small enough not to need
+    computing precisely). If the first attempt still overshoots — x264 can
+    overshoot its own bitrate target more at very low bitrates — one
+    corrective tighter pass is tried before leaving whatever was achieved
+    in place.
+
+    Ported from the same approach the reference osu!taiko-video-resizer
+    tool (github.com/Ares-2222/osu-taiko-video-resizer) uses: CRF first,
+    two-pass bitrate only as a fallback to actually hit a size ceiling."""
+    passlog = os.path.join(tempfile.gettempdir(), f"taiko_video_pass_{uuid.uuid4().hex}")
+    working_target = target_bytes
+    try:
+        for attempt in range(1 + _TWO_PASS_MAX_TIGHTEN_PASSES):
+            kbps = max(int(working_target * 8 * _TWO_PASS_HEADROOM / duration / 1000), _TWO_PASS_MIN_KBPS)
+            rate_args = ["-b:v", f"{kbps}k"]
+            _run_ffmpeg(base_cmd + encoder_args + rate_args +
+                        ["-pass", "1", "-passlogfile", passlog, "-f", "null", "NUL"])
+            _run_ffmpeg(base_cmd + encoder_args + rate_args +
+                        ["-pass", "2", "-passlogfile", passlog, encode_path])
+
+            size = os.path.getsize(encode_path)
+            if size <= target_bytes or attempt >= _TWO_PASS_MAX_TIGHTEN_PASSES:
+                break
+            working_target = working_target * (target_bytes / size) * 0.98
+    finally:
+        for leftover in glob.glob(passlog + "*"):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+
+
 def resize_taiko_video(folder: str, video_file: str, blur: bool) -> str:
     """Encode to 1280x720 .avi, no audio. Content resized to height 339px,
     bottom-center, top 1280x381 always pitch black. If blur is enabled, only
@@ -1476,43 +1633,82 @@ def resize_taiko_video(folder: str, video_file: str, blur: bool) -> str:
     achievable here since ffmpeg's scale filter only accepts integer
     dimensions — rounded down to 339/381.
 
-    Deletes the original full-size video once the resize succeeds — the
-    resized file (a different filename, always ending `_taiko.avi`) is
-    the one that actually ends up referenced by the beatmap afterward, so
-    leaving the original behind just wastes disk space."""
+    Encodes with libx264 (not mjpeg — see below) at a quality-first CRF
+    pass (TAIKO_VIDEO_CRF, preset TAIKO_VIDEO_PRESET) and only falls back
+    to a size-targeted two-pass re-encode (_encode_taiko_video_two_pass) if
+    that pass comes out over TAIKO_VIDEO_TARGET_SIZE_MB (~osu!'s upload
+    limit) — aiming straight at the size budget on every video would
+    over-compress one that already fits comfortably under it at full
+    quality. Falls back to just leaving the (possibly oversized) CRF-pass
+    result in place if the source's duration can't be probed at all, since
+    the two-pass bitrate can't be computed without it.
+
+    mjpeg (the previous codec here) is intra-frame-only, so it has no
+    access to inter-frame prediction the way a real video codec does —
+    it produced far larger files for the same visual quality, and its
+    encoder also doesn't implement real bitrate-targeted rate control, so
+    a video's size scaled unpredictably with length/detail regardless of
+    the requested budget. H.264 is what the osu! wiki's own compression
+    guide and the reference osu!taiko-video-resizer tool
+    (github.com/Ares-2222/osu-taiko-video-resizer) both use — osu!stable's
+    video playback supports it fine (unlike H.265/VP9/AV1), including
+    inside an AVI container, which this app already commits to for its
+    output filename (see below).
+
+    Always writes the result as a fixed `video.avi` — regardless of what the
+    source file was named — so every taiko-resized map's video filename is
+    predictable. Deletes the original full-size video once the resize
+    succeeds — the resized file is the one that actually ends up referenced
+    by the beatmap afterward, so leaving the original behind just wastes
+    disk space. If the source was already named `video.avi` (a re-resize),
+    ffmpeg can't read and write that same path at once, so the encode goes
+    to a temp file first and is then moved into place."""
     if not ffmpeg_available():
         raise RuntimeError("ffmpeg not found. Install it automatically from Settings, or place "
                             "ffmpeg.exe next to this app — it doesn't need to be on PATH.")
 
     src = os.path.join(folder, video_file)
-    out_name = os.path.splitext(video_file)[0] + "_taiko.avi"
+    out_name = "video.avi"
     out_path = os.path.join(folder, out_name)
+    same_file = os.path.abspath(out_path) == os.path.abspath(src)
+    encode_path = os.path.join(folder, "_video_taiko_tmp.avi") if same_file else out_path
 
     if blur:
         filter_complex = (
             "color=c=black:s=1280x720[base];"
-            "[0:v]scale=1280:339,boxblur=20:2[bgband];"
-            "[0:v]scale=-1:339[fg];"
+            "[0:v]scale=1280:339:flags=lanczos,boxblur=20:2[bgband];"
+            "[0:v]scale=-1:339:flags=lanczos[fg];"
             "[bgband][fg]overlay=(W-w)/2:0[bottom];"
             "[base][bottom]overlay=0:381:shortest=1"
         )
     else:
         filter_complex = (
             "color=c=black:s=1280x720[bg];"
-            "[0:v]scale=-1:339[fg];"
+            "[0:v]scale=-1:339:flags=lanczos[fg];"
             "[bg][fg]overlay=(W-w)/2:H-h:shortest=1"
         )
 
-    cmd = [
+    base_cmd = [
         _resolve_binary("ffmpeg"), "-y", "-i", src,
         "-filter_complex", filter_complex,
-        "-shortest",
-        "-an", "-c:v", "mjpeg", "-q:v", "3",
-        out_path,
+        "-shortest", "-an",
     ]
-    _run_ffmpeg(cmd)
+    encoder_args = [
+        "-c:v", "libx264", "-preset", TAIKO_VIDEO_PRESET,
+        "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.1", "-aspect", "16:9",
+    ]
 
-    if os.path.abspath(out_path) != os.path.abspath(src):
+    _run_ffmpeg(base_cmd + encoder_args + ["-crf", str(TAIKO_VIDEO_CRF), encode_path])
+
+    target_bytes = int(TAIKO_VIDEO_TARGET_SIZE_MB * 1024 * 1024)
+    if os.path.getsize(encode_path) > target_bytes:
+        duration = probe_video_duration_seconds(src)
+        if duration:
+            _encode_taiko_video_two_pass(base_cmd, encoder_args, encode_path, duration, target_bytes)
+
+    if same_file:
+        os.replace(encode_path, out_path)
+    elif os.path.abspath(out_path) != os.path.abspath(src):
         try:
             os.remove(src)
         except OSError:

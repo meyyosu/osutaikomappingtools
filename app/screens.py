@@ -783,6 +783,11 @@ class SongSearchResultsWindow(tk.Toplevel):
 
     def __init__(self, app, matches, on_select):
         super().__init__(app)
+        # Stay hidden until every row is built and the window is
+        # positioned — otherwise the WM maps it at a default spot/size
+        # first, so it visibly flashes there and jumps into place
+        # ("ghost window"). Shown via deiconify() at the very end.
+        self.withdraw()
         self.title(f"Search results ({len(matches)})")
         self.configure(bg=FRONT_BG)
         self.resizable(False, True)
@@ -854,6 +859,7 @@ class SongSearchResultsWindow(tk.Toplevel):
         # focused/on top for as long as it's open, matching the other
         # popups (Settings, BG/Video preview, troubleshoot).
         self.transient(app)
+        self.deiconify()
         self.lift()
         self.focus_force()
         self.grab_set()
