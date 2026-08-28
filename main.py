@@ -59,7 +59,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.9"
+APP_VERSION = "1.11"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -1389,6 +1389,11 @@ class App(tk.Tk):
                               FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
+        # Stay hidden until every section is built and the window is
+        # positioned — otherwise the WM maps it at a default spot/size
+        # first, so it visibly flashes there and reflows as the cards are
+        # added ("ghost window"). Shown via deiconify() at the very end.
+        win.withdraw()
         win.title("Settings")
         win.configure(bg=FRONT_BG)
         win.resizable(False, False)
@@ -1726,6 +1731,7 @@ class App(tk.Tk):
         win.protocol("WM_DELETE_WINDOW", on_close)
         win.bind("<Escape>", lambda e: on_close())
         win.transient(self)
+        win.deiconify()
         win.lift()
         win.focus_force()
         win.grab_set()
@@ -1749,6 +1755,11 @@ class App(tk.Tk):
                               _show_alert, FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
+        # Stay hidden until every section is built and the window is
+        # positioned — otherwise the WM maps it at a default spot/size
+        # first, so it visibly flashes there and reflows as the cards are
+        # added ("ghost window"). Shown via deiconify() at the very end.
+        win.withdraw()
         win.title("First time setup")
         win.configure(bg=FRONT_BG)
         win.resizable(False, False)
@@ -1948,6 +1959,7 @@ class App(tk.Tk):
         _position_over_window(win, self, width=600, height=target_h)
 
         win.transient(self)
+        win.deiconify()
         win.lift()
         win.focus_force()
         win.grab_set()
