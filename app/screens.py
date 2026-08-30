@@ -3,11 +3,13 @@ screens.py
 One Frame subclass per sidebar tool, matching the wireframes.
 """
 
+import math
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from fractions import Fraction
 import tkinter as tk
@@ -53,22 +55,45 @@ def _make_light_entry(parent, **kwargs):
     return LightEntry(parent, **kwargs)
 
 
+# highlightthickness=0 + takefocus=0: these are flat, custom-styled buttons
+# meant to read like web buttons — no OS focus ring / dotted focus rectangle
+# left behind after a mouse click (the app is mouse-driven; Tab-to-button
+# nav isn't expected on these).
+def _kill_button_focus(btn):
+    """`takefocus=0` only stops Tab traversal — a mouse click on a classic
+    `tk.Button` (Windows) still focuses it and it then draws a dotted
+    "default" focus rectangle inside itself that no widget option suppresses.
+    So the moment one of these gets focus, hand it straight back to the
+    toplevel (unless focus has already legitimately moved on to e.g. an
+    Entry the user clicked next)."""
+    def _bounce(_e):
+        def go():
+            try:
+                if btn.winfo_exists() and btn.focus_get() is btn:
+                    btn.winfo_toplevel().focus_set()
+            except (tk.TclError, KeyError):
+                pass
+        btn.after_idle(go)
+    btn.bind("<FocusIn>", _bounce, add="+")
+    return btn
+
+
 def _make_accent_button(parent, text, command, **kwargs):
     defaults = dict(font=("Segoe UI", 11, "bold"), bg=LIGHT_ACCENT,
                      activebackground=LIGHT_ACCENT_HOVER, fg="#ffffff",
                      activeforeground="#ffffff", relief="flat", bd=0,
-                     cursor="hand2", padx=18, pady=9)
+                     highlightthickness=0, takefocus=0, cursor="hand2", padx=18, pady=9)
     defaults.update(kwargs)
-    return tk.Button(parent, text=text, command=command, **defaults)
+    return _kill_button_focus(tk.Button(parent, text=text, command=command, **defaults))
 
 
 def _make_ghost_button(parent, text, command, **kwargs):
     defaults = dict(font=("Segoe UI", 10, "bold"), bg=LIGHT_ACCENT_SOFT,
                      activebackground=LIGHT_ACCENT_SOFT, fg=LIGHT_ACCENT,
                      activeforeground=LIGHT_ACCENT, relief="flat", bd=0,
-                     cursor="hand2", padx=14, pady=8)
+                     highlightthickness=0, takefocus=0, cursor="hand2", padx=14, pady=8)
     defaults.update(kwargs)
-    return tk.Button(parent, text=text, command=command, **defaults)
+    return _kill_button_focus(tk.Button(parent, text=text, command=command, **defaults))
 
 
 def _render_gradient_text(text, font_size=30, bold=True,
@@ -438,6 +463,17 @@ def _ask_vlc_required_choice(parent) -> str:
     return _ask_choice_dialog(
         parent, "VLC required",
         "The live video preview needs VLC, which wasn't found on this system.",
+        [("Install automatically", "install"), ("Cancel", "cancel")])
+
+
+def _ask_waifu2x_required_choice(parent) -> str:
+    """Shown when BG Settings' "Upscale BG" is used but
+    waifu2x-ncnn-vulkan isn't resolvable (see `logic.waifu2x_available`).
+    Returns "install" or "cancel"."""
+    return _ask_choice_dialog(
+        parent, "waifu2x required",
+        "Upscaling the background needs waifu2x-ncnn-vulkan, which wasn't found on this "
+        "system.",
         [("Install automatically", "install"), ("Cancel", "cancel")])
 
 
@@ -1288,6 +1324,8 @@ class LightCheckbox(tk.Frame):
             self.command()
 
     def set_enabled(self, enabled: bool):
+        if self.enabled == enabled:
+            return
         self.enabled = enabled
         cursor = "hand2" if enabled else "arrow"
         self.icon.configure(cursor=cursor)
@@ -1418,7 +1456,7 @@ class LightSpinner(tk.Frame):
 
     def __init__(self, master, textvariable, from_, to, increment=1, width=5,
                  fmt=None, bg=FRONT_CARD_BG, fg=FRONT_TEXT, accent=LIGHT_ACCENT,
-                 font=("Segoe UI", 11), on_change=None, validate=None):
+                 font=("Segoe UI", 11), on_change=None, validate=None, parse=None):
         super().__init__(master, bg=bg, highlightthickness=0)
         self.bg = bg
         self.accent = accent
@@ -1427,7 +1465,12 @@ class LightSpinner(tk.Frame):
         self.from_ = from_
         self.to = to
         self.increment = increment
+        # `fmt` may be a `%`-style string (like tk.Spinbox's `format=`) or a
+        # callable value->str; `parse` is the inverse (str->number), for a
+        # field whose displayed text isn't a bare number (e.g. an mm:ss:mmm
+        # timestamp). Both default to plain float/str round-tripping.
         self.fmt = fmt
+        self._parse = parse or float
         self.on_change = on_change
         self.enabled = True
 
@@ -1463,15 +1506,21 @@ class LightSpinner(tk.Frame):
         # real <Configure> instead of trusting a fixed y=BOX_SHIFT offset
         # — a caller's `ipady` on its own grid()/pack() call genuinely
         # resizes this widget beyond BOX_H, same as it does for LightEntry.
-        self.bind("<Configure>", lambda _e: self._position_canvas())
+        self.bind("<Configure>", lambda e: self._position_canvas(e.height))
 
         self.entry.bind("<FocusIn>", lambda _e: self._set_focused(True), add="+")
         self.entry.bind("<FocusOut>", lambda _e: self._set_focused(False), add="+")
         self._redraw()
 
-    def _position_canvas(self):
-        self.update_idletasks()
-        y = max(0, (self.winfo_height() - self.BOX_H) // 2) + self.BOX_SHIFT
+    def _position_canvas(self, height=None):
+        # Use the <Configure> event's own height when we have it — calling
+        # update_idletasks() from inside a Configure handler forces a
+        # re-entrant relayout of the whole parent, which is O(n^2) when a
+        # tableful of these re-lay-out at once.
+        if height is None:
+            self.update_idletasks()
+            height = self.winfo_height()
+        y = max(0, (height - self.BOX_H) // 2) + self.BOX_SHIFT
         self.canvas.place(x=0, y=y)
 
     def _set_focused(self, focused):
@@ -1487,10 +1536,15 @@ class LightSpinner(tk.Frame):
         c.tag_lower("box")
 
     def _draw_arrows(self):
-        for c in (self.up_canvas, self.down_canvas):
-            c.delete("all")
         color = FRONT_TEXT_MUTED if self.enabled else "#d7d7e0"
-        self.up_canvas.create_polygon(1, 7, 6, 1, 11, 7, fill=color, outline="")
+        ids = getattr(self, "_arrow_ids", None)
+        if ids:
+            # recolor the existing triangles rather than delete + recreate —
+            # this is on the hot path for bulk enable/disable (S-cascade).
+            self.up_canvas.itemconfigure(ids[0], fill=color)
+            self.down_canvas.itemconfigure(ids[1], fill=color)
+            return
+        up = self.up_canvas.create_polygon(1, 7, 6, 1, 11, 7, fill=color, outline="")
         # Not a literal mirror of the up triangle's coordinates (1,1 / 6,7 /
         # 11,1) — confirmed empirically (screenshot + per-row pixel count)
         # that Tk's polygon scan-fill rasterizes a flat-top triangle
@@ -1503,18 +1557,23 @@ class LightSpinner(tk.Frame):
         # triangle (25px, 5 rows, row-width profile 9,7,5,3,1 vs up's
         # 1,3,5,7,9) — don't "simplify" this back to a clean mirror of the
         # up coordinates, that's the version confirmed to look bigger.
-        self.down_canvas.create_polygon(1.5, 2, 6, 7, 10.5, 2, fill=color, outline="")
+        dn = self.down_canvas.create_polygon(1.5, 2, 6, 7, 10.5, 2, fill=color, outline="")
+        self._arrow_ids = (up, dn)
 
     def _step(self, direction):
         if not self.enabled:
             return
         try:
-            val = float(self.textvariable.get())
-        except ValueError:
+            val = self._parse(self.textvariable.get())
+        except (ValueError, TypeError):
+            val = None
+        if val is None:
             val = self.from_
         val = round(val + direction * self.increment, 6)
         val = max(self.from_, min(self.to, val))
-        if self.fmt:
+        if callable(self.fmt):
+            text = self.fmt(val)
+        elif self.fmt:
             text = self.fmt % val
         elif val == int(val):
             # Without an explicit fmt, `val` is still a float internally
@@ -1533,6 +1592,8 @@ class LightSpinner(tk.Frame):
             self.on_change()
 
     def set_enabled(self, enabled: bool):
+        if self.enabled == enabled:
+            return
         self.enabled = enabled
         self.entry.configure(state="normal" if enabled else "disabled")
         cursor = "hand2" if enabled else "arrow"
@@ -1887,7 +1948,7 @@ class LightEntry(tk.Frame):
         self.entry.bind("<FocusOut>", lambda _e: self._set_focused(False), add="+")
         self._redraw()
 
-    def _position_canvas(self, width=None):
+    def _position_canvas(self, width=None, height=None):
         # Centers the canvas within this widget's *actual* current height
         # before applying BOX_SHIFT — NOT a hardcoded y=BOX_SHIFT assuming
         # self stays exactly BOX_H tall. A caller's `ipady` on its own
@@ -1895,21 +1956,31 @@ class LightEntry(tk.Frame):
         # for real: unlike pady, which only adds external margin around an
         # unchanged-size widget, ipady inflates the widget's own allocated
         # rectangle) — Metadata Manager's fields use ipady=6, making self
-        # 48px tall, not 36. A fixed y=BOX_SHIFT then anchored the canvas
-        # near self's own top instead of its middle, pushing the box
-        # *above* the Label's center instead of the intended tiny bit
-        # below it. Recomputing from self.winfo_height() every time keeps
-        # this correct regardless of whether the caller uses ipady or not.
-        self.update_idletasks()
-        y = max(0, (self.winfo_height() - self.BOX_H) // 2) + self.BOX_SHIFT
+        # 48px tall, not 36.
+        #
+        # `height` comes from the <Configure> event when available —
+        # calling update_idletasks() from inside a Configure handler forces
+        # a re-entrant relayout of the parent, which is O(n^2) when a
+        # tableful of these re-lay-out at once (delete-undo in the Timing
+        # Editor). Only fall back to the live query when called directly.
+        if height is None:
+            self.update_idletasks()
+            height = self.winfo_height()
+        y = max(0, (height - self.BOX_H) // 2) + self.BOX_SHIFT
         kwargs = {"x": 0, "y": y}
         if width is not None:
             kwargs["width"] = width
         self.canvas.place(**kwargs)
 
     def _on_configure(self, event):
+        if event.width == self._current_w:
+            # only moved (or height changed) — no need to recut the border
+            # or resize the embedded entry. This matters when a tableful of
+            # these shift on a row show/hide.
+            self._position_canvas(width=None, height=event.height)
+            return
         self._current_w = event.width
-        self._position_canvas(width=event.width)
+        self._position_canvas(width=event.width, height=event.height)
         self.canvas.itemconfig(self._window_id,
                                 width=max(self._entry_w, event.width - self.PAD_X * 2))
         self._redraw()
@@ -3301,8 +3372,11 @@ class OffsetShifterFrame(BaseToolFrame):
 
         def on_success(result):
             if external_path:
+                # Note: previously this opened the destination folder with the
+                # exported file pre-selected (_reveal_in_explorer), but that was
+                # unreliable in practice, so it's disabled — the re-encode still
+                # happens, the result just isn't revealed in Explorer.
                 self.notify_done(f"Audio re-encoded to {bitrate}kbps.")
-                _reveal_in_explorer(result)
             else:
                 self.notify_done(f"Audio re-encoded to {bitrate}kbps ({result}).")
 
@@ -3313,6 +3387,1969 @@ class OffsetShifterFrame(BaseToolFrame):
                      if install_first else "Re-encoding audio... Please wait...")
         self.app.run_cancellable_job(busy_msg, work, on_success=on_success, on_error=on_error,
                                       cancelled_toast="Re-encode Cancelled!")
+
+
+def _fmt_ms_timestamp(ms) -> str:
+    """A raw millisecond value as osu!'s `mm:ss:mmm` editor timestamp."""
+    ms = int(round(ms))
+    sign = "-" if ms < 0 else ""
+    ms = abs(ms)
+    m, rem = divmod(ms, 60000)
+    s, mmm = divmod(rem, 1000)
+    return f"{sign}{m:02d}:{s:02d}:{mmm:03d}"
+
+
+def _parse_ms_timestamp(s):
+    """Inverse of `_fmt_ms_timestamp` — accepts an `mm:ss:mmm` timestamp (an
+    optional leading `-` is honoured, unlike `logic.parse_time_input` which
+    ignores sign) or a plain millisecond number. Returns float ms, or None if
+    nothing parseable is there."""
+    s = str(s).strip()
+    neg = s.startswith("-")
+    if neg:
+        s = s[1:].strip()
+    if ":" in s or "." in s:
+        p = logic.parse_time_input(s)
+        v = float(p[0]) if p else None
+    else:
+        try:
+            v = float(s)
+        except ValueError:
+            v = None
+    if v is None:
+        return None
+    return -v if neg else v
+
+
+# =============================================================================
+class TimingEditorFrame(BaseToolFrame):
+    """"Timing Editor" sidebar tool — a per-red-line timing editor with a
+    scrollable/zoomable timeline and a song waveform strip underneath.
+
+    Table: one row per red line — a Sel checkbox (for the Delete action),
+    read-only Old offset / BPM, editable Change (Δoffset ±1ms, ΔBPM ±0.1)
+    and New Offset / New BPM columns kept in sync two ways (edit either
+    side), plus BL (omit first barline) and Time sig. Tick some Sel boxes
+    and a red "Delete selected" button (also the Del key) removes those
+    red lines.
+
+    Timeline: red lines drawn from the *current New* values with a live
+    beat grid at the chosen divisor; barlines shown as thick black bars;
+    drag a red line to snap it, left-drag empty space to scroll, wheel =
+    scroll by one tick, Shift+wheel = zoom, Ctrl+wheel = change divisor.
+    "+ Add new redline" drops an editable red line at the cursor.
+
+    Apply retimes every ticked difficulty (this tool's own "Apply to"
+    list): red lines rewritten, hit objects / green lines moved to the same
+    beat position in their new section, green line SV compensated for the
+    BPM change — see tools_logic.retime_beatmap. Reads the red lines from
+    the first difficulty in the folder; rebuilds on every map change
+    (on_map_changed) and whenever the tab is shown (on_shown)."""
+
+    # "None" = barlines only (no beat grid); its "tick" for scrolling/
+    # snapping is a whole bar. Otherwise the value is the beat subdivision.
+    DIVISOR_OPTIONS = ["None", "1/1", "1/2", "1/3", "1/4", "1/6", "1/8", "1/12"]
+    DIVISOR_DENOMS = {"1/1": 1, "1/2": 2, "1/3": 3, "1/4": 4, "1/6": 6, "1/8": 8, "1/12": 12}
+
+    TIMELINE_H = 120
+    WAVE_H = 66
+    LEFT_PAD = 8
+    BUCKETS_PER_SEC = 200
+    TABLE_COLS = 9
+    CURSOR_FRAC = 0.30           # the fixed "current time" line sits this far from the left
+
+    # osu!lazer shifts its editor waveform visual by +20ms
+    # (Editor.WAVEFORM_VISUAL_OFFSET, Editor.cs) — "osu! beatmaps have an
+    # assumption of full system latency baked in" (stable platform offset +
+    # hardware playback latency + historically tweaked universal offsets).
+    # lazer's Timeline.cs applies it as `waveform.X = -(20 / trackLength)`,
+    # i.e. the grid position for time t lines up with audio content at file
+    # time t+20ms. We match that: the peak drawn under grid time t is
+    # sampled 20ms later in the file.
+    WAVEFORM_VISUAL_OFFSET_MS = 20.0
+
+    TICK_STYLES = {2: ("#e8462e", 34), 4: ("#4a90d9", 27),
+                   8: ("#d4b106", 19), 12: ("#999999", 15)}
+
+    ROW_COLS = ("sel_chk", "oe", "be", "doff_spin", "dbpm_spin", "bl_chk",
+                 "noff_spin", "nbpm_spin", "ts_spin")   # grid column order within a row frame
+
+    def __init__(self, master, app):
+        super().__init__(master, app)
+        _style_light_body(self)
+
+        self.rows = []
+        self._updating = False
+        # undo/redo of the table state (offsets/BPM/BL/Time-sig/added &
+        # deleted rows). A "state" is the tuple from _capture_state; edits
+        # are coalesced (debounced ~450ms) into one undo step via
+        # _schedule_commit. Selection (the Sel checkboxes) is transient UI
+        # state, not tracked in undo history.
+        self._undo_stack = []
+        self._redo_stack = []
+        self._committed_state = None
+        self._initial_state = None    # the map's state at load — target of "Revert all"
+        self._commit_job = None
+        self._restoring = False
+        self._drag_red = None
+        self._drag_x0 = 0
+        self._drag_cursor0 = 0.0
+        self._drag_moved = False
+        self._suppress_release = False
+        self._loaded_src = None      # (folder, filename) the table was last built from
+        self._wave_token = 0         # bumps per map change, so a stale decode result is ignored
+        self._peaks = None
+        self._bucket_ms = 1000.0 / self.BUCKETS_PER_SEC
+        self._wave_msg = "Loading waveform..."
+        self._wave_mode = "amplitude"   # or "onset" — toggled by double-clicking the waveform
+        self._onsets = None             # cached onset bucket indices (lazy)
+
+        # audio playback (VLC) — the timeline scrolls with the playhead
+        self._vlc = None
+        self._vlc_instance = None
+        self._player = None
+        self._playing = False
+        self._play_after = None
+        # playhead interpolation: est = _play_anchor_ms + (now - _play_anchor_wall)*1000,
+        # gently corrected toward libVLC's own (coarse, laggy) get_time().
+        self._play_anchor_ms = 0.0
+        self._play_anchor_wall = 0.0
+        self._play_floor_ms = 0.0     # last explicit seek target — est never dips below it
+        self._seek_guard_until = 0.0  # window after a seek where libVLC's time is untrusted
+        self._seek_job = None         # debounce: pending after() id for a coalesced seek
+        self._pending_seek_ms = None
+        # smooth-scroll state: a full render covers the visible range plus a
+        # margin and tags its items "scroll"; during playback we just
+        # canvas.move() those by the frame's delta and only re-render fully
+        # once the view has panned past the rendered margin.
+        self._rendered_lo = 0.0
+        self._rendered_hi = 0.0
+        self._panned_cursor = 0.0
+        self._cursor_text_id = None
+
+        # The "current time" line is pinned at CURSOR_FRAC across the
+        # timeline; cursor_ms is the primary state and every scroll moves
+        # it — the visible window (_view_start) is always derived from it.
+        self.px_per_ms = 0.15
+        self.cursor_ms = 0.0
+        self.divisor_var = tk.StringVar(value="1/1")
+        self.divisor_var.trace_add("write", lambda *_a: self._redraw_timeline())
+        # extend the timeline's barlines down into the waveform / onset strip
+        self.wave_barlines_var = tk.BooleanVar(value=False)
+
+        body = self.body
+
+        # ---- header ----
+        head = tk.Frame(body, bg=FRONT_BG)
+        head.pack(fill="x", padx=24, pady=(20, 4))
+        tk.Label(head, text="Timing Editor", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(side="left")
+        _hinfo = InfoIcon(head, "Time and refine the timing of the map with waveform. "
+                        "THIS FEATURE IS EXPERIMENTAL!")
+        _hinfo.configure(bg=FRONT_BG)
+        _hinfo.pack(side="left", padx=(6, 0))
+
+        # ---- input validators (reject anything that isn't a number;
+        #      offset fields additionally allow ':' for mm:ss:mmm) ----
+        self._vc_uint = (self.register(lambda P: P == "" or P.isdigit()), "%P")
+        self._vc_sint = (self.register(self._valid_sint), "%P")
+        self._vc_snum = (self.register(self._valid_snum), "%P")
+        self._vc_offset = (self.register(self._valid_offset), "%P")
+
+        # ---- table (scrollable both ways, frozen header) ----
+        # tbl_wrap is a 2x4 grid: the header canvas and body canvas share
+        # column 0 (so they are EXACTLY the same width — that's what keeps
+        # their columns aligned while scrolled sideways), the vertical
+        # scrollbar spans column 1, the horizontal scrollbar is the last row.
+        tbl_wrap = tk.Frame(body, bg=FRONT_BG, highlightthickness=1,
+                             highlightbackground=FRONT_BORDER, highlightcolor=FRONT_BORDER)
+        tbl_wrap.pack(fill="x", padx=24, pady=(8, 6))
+        tbl_wrap.grid_columnconfigure(0, weight=1)
+        tbl_wrap.grid_rowconfigure(2, weight=1)
+
+        self.hdr_canvas = tk.Canvas(tbl_wrap, bg=FRONT_CARD_BG, highlightthickness=0, height=26)
+        self.hdr_canvas.grid(row=0, column=0, sticky="ew")
+        self.hdr_frame = tk.Frame(self.hdr_canvas, bg=FRONT_CARD_BG)
+        self.hdr_canvas.create_window((0, 0), window=self.hdr_frame, anchor="nw")
+        headers = ["Sel", "Old offset", "BPM", "Δ offset", "Δ BPM", "BL",
+                   "New Offset", "New BPM", "Time sig"]
+        for col, txt in enumerate(headers):
+            tk.Label(self.hdr_frame, text=txt, bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED,
+                     font=("Segoe UI", 9, "bold")).grid(row=0, column=col, padx=6, pady=(6, 4), sticky="w")
+        self.hdr_frame.bind("<Configure>", lambda _e: self._sync_scrollregions())
+        tk.Frame(tbl_wrap, bg=FRONT_BORDER, height=1).grid(row=1, column=0, sticky="ew")
+
+        self.table_canvas = tk.Canvas(tbl_wrap, bg=FRONT_CARD_BG, highlightthickness=0, height=180)
+        self.table_canvas.grid(row=2, column=0, sticky="nsew")
+        tbl_scroll = ttk.Scrollbar(tbl_wrap, orient="vertical", command=self._table_yview)
+        tbl_scroll.grid(row=0, column=1, rowspan=3, sticky="ns")
+        x_scroll = ttk.Scrollbar(tbl_wrap, orient="horizontal", command=self._table_xview)
+        x_scroll.grid(row=3, column=0, sticky="ew")
+        self.table_canvas.configure(yscrollcommand=tbl_scroll.set, xscrollcommand=x_scroll.set)
+        self.table_inner = tk.Frame(self.table_canvas, bg=FRONT_CARD_BG)
+        self.table_canvas.create_window((0, 0), window=self.table_inner, anchor="nw")
+        self.table_inner.bind("<Configure>", lambda _e: self._sync_scrollregions())
+        self._bind_table_wheel(tbl_wrap)
+        self._bind_table_wheel(self.hdr_canvas)
+        self._bind_table_wheel(self.table_canvas)
+        self._bind_table_wheel(self.table_inner)
+        self._bind_table_wheel(self.hdr_frame)
+
+        self.empty_lbl = tk.Label(self.table_inner, text="No map loaded.",
+                                   bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10))
+        self.empty_lbl.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+
+        self.add_row = add_row = tk.Frame(body, bg=FRONT_BG)
+        add_row.pack(fill="x", padx=24, pady=(0, 6))
+        _make_ghost_button(add_row, "+ Add new redline", self._add_redline).pack(side="left")
+        self.revert_btn = _make_ghost_button(add_row, "⟲ Revert all", self._revert)
+        self.revert_btn.configure(fg="#d32f2f", activeforeground="#b71c1c",
+                                   bg="#fdecec", activebackground="#fbdcdc")
+        self.revert_btn.pack(side="left", padx=(10, 0))
+        self.redo_btn = _make_ghost_button(add_row, "↷ Redo", self._redo)
+        self.redo_btn.pack(side="right")
+        self.undo_btn = _make_ghost_button(add_row, "↶ Undo", self._undo)
+        self.undo_btn.pack(side="right", padx=(0, 6))
+        # shown (pack) only while >=1 timing point is selected — sits next to Undo
+        self.del_sel_btn = _make_ghost_button(add_row, "Delete selected", self._delete_selected)
+        self.del_sel_btn.configure(fg="#d32f2f", activeforeground="#b71c1c",
+                                    bg="#fdecec", activebackground="#fbdcdc")
+
+        # ---- timeline nav + divisor selector ----
+        div_row = tk.Frame(body, bg=FRONT_BG)
+        div_row.pack(fill="x", padx=24, pady=(2, 2))
+        self.play_btn = _make_ghost_button(div_row, "▶", self._toggle_play,
+                                            width=2, padx=8, pady=3)
+        self.play_btn.pack(side="left", padx=(0, 12))
+        _make_ghost_button(div_row, "◀", lambda: self._step_cursor(-1), width=2,
+                            padx=8, pady=3).pack(side="left")
+        _make_ghost_button(div_row, "▶", lambda: self._step_cursor(1), width=2,
+                            padx=8, pady=3).pack(side="left", padx=(4, 10))
+        tk.Label(div_row, text=" "
+                                " ",
+                 bg=FRONT_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 9)).pack(side="left")
+        _make_ghost_button(div_row, "›", lambda: self._step_divisor(1), width=2,
+                            padx=8, pady=3).pack(side="right")
+        LightDropdown(div_row, self.divisor_var, values=self.DIVISOR_OPTIONS, width=5,
+                       page_bg=FRONT_BG).pack(side="right", padx=4)
+        _make_ghost_button(div_row, "‹", lambda: self._step_divisor(-1), width=2,
+                            padx=8, pady=3).pack(side="right")
+        tk.Label(div_row, text="Snap:", bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="right", padx=(0, 4))
+
+        # ---- timeline + waveform ----
+        # highlightcolor pinned to highlightbackground so the 1px border
+        # doesn't switch to a black/blue focus ring when the panel is clicked
+        # (the timeline still needs takefocus=1 for its arrow-key handling).
+        self.timeline = tk.Canvas(body, height=self.TIMELINE_H, bg="white",
+                                   highlightthickness=1, highlightbackground=FRONT_BORDER,
+                                   highlightcolor=FRONT_BORDER)
+        self.timeline.pack(fill="x", padx=24, pady=(2, 0))
+        self.wave = tk.Canvas(body, height=self.WAVE_H, bg="#faf9fe",
+                               highlightthickness=1, highlightbackground=FRONT_BORDER,
+                               highlightcolor=FRONT_BORDER, takefocus=0)
+        self.wave.pack(fill="x", padx=24, pady=(0, 2))
+        self.seek_scroll = ttk.Scrollbar(body, orient="horizontal", command=self._seek_scroll)
+        self.seek_scroll.pack(fill="x", padx=24, pady=(0, 4))
+        self.seek_scroll.set(0.0, 1.0)
+        LightCheckbox(body, "Display barlines in waveform view", self.wave_barlines_var,
+                       bg=FRONT_BG, font=("Segoe UI", 9),
+                       command=self._redraw_timeline).pack(anchor="w", padx=24, pady=(0, 8))
+
+        # Both canvases share the same time transform. Wheel + press + drag are
+        # identical on either (a drag on the waveform scrolls the current-time
+        # line just like a drag on the timeline). They differ on release: a
+        # plain click on the *timeline* seeks to that point, a plain click on
+        # the *waveform* does nothing (only a drag seeks there) — double-click
+        # the waveform to toggle amplitude/onset view instead.
+        for c in (self.timeline, self.wave):
+            c.bind("<Configure>", lambda _e: self._redraw_timeline())
+            c.bind("<MouseWheel>", self._tl_wheel)
+            c.bind("<Shift-MouseWheel>", self._tl_wheel_shift)
+            c.bind("<Control-MouseWheel>", self._tl_wheel_ctrl)
+            c.bind("<Button-4>", lambda e: self._tl_wheel_like(e, 1))
+            c.bind("<Button-5>", lambda e: self._tl_wheel_like(e, -1))
+            c.bind("<Button-1>", self._tl_press)
+            c.bind("<B1-Motion>", self._tl_motion)
+        self.timeline.bind("<ButtonRelease-1>", self._tl_release)
+        self.wave.bind("<ButtonRelease-1>", self._wave_release)
+        self.timeline.configure(takefocus=1)
+        self.timeline.bind("<Double-Button-1>", self._tl_double)
+        self.timeline.bind("<Left>", lambda _e: self._step_cursor(-1))
+        self.timeline.bind("<Right>", lambda _e: self._step_cursor(1))
+        self.wave.bind("<Double-Button-1>", self._toggle_wave_mode)
+
+        # ---- Apply to + footer ----
+        tk.Label(body, text="Apply to:", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=24, pady=(2, 6))
+        self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
+        self.diff_list.pack(fill="x", padx=24, pady=(0, 12))
+
+        foot = tk.Frame(body, bg=FRONT_BG)
+        foot.pack(fill="x", padx=24, pady=(0, 20))
+        self.status_var = tk.StringVar(value="")
+        tk.Label(foot, textvariable=self.status_var, bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.apply_btn = _make_accent_button(foot, "Apply", self._apply)
+        self.apply_btn.pack(side="right")
+
+    # ------------------------------------------------------------------
+    # Lifecycle — (re)load the map's red lines
+    # ------------------------------------------------------------------
+    def on_shown(self):
+        self._load_map()
+        # Tab-scoped hotkeys (bind_all, removed in on_hidden — nothing else
+        # in the app bind_all's these).
+        self.bind_all("<space>", self._on_space)
+        for seq in ("<Control-z>", "<Control-Z>"):
+            self.bind_all(seq, self._on_undo_key)
+        for seq in ("<Control-y>", "<Control-Y>"):
+            self.bind_all(seq, self._on_redo_key)
+        self.bind_all("<Delete>", self._on_delete_key)
+        # ← → step the current-time line from anywhere on the tab, not just
+        # when the timeline canvas holds focus (same field-aware guard as
+        # <space>). The timeline's own <Left>/<Right> still fire first + return
+        # "break" when it *is* focused, so this never double-steps.
+        self.bind_all("<Left>", lambda e: self._on_arrow_key(e, -1))
+        self.bind_all("<Right>", lambda e: self._on_arrow_key(e, 1))
+
+    def on_map_changed(self):
+        self._load_map()
+
+    def on_hidden(self):
+        self._stop_audio()
+        for seq in ("<space>", "<Control-z>", "<Control-Z>", "<Control-y>",
+                     "<Control-Y>", "<Delete>", "<Left>", "<Right>"):
+            self.unbind_all(seq)
+
+    def _is_current(self):
+        return self.app.frames.get(getattr(self.app, "_current_frame_name", None)) is self
+
+    def _on_undo_key(self, _event=None):
+        if self._is_current():
+            self._undo()
+            return "break"
+
+    def _on_redo_key(self, _event=None):
+        if self._is_current():
+            self._redo()
+            return "break"
+
+    def _on_delete_key(self, _event=None):
+        if not self._is_current():
+            return
+        w = self.focus_get()
+        if isinstance(w, (tk.Entry, tk.Spinbox, tk.Text)):
+            try:
+                if str(w.cget("state")) not in ("disabled", "readonly"):
+                    return   # let Del edit text in a value field
+            except tk.TclError:
+                return
+        self._delete_selected()
+        return "break"
+
+    def _on_arrow_key(self, event, direction):
+        if not self._is_current():
+            return
+        w = self.focus_get()
+        if isinstance(w, (tk.Entry, tk.Spinbox, tk.Text)):
+            try:
+                if str(w.cget("state")) not in ("disabled", "readonly"):
+                    return   # let ← → move the caret in an editable field
+            except tk.TclError:
+                return
+        self._step_cursor(direction)
+        return "break"
+
+    def _on_space(self, _event=None):
+        if not self._is_current():
+            return
+        w = self.focus_get()
+        if isinstance(w, (tk.Entry, tk.Spinbox, tk.Text)):
+            try:
+                if str(w.cget("state")) not in ("disabled", "readonly"):
+                    return   # let Space type into an editable field
+            except tk.TclError:
+                return
+        self._toggle_play()
+        return "break"
+
+    def _load_map(self):
+        folder, diffs = self.app.get_diff_files()
+        src = diffs[0] if diffs else None
+        key = (folder, src)
+        # Rebuild the table + waveform only when the source diff actually
+        # changed — re-showing the same map keeps whatever edits are pending.
+        if key == self._loaded_src and self.rows:
+            self.diff_list.refresh()
+            return
+        self._stop_audio()
+        self._loaded_src = key
+        # fresh undo history per map load (can't undo past the map's own state)
+        self._committed_state = None
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        if self._commit_job is not None:
+            try:
+                self.after_cancel(self._commit_job)
+            except Exception:
+                pass
+            self._commit_job = None
+
+        for r in self.rows:
+            r["frame"].destroy()   # destroys all 9 child widgets with it
+        self.rows = []
+        self.divisor_var.set("1/1")
+
+        reds = []
+        if src:
+            try:
+                bm = osu_parser.Beatmap(os.path.join(folder, src))
+                reds = sorted([tp for tp in bm.timing_points if tp.uninherited == 1],
+                               key=lambda t: t.time)
+            except OSError:
+                reds = []
+
+        if not reds:
+            self.empty_lbl.configure(
+                text="No red (timing) lines found in this map." if src else "No map loaded.")
+            self.empty_lbl.grid()
+            self.apply_btn.configure(state="disabled")
+            self._peaks = None
+            self._onsets = None
+            self._initial_state = None
+            self.diff_list.refresh()
+            self._update_undo_buttons()
+            self._redraw_timeline()
+            return
+
+        self.empty_lbl.grid_remove()
+        self.apply_btn.configure(state="normal")
+        for tp in reds:
+            self._make_row(old_time=float(tp.time), old_bl=float(tp.beat_length),
+                            is_new=False, meter=tp.meter, sample_set=tp.sample_set,
+                            sample_index=tp.sample_index, volume=tp.volume, effects=tp.effects)
+
+        self.px_per_ms = 0.15
+        self.cursor_ms = float(reds[0].time)
+        self._committed_state = self._capture_state()
+        self._initial_state = self._committed_state
+        self._update_undo_buttons()
+        self._sync_delete_button()
+
+        self.diff_list.refresh()
+        self._align_columns()
+        self.after(60, lambda: (self._align_columns(), self._redraw_timeline()))
+
+        # ---- kick the waveform decode ----
+        self._wave_token += 1
+        token = self._wave_token
+        self._peaks = None
+        self._onsets = None
+        self._wave_msg = "Loading waveform..."
+        audio = logic.get_audio_filename(folder)
+        audio_path = os.path.join(folder, audio) if audio else None
+        if not logic.ffmpeg_available():
+            self._wave_msg = "ffmpeg not found — waveform unavailable"
+        elif not audio_path or not os.path.exists(audio_path):
+            self._wave_msg = "Audio file not found — no waveform"
+        else:
+            threading.Thread(target=self._decode_wave, args=(audio_path, token),
+                              daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Table rows
+    # ------------------------------------------------------------------
+    def _make_row(self, old_time, old_bl, is_new, meter, sample_set,
+                   sample_index, volume, effects):
+        r_idx = len(self.rows) + 1
+        old_bpm = 60000.0 / old_bl if old_bl else 0.0
+        row = {
+            "old_time": old_time, "old_bl": old_bl,
+            "base_time": old_time, "base_bpm": old_bpm,
+            "is_new": is_new, "meter": meter, "sample_set": sample_set,
+            "sample_index": sample_index, "volume": volume, "effects": effects,
+            "_deleted": False,   # hidden (grid_remove'd) — rows are never destroyed
+        }                        #   until _load_map, so delete undo/redo is a grid toggle
+        row["doff_var"] = tk.StringVar(value="0")
+        row["dbpm_var"] = tk.StringVar(value="0")
+        row["bl_var"] = tk.BooleanVar(value=bool(effects & 8))
+        row["sel_var"] = tk.BooleanVar(value=False)   # "Sel" checkbox — for the Delete action
+        row["noff_var"] = tk.StringVar(value=_fmt_ms_timestamp(old_time))
+        row["nbpm_var"] = tk.StringVar(value=self._fmt_bpm(old_bpm))
+        row["ts_var"] = tk.StringVar(value=str(int(meter) if meter else 4))
+
+        cbg = FRONT_CARD_BG
+        # Each row lives in its own Frame — hiding a row (delete / undo)
+        # then only reflows N frames instead of 9·N nested widgets, and the
+        # widgets inside a hidden frame get no <Configure> at all. That's
+        # what keeps delete-undo fast on a heavily-timed map.
+        rf = row["frame"] = tk.Frame(self.table_inner, bg=cbg)
+        rf.grid(row=r_idx, column=0, sticky="w")
+
+        row["sel_chk"] = LightCheckbox(rf, "", row["sel_var"], bg=cbg,
+                                        command=self._on_selection_changed)
+        row["sel_chk"].grid(row=0, column=0, padx=6, pady=3)
+
+        old_lbl = _fmt_ms_timestamp(old_time)
+        oe = _make_light_entry(rf, width=11, state="readonly")
+        oe.configure(state="normal"); oe.insert(0, old_lbl); oe.configure(state="readonly")
+        oe.grid(row=0, column=1, padx=6, pady=3, sticky="w")
+        row["oe"] = oe
+        be = _make_light_entry(rf, width=8, state="readonly")
+        be.configure(state="normal"); be.insert(0, self._fmt_bpm(old_bpm)); be.configure(state="readonly")
+        be.grid(row=0, column=2, padx=6, pady=3, sticky="w")
+        row["be"] = be
+
+        row["doff_spin"] = LightSpinner(rf, row["doff_var"], from_=-10_000_000,
+                                         to=10_000_000, increment=1, width=6, fmt="%d",
+                                         validate=("key", self._vc_sint))
+        row["doff_spin"].grid(row=0, column=3, padx=6, pady=3, sticky="w")
+        row["dbpm_spin"] = LightSpinner(rf, row["dbpm_var"], from_=-100000, to=100000,
+                                         increment=0.1, width=6, fmt="%.1f",
+                                         validate=("key", self._vc_snum))
+        row["dbpm_spin"].grid(row=0, column=4, padx=6, pady=3, sticky="w")
+        row["bl_chk"] = LightCheckbox(rf, "", row["bl_var"], bg=cbg)
+        row["bl_chk"].grid(row=0, column=5, padx=6, pady=3)
+        row["noff_spin"] = LightSpinner(rf, row["noff_var"], from_=-10_000_000,
+                                         to=10_000_000, increment=1, width=10,
+                                         fmt=_fmt_ms_timestamp, parse=_parse_ms_timestamp,
+                                         validate=("key", self._vc_offset))
+        row["noff_spin"].grid(row=0, column=6, padx=6, pady=3, sticky="w")
+        row["nbpm_spin"] = LightSpinner(rf, row["nbpm_var"], from_=1, to=100000,
+                                         increment=0.1, width=7,
+                                         validate=("key", self._vc_snum))
+        row["nbpm_spin"].grid(row=0, column=7, padx=6, pady=3, sticky="w")
+        row["ts_spin"] = LightSpinner(rf, row["ts_var"], from_=2, to=10, increment=1,
+                                       width=4, fmt="%d", validate=("key", self._vc_uint))
+        row["ts_spin"].grid(row=0, column=8, padx=6, pady=3, sticky="w")
+
+        row["noff_spin"].entry.bind("<FocusOut>", lambda _e, rr=row: self._normalize_offset(rr), add="+")
+        row["noff_spin"].entry.bind("<Return>", lambda _e, rr=row: self._normalize_offset(rr), add="+")
+        row["ts_spin"].entry.bind("<FocusOut>", lambda _e, rr=row: self._clamp_ts(rr), add="+")
+
+        # Double-clicking ANY of the row's fields (editable or not) jumps
+        # the timeline to that red line's timestamp.
+        for w in (oe, be, row["doff_spin"], row["dbpm_spin"], row["noff_spin"],
+                   row["nbpm_spin"], row["ts_spin"]):
+            ent = getattr(w, "entry", None) or w
+            ent.bind("<Double-Button-1>", lambda _e, rr=row: self._jump_to_row(rr), add="+")
+
+        row["doff_var"].trace_add("write", lambda *_a, rr=row: self._on_delta_changed(rr))
+        row["dbpm_var"].trace_add("write", lambda *_a, rr=row: self._on_delta_changed(rr))
+        row["noff_var"].trace_add("write", lambda *_a, rr=row: self._on_new_changed(rr))
+        row["nbpm_var"].trace_add("write", lambda *_a, rr=row: self._on_new_changed(rr))
+        row["bl_var"].trace_add("write", lambda *_a: self._on_toggle_var())
+        row["ts_var"].trace_add("write", lambda *_a: self._on_toggle_var())
+
+        self._bind_table_wheel(rf)   # recurses into every child widget
+        row["_hover"] = False
+        self._bind_row_hover(rf, row)
+        self._paint_row(row)
+
+        self.rows.append(row)
+        return row
+
+    def _regrid_rows(self):
+        """Order the row frames by old offset (their timeline position), so a
+        newly added red line slots in where it belongs rather than always at
+        the bottom. `self.rows` itself stays append-only — undo/redo snapshots
+        it positionally (see `_restore_state`) — only the grid rows are moved."""
+        for i, r in enumerate(sorted(self.rows, key=lambda rr: rr["old_time"])):
+            r["frame"].grid_configure(row=i + 1)
+            if r["_deleted"]:
+                r["frame"].grid_remove()   # grid_configure re-maps it — hide it again
+
+    # ---- validators / normalisers ----
+    @staticmethod
+    def _valid_sint(P):
+        if P in ("", "-"):
+            return True
+        if P.startswith("-"):
+            P = P[1:]
+        return P.isdigit()
+
+    @staticmethod
+    def _valid_snum(P):
+        if P in ("", "-", ".", "-."):
+            return True
+        body = P[1:] if P.startswith("-") else P
+        return body.count(".") <= 1 and body.replace(".", "", 1).isdigit()
+
+    @staticmethod
+    def _valid_offset(P):
+        return set(P) <= set("0123456789-:") and P.count("-") <= 1
+
+    def _bind_table_wheel(self, widget):
+        widget.bind("<MouseWheel>", self._table_wheel)
+        widget.bind("<Button-4>", lambda e: self._table_wheel(e, 1))
+        widget.bind("<Button-5>", lambda e: self._table_wheel(e, -1))
+        for child in widget.winfo_children():
+            self._bind_table_wheel(child)
+
+    def _table_wheel(self, event, direction=None):
+        if direction is None:
+            direction = 1 if getattr(event, "delta", 0) > 0 else -1
+        # If the whole table already fits (nothing to scroll), swallow the
+        # event rather than letting tk drift the canvas past its content or
+        # letting the wheel bubble up to an ancestor scrollable.
+        first, last = self.table_canvas.yview()
+        if first <= 0.0 and last >= 1.0:
+            return "break"
+        self.table_canvas.yview_scroll(-direction * 2, "units")
+        self._flush_table_redraw()
+        return "break"
+
+    def _table_yview(self, *args):
+        """Vertical-scroll entry point shared by the scrollbar and the wheel."""
+        self.table_canvas.yview(*args)
+        self._flush_table_redraw()
+
+    def _flush_table_redraw(self):
+        """Repaint the table straight after a scroll.
+
+        Scrolling a tk.Canvas that holds embedded widgets (every row packs
+        ~9 native LightEntry/LightSpinner sub-widgets) is done on Windows by
+        bit-blitting the old pixels and redrawing only the freshly-exposed
+        strip — the moved child windows get left behind as ghosts / doubled
+        rows / blank rows, which is the 'tearing' the user sees.
+
+        The fix that actually works (verified by screenshotting a repro of
+        this exact table): a full `update()` on the canvas — NOT
+        `update_idletasks()`. The stale pixels are cleared by real
+        expose/paint messages for the embedded native Entry windows, which
+        only the full message pump services; the Tcl idle queue alone
+        leaves them (an earlier `update_idletasks()` attempt, with or
+        without a -scrollregion poke to force a full-area redraw, still
+        showed doubled/blank rows). Re-entrancy-guarded for a second wheel
+        notch landing while this update() is still draining events."""
+        # Mark a scroll in progress so per-row hover repainting holds off
+        # until it settles (see _row_hover); reset on a trailing timer.
+        self._table_scrolling = True
+        job = getattr(self, "_table_scroll_settle_job", None)
+        if job is not None:
+            self.after_cancel(job)
+        self._table_scroll_settle_job = self.after(120, self._end_table_scroll)
+
+        if getattr(self, "_in_table_redraw", False):
+            return
+        self._in_table_redraw = True
+        try:
+            self.table_canvas.update()
+        except tk.TclError:
+            pass
+        finally:
+            self._in_table_redraw = False
+
+    def _end_table_scroll(self):
+        self._table_scroll_settle_job = None
+        self._table_scrolling = False
+        # Reconcile the row actually under the pointer now that the burst of
+        # scroll-time <Enter>/<Leave> events was ignored.
+        try:
+            w = self.winfo_containing(*self.winfo_pointerxy())
+        except tk.TclError:
+            w = None
+        for row in self.rows:
+            f = row.get("frame")
+            if f is None or row["_deleted"]:
+                continue
+            inside, cur = False, w
+            while cur is not None:
+                if cur is f:
+                    inside = True
+                    break
+                cur = getattr(cur, "master", None)
+            if row.get("_hover") != inside:
+                row["_hover"] = inside
+                self._paint_row(row)
+
+    def _align_columns(self):
+        """Each row is its own Frame with its own 9-column grid; keep those
+        columns lined up with each other and with the frozen header by
+        pushing the widest measured width per column onto every row frame +
+        the header frame as a `minsize`."""
+        if not self.rows:
+            return
+        ref = next((r["frame"] for r in self.rows if not r["_deleted"]), self.rows[0]["frame"])
+        self.hdr_frame.update_idletasks()
+        ref.update_idletasks()
+        for cidx in range(self.TABLE_COLS):
+            w = 0
+            for fr in (self.hdr_frame, ref):
+                bb = fr.grid_bbox(cidx, 0)
+                if bb:
+                    w = max(w, bb[2])
+            if w:
+                self.hdr_frame.grid_columnconfigure(cidx, minsize=w)
+                for r in self.rows:
+                    r["frame"].grid_columnconfigure(cidx, minsize=w)
+        self.table_inner.update_idletasks()   # so _sync_scrollregions sees settled reqwidth
+        self._sync_scrollregions()
+
+    def _sync_scrollregions(self):
+        """Pin both canvases to the SAME scroll width so an equal xview
+        fraction is an equal pixel offset — that's what keeps the frozen
+        header's columns lined up with the body's while scrolled sideways.
+
+        No update_idletasks() here on purpose: it's called from
+        table_inner's own <Configure> (layout already settled) and from
+        _align_columns (which does its own) — forcing a full relayout of a
+        40-row table here made delete-undo ~100ms.
+
+        Memoised on the measured geometry: Tk also fires <Configure> on
+        table_inner / hdr_frame every time the canvas *scrolls* them (a
+        position change, not a size change), and re-running the
+        configure(scrollregion=...) / configure(height=...) calls on every
+        scroll tick made the table visibly tear/smear as it scrolled. When
+        nothing that actually feeds these calls has changed, this is now a
+        no-op — the one xview sync that vertical scrolling doesn't need is
+        already done directly by _table_xview during a horizontal drag."""
+        tot_w = max(self.table_inner.winfo_reqwidth(), self.hdr_frame.winfo_reqwidth())
+        table_h = self.table_inner.winfo_reqheight()
+        hh = self.hdr_frame.winfo_reqheight()
+        geom = (tot_w, table_h, hh)
+        if geom == getattr(self, "_scroll_geom", None):
+            return
+        self._scroll_geom = geom
+        self.table_canvas.configure(scrollregion=(0, 0, tot_w, table_h))
+        self.hdr_canvas.configure(scrollregion=(0, 0, tot_w, hh), height=hh)
+        self.hdr_canvas.xview_moveto(self.table_canvas.xview()[0])
+
+    def _normalize_offset(self, row):
+        """On focus-out / Return, redisplay the New Offset field in canonical
+        `mm:ss:mmm` form (accepting either a raw ms number or a timestamp as
+        input). If it's unparseable, fall back to whatever the Δ implies."""
+        v = _parse_ms_timestamp(row["noff_var"].get())
+        if v is not None:
+            canon = _fmt_ms_timestamp(v)
+            if row["noff_var"].get() != canon:
+                row["noff_var"].set(canon)
+        else:
+            self._updating = True
+            try:
+                self._sync_new_from_delta(row)
+            finally:
+                self._updating = False
+
+    def _clamp_ts(self, row):
+        try:
+            v = int(float(row["ts_var"].get()))
+        except (ValueError, tk.TclError):
+            v = int(row["meter"]) if row["meter"] else 4
+        v = max(1, min(100, v))
+        row["ts_var"].set(str(v))
+
+    def _row_meter(self, row):
+        try:
+            return max(1, min(100, int(float(row["ts_var"].get()))))
+        except (ValueError, tk.TclError):
+            return int(row["meter"]) if row["meter"] else 4
+
+    @staticmethod
+    def _fmt_bpm(v):
+        return f"{v:.3f}".rstrip("0").rstrip(".") if v else "0"
+
+    @staticmethod
+    def _f(var):
+        try:
+            return float(var.get())
+        except (ValueError, tk.TclError):
+            return None
+
+    @staticmethod
+    def _f_off(var):
+        """Parse an offset field — an mm:ss:mmm timestamp (the canonical
+        display form now, leading '-' honoured) or a plain ms number."""
+        return _parse_ms_timestamp(var.get())
+
+    def _sync_new_from_delta(self, row):
+        doff = self._f(row["doff_var"])
+        dbpm = self._f(row["dbpm_var"])
+        if doff is not None:
+            row["noff_var"].set(_fmt_ms_timestamp(row["base_time"] + doff))
+        if dbpm is not None:
+            row["nbpm_var"].set(self._fmt_bpm(row["base_bpm"] + dbpm))
+
+    def _sync_delta_from_new(self, row):
+        nt = self._f_off(row["noff_var"])
+        nb = self._f(row["nbpm_var"])
+        if nt is not None:
+            row["doff_var"].set(str(int(round(nt - row["base_time"]))))
+        if nb is not None:
+            d = nb - row["base_bpm"]
+            row["dbpm_var"].set(f"{d:.1f}" if abs(d - round(d, 1)) < 1e-9 else self._fmt_bpm(d))
+
+    def _on_delta_changed(self, row):
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            self._sync_new_from_delta(row)
+        finally:
+            self._updating = False
+        self._after_row_edit(row)
+
+    def _on_new_changed(self, row):
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            self._sync_delta_from_new(row)
+        finally:
+            self._updating = False
+        self._after_row_edit(row)
+
+    def _after_row_edit(self, row):
+        if self._restoring:
+            return
+        self._redraw_timeline()
+        self._schedule_commit()
+
+    def _on_toggle_var(self):
+        """bl_var / ts_var trace — redraw the timeline and record an undo step."""
+        if self._restoring:
+            return
+        self._redraw_timeline()
+        self._schedule_commit()
+
+    # ---- selection (the "Sel" checkboxes → Delete) --------------------
+    def _selected_rows(self):
+        return [r for r in self.rows if not r["_deleted"] and r["sel_var"].get()]
+
+    def _visible_rows(self):
+        return [r for r in self.rows if not r["_deleted"]]
+
+    def _set_row_visible(self, row, visible):
+        """Show / hide a row's Frame — Tk collapses the empty grid slot so
+        the rows below move up, and `grid()` restores it at its original
+        position. Widgets are never destroyed, so delete undo/redo is a
+        single grid toggle per changed row."""
+        if (not row["_deleted"]) == visible:
+            return
+        row["_deleted"] = not visible
+        row["frame"].grid() if visible else row["frame"].grid_remove()
+
+    def _on_selection_changed(self):
+        self._sync_delete_button()
+        for r in self.rows:
+            self._paint_row(r)
+
+    # ---- per-row hover / selection tint ------------------------------
+    ROW_BG_NORMAL = FRONT_CARD_BG
+    ROW_BG_HOVER = "#f4f6fe"
+    ROW_BG_SEL = LIGHT_ACCENT_SOFT          # lavender
+    ROW_BG_SEL_HOVER = "#e3e7fb"
+
+    def _row_bg(self, row):
+        sel = row["sel_var"].get()
+        hov = row.get("_hover")
+        if sel:
+            return self.ROW_BG_SEL_HOVER if hov else self.ROW_BG_SEL
+        return self.ROW_BG_HOVER if hov else self.ROW_BG_NORMAL
+
+    def _paint_row(self, row):
+        c = self._row_bg(row)
+        f = row.get("frame")
+        if f is None or str(f.cget("bg")) == c:
+            return
+        # Tint the row frame + the widgets' own frames / canvases (cheap
+        # `configure` only — never their `_redraw`, since a mouse gliding
+        # over rows fires this a lot). The spinner/entry rounded-rect fill
+        # and the checkbox glyph stay white, but everything around them
+        # tints, so the row reads as highlighted without any widget churn.
+        f.configure(bg=c)
+        for w in f.winfo_children():
+            self._tint_bg(w, c)
+            for attr in ("icon", "label", "canvas", "up_canvas", "down_canvas"):
+                self._tint_bg(getattr(w, attr, None), c)
+            for sub in w.winfo_children():
+                self._tint_bg(sub, c)
+
+    @staticmethod
+    def _tint_bg(w, c):
+        if w is None:
+            return
+        try:
+            w.configure(bg=c)
+        except tk.TclError:
+            pass
+
+    def _bind_row_hover(self, widget, row):
+        widget.bind("<Enter>", lambda _e, rr=row: self._row_hover(rr, True), add="+")
+        widget.bind("<Leave>", lambda _e, rr=row: self._row_hover(rr, False), add="+")
+        for child in widget.winfo_children():
+            self._bind_row_hover(child, row)
+
+    def _row_hover(self, row, entering):
+        # While the table is actively scrolling, rows slide past the
+        # stationary pointer and fire a burst of <Enter>/<Leave>; repainting
+        # ~30 sub-widgets per crossed row mid-scroll fights the scroll blit
+        # and adds to the tearing. Skip hover tinting until scrolling stops.
+        if getattr(self, "_table_scrolling", False):
+            return
+        if entering:
+            if not row.get("_hover"):
+                row["_hover"] = True
+                self._paint_row(row)
+        else:
+            # <Leave> also fires when the pointer just crosses between two
+            # of the row's own widgets — only clear once it has genuinely
+            # left the row frame's subtree.
+            self.after(15, lambda: self._maybe_unhover(row))
+
+    def _maybe_unhover(self, row):
+        if not row.get("_hover") or row["_deleted"]:
+            return
+        f = row.get("frame")
+        try:
+            w = self.winfo_containing(*self.winfo_pointerxy())
+        except tk.TclError:
+            w = None
+        while w is not None:
+            if w is f:
+                return
+            w = getattr(w, "master", None)
+        row["_hover"] = False
+        self._paint_row(row)
+
+    def _sync_delete_button(self):
+        btn = getattr(self, "del_sel_btn", None)
+        if btn is None:
+            return
+        n = len(self._selected_rows())
+        if n:
+            btn.configure(text=f"Delete selected ({n})")
+            if not btn.winfo_ismapped():
+                btn.pack(side="right", padx=(0, 10))
+        elif btn.winfo_ismapped():
+            btn.pack_forget()
+
+    def _delete_selected(self):
+        sel = self._selected_rows()
+        if not sel:
+            return
+        if len(sel) >= len(self._visible_rows()):
+            _show_alert(self, "Can't delete all",
+                        "A map needs at least one timing point — leave one unselected.")
+            return
+        self._flush_commit()
+        for r in sel:
+            r["sel_var"].set(False)
+            self._set_row_visible(r, False)
+        self._sync_delete_button()
+        self._sync_scrollregions()
+        self._commit_state()
+        self._redraw_timeline()
+
+    def _add_redline(self):
+        if not self.rows:
+            _show_alert(self, "No map", "Load a map with existing timing first.")
+            return
+        self._flush_commit()   # settle any pending edits as their own undo step
+        reds = self._new_redlines()
+        t = self.cursor_ms
+        gov = None
+        for d in reds:
+            if d["t"] <= t + 1e-6:
+                gov = d
+        src_row = gov["row"] if gov else (self.rows[0] if self.rows else None)
+        src_bl = gov["bl"] if gov else (reds[0]["bl"] if reds else 500.0)
+        meter = src_row["meter"] if src_row else 4
+        s_set = src_row["sample_set"] if src_row else 0
+        s_idx = src_row["sample_index"] if src_row else 0
+        vol = src_row["volume"] if src_row else 100
+        new_row = self._make_row(old_time=t, old_bl=src_bl, is_new=True, meter=meter,
+                                  sample_set=s_set, sample_index=s_idx, volume=vol, effects=0)
+        self._regrid_rows()
+        # Select just the new row so it's easy to spot in the panel (Sel isn't
+        # part of undo history, so this doesn't affect the commit below).
+        for r in self.rows:
+            want = r is new_row
+            if r["sel_var"].get() != want:
+                r["sel_var"].set(want)
+        self._on_selection_changed()
+        self._align_columns()
+        self._scroll_row_to_top(new_row)
+        self._redraw_timeline()
+        self._commit_state()   # the add is its own undo step
+
+    # ------------------------------------------------------------------
+    # Undo / redo (table state)
+    # ------------------------------------------------------------------
+    def _capture_state(self):
+        rows = []
+        for r in self.rows:
+            rows.append((
+                bool(r["_deleted"]),
+                bool(r["is_new"]), r["old_time"], r["old_bl"], int(r["meter"]),
+                int(r["sample_set"]), int(r["sample_index"]), int(r["volume"]),
+                int(r["effects"]),
+                r["doff_var"].get(), r["dbpm_var"].get(), bool(r["bl_var"].get()),
+                r["noff_var"].get(), r["nbpm_var"].get(), r["ts_var"].get(),
+            ))
+        return tuple(rows)
+
+    @staticmethod
+    def _states_equal(a, b):
+        """Two states are equal even if one has fewer records — the missing
+        trailing rows just have to be 'deleted' in the longer one (a row
+        added then undone leaves a hidden record that isn't in an older
+        snapshot)."""
+        for i in range(max(len(a), len(b))):
+            ra = a[i] if i < len(a) else None
+            rb = b[i] if i < len(b) else None
+            if ra is None:
+                if not (rb and rb[0]):
+                    return False
+            elif rb is None:
+                if not ra[0]:
+                    return False
+            elif ra != rb:
+                return False
+        return True
+
+    def _schedule_commit(self):
+        if self._restoring or self._committed_state is None:
+            return
+        if self._commit_job is not None:
+            try:
+                self.after_cancel(self._commit_job)
+            except Exception:
+                pass
+        self._commit_job = self.after(450, self._commit_state)
+
+    def _flush_commit(self):
+        if self._commit_job is not None:
+            try:
+                self.after_cancel(self._commit_job)
+            except Exception:
+                pass
+            self._commit_job = None
+        self._commit_state()
+
+    def _commit_state(self):
+        self._commit_job = None
+        if self._restoring or self._committed_state is None:
+            return
+        snap = self._capture_state()
+        if self._states_equal(snap, self._committed_state):
+            return
+        self._undo_stack.append(self._committed_state)
+        if len(self._undo_stack) > 200:
+            self._undo_stack.pop(0)
+        self._committed_state = snap
+        self._redo_stack.clear()
+        self._update_undo_buttons()
+
+    def _cancel_commit_job(self):
+        if self._commit_job is not None:
+            try:
+                self.after_cancel(self._commit_job)
+            except Exception:
+                pass
+            self._commit_job = None
+
+    def _undo(self):
+        self._flush_commit()
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._capture_state())
+        self._restore_state(self._undo_stack.pop())
+        # re-capture: after restoring a (possibly shorter) snapshot,
+        # self.rows may still hold hidden rows the snapshot didn't have.
+        self._committed_state = self._capture_state()
+        self._update_undo_buttons()
+
+    def _redo(self):
+        self._cancel_commit_job()
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._capture_state())
+        self._restore_state(self._redo_stack.pop())
+        self._committed_state = self._capture_state()
+        self._update_undo_buttons()
+
+    def _update_undo_buttons(self):
+        for btn, stack in ((getattr(self, "undo_btn", None), self._undo_stack),
+                            (getattr(self, "redo_btn", None), self._redo_stack)):
+            if btn is not None:
+                btn.configure(state="normal" if stack else "disabled")
+        rb = getattr(self, "revert_btn", None)
+        if rb is not None:
+            dirty = (self._initial_state is not None and self.rows
+                     and not self._states_equal(self._capture_state(), self._initial_state))
+            rb.configure(state="normal" if dirty else "disabled")
+
+    def _revert(self):
+        """Restore the map's timing to how it was at load — as a single
+        undoable step (Undo / Ctrl+Z brings all the changes back)."""
+        if self._initial_state is None:
+            return
+        self._flush_commit()
+        if self._states_equal(self._capture_state(), self._initial_state):
+            return
+        self._redo_stack.clear()
+        self._undo_stack.append(self._capture_state())
+        if len(self._undo_stack) > 200:
+            self._undo_stack.pop(0)
+        self._restore_state(self._initial_state)
+        self._committed_state = self._capture_state()
+        self._update_undo_buttons()
+
+    def _restore_state(self, snap):
+        """Reapply a captured state. Rows are never destroyed (only hidden),
+        and `self.rows` only ever grows — so this is always a pure in-place
+        update: set each row's vars + visibility from its snapshot record.
+        Rows added *after* this snapshot was taken (index past its length)
+        are just hidden. No widget churn → every undo/redo is instant,
+        deletions included."""
+        self._restoring = True
+        try:
+            self._updating = True
+            try:
+                for i, row in enumerate(self.rows):
+                    if i < len(snap):
+                        rec = snap[i]
+                        (deleted, _isn, _ot, _ob, _m, _ss, _si, _v, _e,
+                         doff, dbpm, blv, noff, nbpm, ts) = rec
+                        for var, val in ((row["doff_var"], doff), (row["dbpm_var"], dbpm),
+                                          (row["noff_var"], noff), (row["nbpm_var"], nbpm),
+                                          (row["ts_var"], ts)):
+                            if var.get() != val:
+                                var.set(val)
+                        if bool(row["bl_var"].get()) != blv:
+                            row["bl_var"].set(blv)
+                    else:
+                        deleted = True   # this row was added after the snapshot
+                    self._set_row_visible(row, not deleted)
+            finally:
+                self._updating = False
+        finally:
+            self._restoring = False
+
+        self.empty_lbl.grid_remove() if self._visible_rows() else self.empty_lbl.grid()
+        self._sync_scrollregions()
+        self._sync_delete_button()
+        for r in self.rows:
+            r["_hover"] = False
+            self._paint_row(r)
+        self._redraw_timeline()
+
+    # ------------------------------------------------------------------
+    # Timeline
+    # ------------------------------------------------------------------
+    def _divisor_denom(self):
+        """Beat subdivision for the current snap setting — None for the
+        "None" option (barlines only; a whole bar is the step/snap unit)."""
+        return self.DIVISOR_DENOMS.get(self.divisor_var.get())
+
+    def _gov_at(self, t):
+        reds = self._new_redlines()
+        if not reds:
+            return None
+        gov = reds[0]
+        for r in reds:
+            if r["t"] <= t + 1e-6:
+                gov = r
+            else:
+                break
+        return gov
+
+    def _snap_unit_at(self, t):
+        """ms between snap points around `t` — a bar for "None", else a
+        beat subdivision — plus the governing red line's own time."""
+        gov = self._gov_at(t)
+        if gov is None:
+            return None, 0.0
+        denom = self._divisor_denom()
+        if denom is None:
+            unit = gov["bl"] * max(1, self._row_meter(gov["row"]))
+        else:
+            unit = gov["bl"] / denom
+        return gov["t"], unit
+
+    def _step_divisor(self, delta):
+        i = self.DIVISOR_OPTIONS.index(self.divisor_var.get())
+        i = max(0, min(len(self.DIVISOR_OPTIONS) - 1, i + delta))
+        self.divisor_var.set(self.DIVISOR_OPTIONS[i])
+
+    def _timeline_w(self):
+        return (self.timeline.winfo_width() or 1000)
+
+    def _cursor_x(self):
+        return self.LEFT_PAD + self.CURSOR_FRAC * max(1, self._timeline_w() - 2 * self.LEFT_PAD)
+
+    def _view_start(self):
+        """Left-edge timestamp — derived so cursor_ms always lands at _cursor_x()."""
+        return self.cursor_ms - (self._cursor_x() - self.LEFT_PAD) / self.px_per_ms
+
+    def _visible_ms(self):
+        return (self._timeline_w() - 2 * self.LEFT_PAD) / self.px_per_ms
+
+    def _total_ms(self):
+        last = max((r["t"] for r in self._new_redlines()), default=0.0)
+        wav = len(self._peaks) * self._bucket_ms if self._peaks else 0.0
+        return max(last + 4000.0, wav, 10000.0)
+
+    def _clamp_cursor(self):
+        self.cursor_ms = max(-2000.0, min(self._total_ms(), self.cursor_ms))
+
+    def _t_to_x(self, t):
+        return self.LEFT_PAD + (t - self._view_start()) * self.px_per_ms
+
+    def _x_to_t(self, x):
+        return self._view_start() + (x - self.LEFT_PAD) / self.px_per_ms
+
+    def _new_redlines(self, exclude=None):
+        res = []
+        for r in self.rows:
+            if r is exclude or r["_deleted"]:
+                continue
+            t = self._f_off(r["noff_var"])
+            bpm = self._f(r["nbpm_var"])
+            if t is None or not bpm or bpm <= 0:
+                continue
+            res.append({"t": t, "bl": 60000.0 / bpm, "row": r})
+        res.sort(key=lambda d: d["t"])
+        return res
+
+    def _snap_t(self, t, exclude=None):
+        reds = self._new_redlines(exclude=exclude)
+        if not reds:
+            return t
+        gov = reds[0]
+        for r in reds:
+            if r["t"] <= t + 1e-6:
+                gov = r
+            else:
+                break
+        denom = self._divisor_denom()
+        if denom is None:
+            unit = gov["bl"] * max(1, self._row_meter(gov["row"]))
+        else:
+            unit = gov["bl"] / denom
+        if unit <= 0:
+            return t
+        k = round((t - gov["t"]) / unit)
+        return gov["t"] + k * unit
+
+    def _tick_style(self, k, denom):
+        if denom <= 1 or k % denom == 0:
+            return ("#000000", 44)
+        fr = Fraction(k % denom, denom)
+        return self.TICK_STYLES.get(fr.denominator, ("#f5a623", 22))
+
+    def _redraw_timeline(self, *_a):
+        c = getattr(self, "timeline", None)
+        if c is None:
+            return
+        c.delete("all")
+        W = c.winfo_width() or 1000
+        H = self.TIMELINE_H
+        reds = self._new_redlines()
+        denom = self._divisor_denom()
+
+        # Render the visible window plus a generous margin on each side and
+        # tag every grid/red-line item "scroll" — playback then just
+        # canvas.move()s them (see _pan_timeline) instead of re-rendering.
+        vis_ms = self._visible_ms()
+        margin = vis_ms * 0.85
+        draw0 = self._view_start() - margin
+        draw1 = self._view_start() + vis_ms + margin
+        self._rendered_lo, self._rendered_hi = draw0, draw1
+        self._panned_cursor = self.cursor_ms
+
+        for i, r in enumerate(reds):
+            seg_start = r["t"] if i > 0 else -1e18
+            seg_end = reds[i + 1]["t"] if i + 1 < len(reds) else 1e18
+            bl = r["bl"]
+            if bl <= 0:
+                continue
+            meter = max(1, self._row_meter(r["row"]))
+            omit_bar = bool(r["row"]["bl_var"].get())
+            lo = max(seg_start, draw0)
+            hi = min(seg_end, draw1)
+            if hi < lo:
+                continue
+
+            # --- barlines (always drawn, at every `meter` beats) ---
+            bar_len = bl * meter
+            if bar_len * self.px_per_ms >= 3:
+                b0 = math.floor((lo - r["t"]) / bar_len) - 1
+                b1 = math.ceil((hi - r["t"]) / bar_len) + 1
+                if b1 - b0 <= 8000:
+                    for b in range(b0, b1 + 1):
+                        t = r["t"] + b * bar_len
+                        if t < seg_start - 1e-6 or t > seg_end + 1e-6 or t < draw0 or t > draw1:
+                            continue
+                        x = self._t_to_x(t)
+                        if omit_bar and b == 0:   # BL omits only the FIRST barline
+                            c.create_line(x, H, x, H - 44, fill="#000000", width=1, tags="scroll")
+                        else:
+                            c.create_line(x, 4, x, H, fill="#000000", width=3, tags="scroll")
+
+            # --- beat + sub ticks (skipped entirely when snap is "None") ---
+            if denom is None:
+                continue
+            sub = bl / denom
+            if sub * self.px_per_ms >= 4:
+                step, d = sub, denom
+            elif bl * self.px_per_ms >= 4:
+                step, d = bl, 1
+            else:
+                continue
+            k0 = math.floor((lo - r["t"]) / step) - 1
+            k1 = math.ceil((hi - r["t"]) / step) + 1
+            if k1 - k0 > 10000:
+                continue
+            for k in range(k0, k1 + 1):
+                t = r["t"] + k * step
+                if t < seg_start - 1e-6 or t > seg_end + 1e-6 or t < draw0 or t > draw1:
+                    continue
+                beat_no = k // d
+                if k % d == 0 and beat_no % meter == 0:
+                    continue   # already drawn as a barline above
+                x = self._t_to_x(t)
+                if k % d == 0:
+                    c.create_line(x, H, x, H - 44, fill="#000000", width=1, tags="scroll")
+                else:
+                    color, ht = self._tick_style(k, d)
+                    c.create_line(x, H, x, H - ht, fill=color, tags="scroll")
+
+        for r in reds:
+            if r["t"] < draw0 or r["t"] > draw1:
+                continue
+            x = self._t_to_x(r["t"])
+            dash = () if not r["row"]["bl_var"].get() else (5, 3)
+            c.create_line(x, 0, x, H, fill="#e8462e", width=2, dash=dash, tags="scroll")
+            c.create_text(x + 3, 3, anchor="nw", fill="#e8462e", font=("Segoe UI", 8, "bold"),
+                           text=(f"{_fmt_ms_timestamp(r['t'])}\n{60000.0 / r['bl']:.1f} BPM"
+                                 f"\n{max(1, self._row_meter(r['row']))}/4"),
+                           tags="scroll")
+
+        # the fixed "current time" line (never tagged "scroll")
+        cx = self._cursor_x()
+        c.create_line(cx, 0, cx, H, fill="#5b5b5b", width=1, tags="cursor")
+        self._cursor_text_id = c.create_text(
+            cx + 3, H * 0.5, anchor="nw", fill="#4a4a4a", font=("Segoe UI", 8, "bold"),
+            text=_fmt_ms_timestamp(self.cursor_ms), tags="cursor")
+
+        self._redraw_waveform(draw0, draw1)
+        self._sync_seek_scrollbar()
+
+    def _toggle_wave_mode(self, _e=None):
+        """Double-click the waveform → flip between the raw amplitude
+        envelope and "onset" view (detected note attacks)."""
+        self._wave_mode = "onset" if self._wave_mode == "amplitude" else "amplitude"
+        self._redraw_timeline()
+        return "break"
+
+    def _compute_onsets(self):
+        """Energy-based onset detection over the (5ms/bucket) peak envelope:
+        half-wave-rectified first difference of a lightly smoothed curve,
+        then adaptive-threshold local-max peak-picking. Returns onset
+        *bucket indices* (file-time = idx * bucket_ms)."""
+        peaks = self._peaks
+        if not peaks:
+            return []
+        n = len(peaks)
+        bm = self._bucket_ms
+        # 3-tap smooth
+        s = [peaks[0]] * n
+        for i in range(1, n - 1):
+            s[i] = (peaks[i - 1] + 2.0 * peaks[i] + peaks[i + 1]) * 0.25
+        # half-wave-rectified difference = onset strength
+        flux = [0.0] * n
+        for i in range(1, n):
+            d = s[i] - s[i - 1]
+            if d > 0:
+                flux[i] = d
+        pref = [0.0] * (n + 1)
+        for i in range(n):
+            pref[i + 1] = pref[i] + flux[i]
+        mx = max(flux) or 1.0
+        win = max(1, int(160.0 / bm))       # ~160ms local-mean window
+        min_gap = max(1, int(45.0 / bm))    # ~45ms minimum onset spacing
+        onsets = []
+        last = -10 ** 9
+        for i in range(1, n - 1):
+            f = flux[i]
+            if f <= flux[i - 1] or f < flux[i + 1]:
+                continue
+            lo, hi = max(0, i - win), min(n, i + win + 1)
+            local_mean = (pref[hi] - pref[lo]) / (hi - lo)
+            if f < local_mean * 2.2 + mx * 0.05:
+                continue
+            if i - last < min_gap:
+                if onsets and f > flux[onsets[-1]]:
+                    onsets[-1] = i
+                    last = i
+                continue
+            onsets.append(i)
+            last = i
+        return onsets
+
+    def _iter_barline_x(self, reds, draw0, draw1):
+        """Canvas x of every barline in [draw0, draw1] — the same grid the
+        timeline draws (see the barline block in `_redraw_timeline`; the math
+        is intentionally duplicated rather than shared, to keep that hot path
+        untouched). An omitted first barline is skipped. Used by the optional
+        "Display barlines in waveform view" overlay."""
+        for i, r in enumerate(reds):
+            seg_start = r["t"] if i > 0 else -1e18
+            seg_end = reds[i + 1]["t"] if i + 1 < len(reds) else 1e18
+            bl = r["bl"]
+            if bl <= 0:
+                continue
+            meter = max(1, self._row_meter(r["row"]))
+            omit_bar = bool(r["row"]["bl_var"].get())
+            lo = max(seg_start, draw0)
+            hi = min(seg_end, draw1)
+            if hi < lo:
+                continue
+            bar_len = bl * meter
+            if bar_len * self.px_per_ms < 3:
+                continue
+            b0 = math.floor((lo - r["t"]) / bar_len) - 1
+            b1 = math.ceil((hi - r["t"]) / bar_len) + 1
+            if b1 - b0 > 8000:
+                continue
+            for b in range(b0, b1 + 1):
+                if omit_bar and b == 0:
+                    continue
+                t = r["t"] + b * bar_len
+                if t < seg_start - 1e-6 or t > seg_end + 1e-6 or t < draw0 or t > draw1:
+                    continue
+                yield self._t_to_x(t)
+
+    def _redraw_waveform(self, draw0=None, draw1=None):
+        c = getattr(self, "wave", None)
+        if c is None:
+            return
+        c.delete("all")
+        W = c.winfo_width() or 1000
+        H = self.WAVE_H
+        mid = H / 2
+        if draw0 is None:
+            vis_ms = self._visible_ms()
+            draw0 = self._view_start() - vis_ms * 0.85
+            draw1 = self._view_start() + vis_ms + vis_ms * 0.85
+        onset_mode = self._wave_mode == "onset"
+
+        if not self._peaks:
+            c.create_text(W / 2, mid, text=self._wave_msg, fill=FRONT_TEXT_MUTED,
+                           font=("Segoe UI", 9))
+        else:
+            peaks = self._peaks
+            n = len(peaks)
+            bm = self._bucket_ms
+            off = self.WAVEFORM_VISUAL_OFFSET_MS
+            xa = max(-3000, int(self._t_to_x(draw0)))
+            xb = min(int(W) + 3000, int(self._t_to_x(draw1)) + 1)
+            top, bot = [], []
+            for x in range(xa, xb):
+                # sample 20ms later in the file than the grid time at this x
+                # (matches osu!lazer's WAVEFORM_VISUAL_OFFSET, see class const)
+                t = self._x_to_t(x) + off
+                bi = int(t / bm) if t >= 0 else -1
+                a = peaks[bi] * (mid - 1) if 0 <= bi < n else 0.0
+                top.append(x); top.append(mid - a)
+                bot.append(x); bot.append(mid + a)
+            # one filled polygon (top envelope + reversed bottom) instead of
+            # ~W separate create_line calls — the per-item overhead was what
+            # made playback scroll stutter. Dimmed in onset mode so the
+            # detected-attack lines read on top.
+            if len(top) >= 4:
+                poly = top + [v for i in range(len(bot) - 2, -1, -2) for v in (bot[i], bot[i + 1])]
+                c.create_polygon(poly, fill="#e7dff4" if onset_mode else "#c9b8ea",
+                                  outline="", tags="scroll")
+
+            if onset_mode:
+                if self._onsets is None:
+                    self._onsets = self._compute_onsets()
+                for idx in self._onsets:
+                    ot = idx * bm - off        # onset file time -> grid time
+                    if ot < draw0 or ot > draw1:
+                        continue
+                    x = self._t_to_x(ot)
+                    c.create_line(x, 2, x, H - 2, fill="#12a594", width=1, tags="scroll")
+
+        reds = self._new_redlines()
+        if self.wave_barlines_var.get():
+            for x in self._iter_barline_x(reds, draw0, draw1):
+                c.create_line(x, 0, x, H, fill="#000000", width=1, tags="scroll")
+
+        for r in reds:
+            if r["t"] < draw0 or r["t"] > draw1:
+                continue
+            x = self._t_to_x(r["t"])
+            dash = () if not r["row"]["bl_var"].get() else (4, 3)
+            c.create_line(x, 0, x, H, fill="#e8462e", width=1, dash=dash, tags="scroll")
+        c.create_line(self._cursor_x(), 0, self._cursor_x(), H, fill="#5b5b5b", width=1,
+                       tags="cursor")
+        c.create_text(W - 4, 2, anchor="ne", fill=FRONT_TEXT_MUTED, font=("Segoe UI", 8),
+                       text=("onsets — dbl-click for wave" if onset_mode
+                              else "wave — dbl-click for onsets"))
+
+    def _pan_timeline(self, new_cursor):
+        """Cheap playback frame — translate the pre-rendered grid/waveform
+        by the elapsed delta instead of re-rendering; only fall back to a
+        full _redraw_timeline once the view has scrolled past the margin."""
+        c1 = getattr(self, "timeline", None)
+        c2 = getattr(self, "wave", None)
+        if c1 is None or c2 is None:
+            return
+        new_cursor = max(-2000.0, min(self._total_ms(), new_cursor))
+        d = new_cursor - self._panned_cursor
+        if d:
+            dx = -d * self.px_per_ms
+            c1.move("scroll", dx, 0)
+            c2.move("scroll", dx, 0)
+            self._panned_cursor = new_cursor
+        self.cursor_ms = new_cursor
+        if self._cursor_text_id is not None:
+            try:
+                c1.itemconfigure(self._cursor_text_id, text=_fmt_ms_timestamp(new_cursor))
+            except tk.TclError:
+                pass
+        self._sync_seek_scrollbar()
+        vs = self._view_start()
+        if vs < self._rendered_lo or vs + self._visible_ms() > self._rendered_hi:
+            self._redraw_timeline()
+
+    def _decode_wave(self, path, token):
+        peaks, _dur = logic.decode_audio_peaks(path, self.BUCKETS_PER_SEC)
+        self.after(0, lambda: self._on_peaks(peaks, token))
+
+    def _on_peaks(self, peaks, token):
+        if token != self._wave_token or not self.winfo_exists():
+            return  # a newer map was loaded while this decode was running
+        if peaks:
+            self._peaks = peaks
+            self._onsets = None
+        else:
+            self._wave_msg = "Waveform decode failed"
+        # full redraw so the seek scrollbar's range picks up the song length
+        self._redraw_timeline()
+
+    # ------------------------------------------------------------------
+    # Audio playback (VLC) — the timeline scrolls with the playhead
+    # ------------------------------------------------------------------
+    def _toggle_play(self):
+        if self._playing:
+            self._pause_audio()
+            return
+        if self._player is not None:
+            self._resume_audio()
+            return
+        if not self.rows:
+            _show_alert(self, "No map", "Load a map with timing first.")
+            return
+        if logic.vlc_available():
+            self._start_audio()
+            return
+        if _ask_vlc_required_choice(self) == "cancel":
+            return
+
+        def work(_cancel):
+            logic.install_vlc_bundled()
+
+        self.app.run_cancellable_job(
+            "Installing VLC (may take a few minutes)... Please wait...", work,
+            on_success=lambda _r: (self.notify_done("VLC installed."), self._start_audio()),
+            on_error=lambda m: _show_alert(self, "Error", m),
+            cancelled_toast="Installation Cancelled!")
+
+    def _audio_path(self):
+        folder, _ = self.app.get_diff_files()
+        a = logic.get_audio_filename(folder)
+        p = os.path.join(folder, a) if a else None
+        return p if p and os.path.exists(p) else None
+
+    def _start_audio(self):
+        path = self._audio_path()
+        if not path:
+            _show_alert(self, "No audio", "Couldn't find this map's audio file.")
+            return
+        try:
+            import vlc
+            self._vlc = vlc
+            if self._vlc_instance is None:
+                self._vlc_instance = (vlc.Instance() if os.name == "nt"
+                                       else vlc.Instance("--no-xlib"))
+            self._player = self._vlc_instance.media_player_new()
+            self._player.set_media(self._vlc_instance.media_new(path))
+            self._player.play()
+        except Exception as e:
+            self._player = None
+            _show_alert(self, "Playback error", str(e))
+            return
+        self._playing = True
+        self.play_btn.configure(text="⏸")
+        start = int(max(0.0, self.cursor_ms))
+        self._reset_play_anchor(start, latency=0.15)
+        self._redraw_timeline()   # fresh render extent for the pan loop
+        # libVLC only honours set_time once the player is actually Playing
+        if start > 60:
+            self.after(150, lambda: self._safe_set_time(start))
+        self._tick_play()
+
+    def _resume_audio(self):
+        try:
+            self._player.set_pause(0)
+        except Exception:
+            self._player = None
+            self._start_audio()
+            return
+        self._playing = True
+        self.play_btn.configure(text="⏸")
+        cur = int(max(0.0, self.cursor_ms))
+        self._reset_play_anchor(cur, latency=0.06)
+        self._safe_set_time(cur)
+        self._tick_play()
+
+    def _reset_play_anchor(self, ms, latency=0.0):
+        t = time.monotonic()
+        self._play_anchor_ms = float(ms)
+        self._play_anchor_wall = t + latency   # audio won't actually reach `ms` until ~now+latency
+        self._play_floor_ms = float(ms)
+        self._seek_guard_until = t + latency + 0.2
+
+    def _pause_audio(self):
+        self._playing = False
+        self.play_btn.configure(text="▶")
+        for attr in ("_play_after", "_seek_job"):
+            job = getattr(self, attr)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._pending_seek_ms = None
+        try:
+            if self._player is not None:
+                self._player.set_pause(1)   # explicit, not pause() which toggles
+        except Exception:
+            pass
+
+    def _stop_audio(self):
+        self._pause_audio()
+        try:
+            if self._player is not None:
+                self._player.stop()
+                self._player.release()
+        except Exception:
+            pass
+        self._player = None
+
+    def _safe_set_time(self, ms):
+        try:
+            if self._player is None:
+                return
+            ms = int(max(0, ms))
+            # Pause across the jump, then resume a moment later: a set_time()
+            # on a Playing player lets libVLC's audio clock run fast to
+            # "catch up" to the new position — that's the pitch-up
+            # ("chipmunk") artifact. Making it a discrete paused jump costs
+            # a ~40ms gap instead.
+            if self._playing:
+                try:
+                    self._player.set_pause(1)
+                except Exception:
+                    pass
+            self._player.set_time(ms)
+            self._reset_play_anchor(ms, latency=0.12)
+            if self._playing:
+                self.after(40, self._resume_after_seek)
+        except Exception:
+            pass
+
+    def _resume_after_seek(self):
+        try:
+            if self._playing and self._player is not None:
+                self._player.set_pause(0)
+        except Exception:
+            pass
+
+    def _tick_play(self):
+        if not self._playing or self._player is None:
+            return
+        try:
+            state = self._player.get_state()
+            vt = self._player.get_time()
+        except Exception:
+            self._stop_audio()
+            return
+        V = self._vlc
+        if V is not None and state in (V.State.Ended, V.State.Error, V.State.Stopped):
+            self._stop_audio()
+            return
+
+        now = time.monotonic()
+        # free-running estimate from the anchor (this is what makes the
+        # scroll advance every frame instead of once per libVLC update)
+        est = self._play_anchor_ms + (now - self._play_anchor_wall) * 1000.0
+        if now >= self._seek_guard_until and vt is not None and vt >= 0:
+            drift = vt - est
+            if abs(drift) > 200.0:          # discontinuity (user seeked, buffer skip) — hard resync
+                self._play_anchor_ms = float(vt)
+                self._play_anchor_wall = now
+                est = float(vt)
+            else:                            # ease the anchor toward reality (~10%/frame)
+                corr = drift * 0.10
+                self._play_anchor_ms += corr
+                est += corr
+        # never scroll backward during continuous playback / before the seek target
+        est = max(est, self._play_floor_ms, self._panned_cursor - 0.5)
+        self._pan_timeline(est)
+        self._play_after = self.after(20, self._tick_play)
+
+    def _audio_seek_to_cursor(self):
+        """Keep the audio playhead in step with a manual scroll/seek while
+        playing (no-op when paused). **Debounced** — a drag / spun wheel /
+        held arrow fires this dozens of times a second, and hammering
+        libVLC's set_time() that fast makes its audio engine play catch-up
+        bursts that sound pitched-up ("chipmunk"). Instead we only issue
+        one real seek ~110ms after the motion settles; the audio keeps
+        playing from where it was until then."""
+        if not self._playing:
+            return
+        self._pending_seek_ms = max(0.0, self.cursor_ms)
+        if self._seek_job is not None:
+            try:
+                self.after_cancel(self._seek_job)
+            except Exception:
+                pass
+        self._seek_job = self.after(110, self._flush_pending_seek)
+
+    def _flush_pending_seek(self):
+        self._seek_job = None
+        if self._playing and self._pending_seek_ms is not None:
+            self._safe_set_time(int(self._pending_seek_ms))
+        self._pending_seek_ms = None
+
+    # ---- timeline input ----
+    #
+    # The "current time" line is pinned at _cursor_x(); every scroll moves
+    # cursor_ms and the visible window follows. Dragging a red line still
+    # edits its New Offset; dragging empty space scrolls; a plain click
+    # brings the clicked instant onto the current-time line.
+    def _tl_press(self, e):
+        self.timeline.focus_set()   # so ← → arrow keys step the timeline
+        self._drag_x0 = e.x
+        self._drag_cursor0 = self.cursor_ms
+        self._drag_moved = False
+        self._drag_red = None
+        for r in self._new_redlines():
+            if abs(self._t_to_x(r["t"]) - e.x) <= 5:
+                self._drag_red = r["row"]
+                break
+
+    def _tl_motion(self, e):
+        if abs(e.x - self._drag_x0) > 2:
+            self._drag_moved = True
+        if self._drag_red is not None:
+            t = self._snap_t(self._x_to_t(e.x), exclude=self._drag_red)
+            self._drag_red["noff_var"].set(_fmt_ms_timestamp(t))
+        else:
+            self.cursor_ms = self._drag_cursor0 - (e.x - self._drag_x0) / self.px_per_ms
+            self._clamp_cursor()
+            self._redraw_timeline()
+            self._audio_seek_to_cursor()
+
+    def _tl_release(self, e):
+        if self._suppress_release:
+            self._suppress_release = False
+            self._drag_red = None
+            return
+        if self._drag_red is None and not self._drag_moved:
+            self.cursor_ms = self._x_to_t(e.x)
+            self._clamp_cursor()
+            self._redraw_timeline()
+            self._audio_seek_to_cursor()
+        self._drag_red = None
+
+    def _wave_release(self, _e):
+        """Release on the waveform. Unlike the timeline, a plain click here
+        must NOT seek — only a drag does (applied live in `_tl_motion`), and a
+        double-click toggles amplitude/onset view. So just clear drag state."""
+        self._suppress_release = False
+        self._drag_red = None
+
+    def _tl_double(self, e):
+        """Double-click a barline/section → scroll that timing point's row
+        to the top of the table."""
+        self._suppress_release = True
+        reds = self._new_redlines()
+        if not reds:
+            return
+        t = self._x_to_t(e.x)
+        gov = reds[0]
+        for r in reds:
+            if r["t"] <= t + 1e-6:
+                gov = r
+            else:
+                break
+        self._scroll_row_to_top(gov["row"])
+
+    def _scroll_row_to_top(self, row):
+        w = row.get("frame")
+        if w is None or row["_deleted"]:
+            return
+        self.table_inner.update_idletasks()
+        total = max(1, self.table_inner.winfo_height())
+        self.table_canvas.yview_moveto(max(0.0, min(1.0, w.winfo_y() / total)))
+
+    def _jump_to_row(self, row):
+        """Double-click a row's Old offset → bring that red line onto the
+        current-time line."""
+        t = self._f_off(row["noff_var"])
+        if t is None:
+            return
+        self.cursor_ms = t
+        self._clamp_cursor()
+        self._redraw_timeline()
+        self._audio_seek_to_cursor()
+
+    def _tick_ms(self):
+        _base, unit = self._snap_unit_at(self.cursor_ms)
+        return unit if unit and unit > 0 else 500.0
+
+    def _step_cursor(self, direction):
+        """Move the current-time line one tick (one bar in "None" mode) and
+        keep it snapped to the grid. ◀ ▶ buttons, ← → keys and the mouse
+        wheel all funnel through here."""
+        base, unit = self._snap_unit_at(self.cursor_ms)
+        if base is None or unit <= 0:
+            self.cursor_ms += direction * 500.0
+        else:
+            k = round((self.cursor_ms - base) / unit)
+            self.cursor_ms = base + (k + direction) * unit
+        self._clamp_cursor()
+        self._redraw_timeline()
+        self._audio_seek_to_cursor()
+        return "break"
+
+    def _tl_wheel(self, e):
+        # reversed: wheel up scrolls back in time
+        self._step_cursor(-1 if e.delta > 0 else 1)
+
+    def _tl_wheel_like(self, e, direction):
+        self._step_cursor(-1 if direction > 0 else 1)
+
+    def _tl_wheel_shift(self, e):
+        # Zoom about the current-time line (cursor_ms stays put).
+        factor = 1.25 if e.delta > 0 else 1 / 1.25
+        self.px_per_ms = max(0.004, min(4.0, self.px_per_ms * factor))
+        self._redraw_timeline()
+
+    def _tl_wheel_ctrl(self, e):
+        self._step_divisor(1 if e.delta > 0 else -1)
+
+    # ---- horizontal scrollbars ----
+    def _table_xview(self, *args):
+        self.table_canvas.xview(*args)
+        # match by pixel (same scrollregion width) rather than by forwarding
+        # the same fraction to a canvas of a slightly different content width
+        self.hdr_canvas.xview_moveto(self.table_canvas.xview()[0])
+        self._flush_table_redraw()
+
+    def _seek_scroll(self, *args):
+        total = max(1.0, self._total_ms())
+        vis = self._visible_ms()
+        if args[0] == "moveto":
+            left = float(args[1]) * total
+        else:  # ("scroll", n, "units"|"pages")
+            n = int(args[1])
+            unit = vis * (0.08 if args[2] == "units" else 0.9)
+            left = self._view_start() + n * unit
+        self.cursor_ms = left + self.CURSOR_FRAC * vis
+        self._clamp_cursor()
+        self._redraw_timeline()
+        self._audio_seek_to_cursor()
+
+    def _sync_seek_scrollbar(self):
+        sb = getattr(self, "seek_scroll", None)
+        if sb is None:
+            return
+        total = max(1.0, self._total_ms())
+        vs = self._view_start()
+        vis = self._visible_ms()
+        lo = max(0.0, min(1.0, vs / total))
+        hi = max(lo, min(1.0, (vs + vis) / total))
+        sb.set(lo, hi)
+
+    # ------------------------------------------------------------------
+    # Apply
+    # ------------------------------------------------------------------
+    def _apply(self):
+        if not self.require_map():
+            return
+        folder, _diffs = self.app.get_diff_files()
+        targets = self.diff_list.selected()
+        if not targets:
+            _show_alert(self, "Nothing selected",
+                        "Tick at least one difficulty in the \"Apply to\" list first.")
+            return
+        if not self._visible_rows():
+            _show_alert(self, "No timing", "This map has no red (timing) lines to edit.")
+            return
+
+        if self._states_equal(self._capture_state(), self._initial_state):
+            _show_alert(self, "No change", "Nothing has been changed yet.")
+            return
+
+        segments = []
+        for r in sorted(self._visible_rows(), key=lambda rr: self._f_off(rr["noff_var"]) or 0.0):
+            nt = self._f_off(r["noff_var"])
+            nb = self._f(r["nbpm_var"])
+            if nt is None or nb is None or nb <= 0:
+                _show_alert(self, "Invalid value",
+                            "Every row needs a valid New Offset and a positive New BPM.")
+                return
+            segments.append({
+                "old_time": None if r["is_new"] else r["old_time"],
+                "old_beat_length": None if r["is_new"] else r["old_bl"],
+                "new_time": nt, "new_beat_length": 60000.0 / nb,
+                "omit_barline": bool(r["bl_var"].get()), "is_new": r["is_new"],
+                "meter": self._row_meter(r), "sample_set": r["sample_set"],
+                "sample_index": r["sample_index"], "volume": r["volume"],
+                "effects": r["effects"],
+            })
+        if not any(not s["is_new"] for s in segments):
+            _show_alert(self, "No timing",
+                        "Leave at least one existing red line to retime against.")
+            return
+
+        self.apply_btn.configure(state="disabled")
+        self.status_var.set("Retiming...")
+
+        def work():
+            try:
+                logic.apply_advanced_timing(folder, targets, segments)
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda: self._apply_failed(err))
+                return
+            self.after(0, self._apply_done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_failed(self, err):
+        self.apply_btn.configure(state="normal")
+        self.status_var.set("")
+        _show_alert(self, "Error", err)
+
+    def _apply_done(self):
+        n = len(self.diff_list.selected())
+        self.status_var.set("")
+        self.apply_btn.configure(state="normal")
+        self.notify_done(f"Retimed {n} difficulty file(s).")
+        # Reload from disk so the table + timeline reflect the new timing.
+        self._loaded_src = None
+        self._load_map()
 
 
 # =============================================================================
@@ -3356,6 +5393,19 @@ class BgOffsetShifterFrame(BaseToolFrame):
 
         self.convert_jpg_var = tk.BooleanVar(value=False)
         LightCheckbox(body, "Convert to .jpg", self.convert_jpg_var).pack(anchor="w", pady=(0, 12))
+
+        upscale_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        upscale_row.pack(fill="x", pady=(0, 12))
+        self.upscale_bg_var = tk.BooleanVar(value=False)
+        LightCheckbox(upscale_row, "Upscale BG", self.upscale_bg_var,
+                      command=self._sync_upscale_state).pack(side="left")
+        _upscale_info = InfoIcon(upscale_row, "Upscale the BG using waifu2x")
+        _upscale_info.configure(bg=FRONT_CARD_BG)
+        _upscale_info.pack(side="left", padx=(4, 0))
+        self.upscale_config_btn = _make_ghost_button(upscale_row, "Configure",
+                                                      self.open_upscale_config)
+        self.upscale_config_btn.pack(side="left", padx=(10, 0))
+        self._sync_upscale_state()
 
         tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
@@ -3442,12 +5492,25 @@ class BgOffsetShifterFrame(BaseToolFrame):
     def _set_offset(self, value):
         self.offset_var.set(str(value))
 
+    def _sync_upscale_state(self):
+        state = "normal" if self.upscale_bg_var.get() else "disabled"
+        self.upscale_config_btn.configure(state=state)
+
+    def open_upscale_config(self):
+        existing = getattr(self, "_upscale_cfg_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+        self._upscale_cfg_win = Waifu2xConfigWindow(self, self.app)
+
     def apply(self):
         if not self.require_map():
             return
         folder, _ = self.app.get_diff_files()
         targets = self.diff_list.selected()
-        if not self.bg_var.get():
+        bg = self.bg_var.get()
+        if not bg:
             _show_alert(self, "No background", "Pick a background image.")
             return
         if not targets:
@@ -3458,14 +5521,56 @@ class BgOffsetShifterFrame(BaseToolFrame):
         except ValueError:
             _show_alert(self, "Invalid value", "Offset must be a number.")
             return
+        convert_jpg = self.convert_jpg_var.get()
+
+        if self.upscale_bg_var.get():
+            self._apply_with_upscale(folder, targets, bg, offset, convert_jpg)
+            return
+
         try:
-            final_name = logic.apply_bg_offset(folder, targets, self.bg_var.get(), offset,
-                                                self.convert_jpg_var.get())
+            final_name = logic.apply_bg_offset(folder, targets, bg, offset, convert_jpg)
         except Exception as e:
             _show_alert(self, "Error", str(e))
             return
         self.notify_done(f"Background updated ({final_name}) and applied to {len(targets)} difficulty file(s).")
         self.refresh()
+
+    def _apply_with_upscale(self, folder, targets, bg, offset, convert_jpg):
+        install_first = False
+        if not logic.waifu2x_available():
+            choice = _ask_waifu2x_required_choice(self)
+            if choice == "cancel":
+                return
+            install_first = True  # only "install" remains as a non-cancel choice
+
+        cfg = dict(self.app.waifu2x_config)
+
+        def work(cancel_event):
+            if install_first:
+                logic.install_waifu2x_bundled()
+                if cancel_event.is_set():
+                    return None
+                self.after(0, lambda: self.notify_done("waifu2x installed — continuing."))
+            upscaled = logic.upscale_bg_image(folder, bg, cfg.get("model"), cfg.get("scale"),
+                                               cfg.get("format"), cfg.get("denoise"))
+            if cancel_event.is_set():
+                return None
+            return logic.apply_bg_offset(folder, targets, upscaled, offset, convert_jpg)
+
+        def on_success(result):
+            if result is None:
+                return
+            self.notify_done(f"Background upscaled and updated ({result}) and applied to "
+                              f"{len(targets)} difficulty file(s).")
+            self.refresh()
+
+        def on_error(err_msg):
+            _show_alert(self, "Error", err_msg)
+
+        busy_msg = ("Installing waifu2x (may take a few minutes)... Please wait..."
+                     if install_first else "Upscaling background with waifu2x... Please wait...")
+        self.app.run_cancellable_job(busy_msg, work, on_success=on_success, on_error=on_error,
+                                      cancelled_toast="Upscale Cancelled!")
 
 
 class PreviewWindow(tk.Toplevel):
@@ -3588,6 +5693,73 @@ class PreviewWindow(tk.Toplevel):
 
     def _apply(self):
         self.on_apply(self.offset)
+        self.destroy()
+
+
+class Waifu2xConfigWindow(tk.Toplevel):
+    """The "Configure" menu behind BG Settings' "Upscale BG" option — four
+    LightDropdowns (Model / Scale / Format / Denoise) for the
+    waifu2x-ncnn-vulkan upscale. Save writes the choices back through
+    App.save_waifu2x_settings (persisted to
+    .osu_taiko_helper_waifu2x.json). Modal + dedup-guarded, same as every
+    other Toplevel-spawning button in the app."""
+
+    def __init__(self, parent_frame, app):
+        super().__init__(parent_frame)
+        self.app = app
+        self.title("Upscale BG — Configure")
+        self.configure(bg=FRONT_BG)
+        _position_over_window(self, parent_frame, width=400, height=372)
+        self.resizable(False, False)
+
+        cfg = dict(app.waifu2x_config)
+        self.model_var = tk.StringVar(value=cfg.get("model", "CUnet"))
+        self.scale_var = tk.StringVar(value=cfg.get("scale", "RC compliance"))
+        self.format_var = tk.StringVar(value=cfg.get("format", "jpg"))
+        self.denoise_var = tk.StringVar(value=str(cfg.get("denoise", "0")))
+
+        tk.Label(self, text="Upscale BG Configuration", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=20, pady=(18, 4))
+        tk.Frame(self, bg=FRONT_BORDER, height=1).pack(fill="x", padx=20, pady=(6, 14))
+
+        def _row(label, var, values, info=None):
+            r = tk.Frame(self, bg=FRONT_BG)
+            r.pack(fill="x", padx=20, pady=(0, 12))
+            tk.Label(r, text=label, bg=FRONT_BG, fg=FRONT_TEXT, font=("Segoe UI", 11),
+                     width=8, anchor="w").pack(side="left")
+            LightDropdown(r, var, values=values, width=22, page_bg=FRONT_BG).pack(side="left")
+            if info:
+                ic = InfoIcon(r, info, align="right")
+                ic.configure(bg=FRONT_BG)
+                ic.pack(side="left", padx=(6, 0))
+
+        _row("Model", self.model_var, logic.WAIFU2X_MODEL_OPTIONS,
+             "CUnet works best on anime/art.")
+        _row("Scale", self.scale_var, logic.WAIFU2X_SCALE_OPTIONS,
+             "RC Compliance will upscale to fit ranking criteria's maximum dimension")
+        _row("Format", self.format_var, logic.WAIFU2X_FORMAT_OPTIONS)
+        _row("Denoise", self.denoise_var, logic.WAIFU2X_DENOISE_OPTIONS,
+             "-1: disable, 0: a light pass. Higher values removes more compression "
+             "artifact and image details")
+
+        btn_row = tk.Frame(self, bg=FRONT_BG)
+        btn_row.pack(fill="x", padx=20, pady=(10, 18))
+        _make_accent_button(btn_row, "Save", self._save).pack(side="right")
+        _make_ghost_button(btn_row, "Cancel", self.destroy).pack(side="right", padx=(0, 8))
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.transient(parent_frame.winfo_toplevel())
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
+    def _save(self):
+        self.app.save_waifu2x_settings({
+            "model": self.model_var.get(),
+            "scale": self.scale_var.get(),
+            "format": self.format_var.get(),
+            "denoise": self.denoise_var.get(),
+        })
         self.destroy()
 
 
@@ -4788,6 +6960,7 @@ class ManualPatternWindow(tk.Toplevel):
         self._phantom_item = None
         self._hover_pos = None           # last hovered tick position, for restoring the phantom after a redraw
         self._drag_note = None           # note currently being dragged/resized in Select mode, if any
+        self._drag_group = []            # every note moving with it (the whole selection, when the pressed note is part of a multi-selection)
         self._drag_moved = False
         self._bg_drag_start = None       # Fraction: where a Select-mode background (box-select) drag began
         self._bg_drag_current = None     # Fraction: its current cursor position, for the overlay/range
@@ -5239,6 +7412,12 @@ class ManualPatternWindow(tk.Toplevel):
         if existing is None:
             self._begin_bg_drag(pos)
             return
+        if id(existing) in self.selected_note_ids and len(self.selected_note_ids) > 1:
+            # Pressed one of several already-selected notes — keep the whole
+            # selection intact and drag every selected note together.
+            self._range_anchor_id = id(existing)
+            self._begin_note_drag(existing)
+            return
         self.selected_note_ids = {id(existing)}
         self._range_anchor_id = id(existing)
         self._redraw()
@@ -5369,16 +7548,18 @@ class ManualPatternWindow(tk.Toplevel):
             self._redraw()
             return
         if self.mode == "select":
-            # Right-clicking a specific object deletes just that one,
-            # whether or not it's currently selected — no need to select
-            # first. Right-clicking empty space instead falls back to
-            # deleting the whole current selection (if any), so bulk
-            # delete via Ctrl/Shift-select + right-click still works.
+            # Right-clicking one of several currently-selected objects deletes
+            # the whole selection — so bulk delete via Ctrl/Shift-select (or a
+            # box-select drag) + right-click works. Right-clicking any other
+            # object deletes just that one (no need to select it first).
+            # Right-clicking empty space deselects everything instead.
             existing = self._find_note_at(pos)
-            if existing is not None:
-                self._delete_object(existing)
-            else:
+            if existing is None:
+                self._deselect_all()
+            elif id(existing) in self.selected_note_ids and len(self.selected_note_ids) > 1:
                 self._delete_selected()
+            else:
+                self._delete_object(existing)
             return
         if self.mode not in ("note", "special"):
             return
@@ -5397,9 +7578,15 @@ class ManualPatternWindow(tk.Toplevel):
     # ------------------------------------------------------------------
     def _begin_note_drag(self, note: dict):
         """Head/body press: moves the whole object (both endpoints, for a
-        slider/spinner) together, preserving its length."""
+        slider/spinner) together, preserving its length. When the pressed
+        note is part of a multi-selection, every selected note moves with
+        it by the same amount — see _on_note_drag_motion."""
         self._drag_note = note
         self._drag_moved = False
+        if id(note) in self.selected_note_ids and len(self.selected_note_ids) > 1:
+            self._drag_group = [n for n in self.notes if id(n) in self.selected_note_ids]
+        else:
+            self._drag_group = [note]
         self.bind_all("<B1-Motion>", self._on_note_drag_motion)
         self.bind_all("<ButtonRelease-1>", self._on_note_drag_release)
 
@@ -5409,33 +7596,37 @@ class ManualPatternWindow(tk.Toplevel):
             return
         canvas_x = event.x_root - self.canvas.winfo_rootx()
         new_pos = self._pos_from_x(canvas_x)
-        if new_pos == note["pos"]:
+        delta = new_pos - note["pos"]
+        if delta == 0:
             return
-        if note["kind"] == "note":
-            occupant = self._find_note_at(new_pos)
-            if occupant is not None and occupant is not note:
-                return  # don't drop one note on top of another
-            note["pos"] = new_pos
-        else:
-            length = note["end_pos"] - note["pos"]
-            if new_pos < 0:
-                return  # don't let the head go negative
-            new_end = new_pos + length
-            if new_end > Fraction(self.BEATS_SHOWN):
-                return  # don't let the tail run off the visible timeline
-            occupant = self._find_note_at(new_pos)
-            if occupant is not None and occupant is not note:
-                return  # don't drop the head onto another object's head
-            note["pos"] = new_pos
-            note["end_pos"] = new_end
+        group = self._drag_group or [note]
+        group_ids = {id(n) for n in group}
+        planned = []
+        for n in group:
+            new_head = n["pos"] + delta
+            if new_head < 0 or new_head > Fraction(self.BEATS_SHOWN):
+                return  # don't let any head leave the visible timeline
+            new_end = None
+            if n["end_pos"] is not None:
+                new_end = n["end_pos"] + delta
+                if new_end > Fraction(self.BEATS_SHOWN):
+                    return  # don't let any tail run off the visible timeline
+            occupant = self._find_note_at(new_head)
+            if occupant is not None and id(occupant) not in group_ids:
+                return  # don't drop a moving note onto one that isn't moving
+            planned.append((n, new_head, new_end))
+        for n, new_head, new_end in planned:
+            n["pos"] = new_head
+            if new_end is not None:
+                n["end_pos"] = new_end
         self._drag_moved = True
-        self.selected_note_ids = {id(note)}
         self._redraw()
 
     def _begin_tail_drag(self, note: dict):
         """Tail press (slider/spinner only): resizes by moving only
         end_pos, leaving the head (pos) fixed."""
         self._drag_note = note
+        self._drag_group = [note]  # tail resize is always single-object
         self._drag_moved = False
         self.bind_all("<B1-Motion>", self._on_tail_drag_motion)
         self.bind_all("<ButtonRelease-1>", self._on_note_drag_release)
@@ -5462,11 +7653,19 @@ class ManualPatternWindow(tk.Toplevel):
 
     def _on_note_drag_release(self, _event):
         """Shared release handler for both the move drag (_on_note_drag_motion)
-        and the resize drag (_on_tail_drag_motion) — neither needs anything
-        different done at release time."""
+        and the resize drag (_on_tail_drag_motion). A press that never turned
+        into a drag counts as a plain click: it collapses a multi-selection
+        down to just the pressed note (the drag itself is what keeps the
+        whole selection and moves it together)."""
         self.unbind_all("<B1-Motion>")
         self.unbind_all("<ButtonRelease-1>")
+        if (not self._drag_moved and self._drag_note is not None
+                and self.selected_note_ids != {id(self._drag_note)}):
+            self.selected_note_ids = {id(self._drag_note)}
+            self._range_anchor_id = id(self._drag_note)
+            self._redraw()
         self._drag_note = None
+        self._drag_group = []
         self._drag_moved = False
 
     # ------------------------------------------------------------------
@@ -5907,11 +8106,6 @@ class PatternGalleryFrame(BaseToolFrame):
         target_info = InfoIcon(target_row, "This field is auto-filled after copying a timestamp.")
         target_info.configure(bg=FRONT_CARD_BG)
         target_info.pack(side="left", padx=(6, 0))
-
-        self.match_bpm_var = tk.BooleanVar(value=True)
-        match_bpm_row = tk.Frame(body2, bg=FRONT_CARD_BG)
-        match_bpm_row.pack(fill="x", anchor="w", pady=(0, 12))
-        LightCheckbox(match_bpm_row, "Match target map's BPM", self.match_bpm_var).pack(side="left")
 
         tk.Label(body2, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
@@ -6619,7 +8813,7 @@ class PatternGalleryFrame(BaseToolFrame):
             return
 
         folder, _ = self.app.get_diff_files()
-        logic.insert_pattern_into_map(folder, [target_file], pattern, target_ms, self.match_bpm_var.get())
+        logic.insert_pattern_into_map(folder, [target_file], pattern, target_ms)
         self.notify_done("Success! Press Ctrl + L in the editor to load the pattern")
 
 

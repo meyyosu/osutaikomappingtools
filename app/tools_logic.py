@@ -6,6 +6,7 @@ be unit-tested independently.
 """
 
 from __future__ import annotations
+import array
 import copy
 import glob
 import json
@@ -1497,6 +1498,267 @@ def apply_bg_offset(folder: str, diff_files: List[str], bg_file: str, new_offset
 
 
 # =============================================================================
+# BG upscale (waifu2x-ncnn-vulkan)
+#
+# waifu2x-ncnn-vulkan is a standalone command-line upscaler (nihui's port,
+# https://github.com/nihui/waifu2x-ncnn-vulkan) — a single .exe plus a set
+# of model folders and a vulkan runtime DLL, no installer. There's no
+# winget package for it, so `install_waifu2x_bundled` only has the direct-
+# download path (the GitHub "latest" release's `*-windows.zip` asset,
+# located via the releases API the same way VLC's zip is scraped from a
+# directory listing). Everything is unpacked into `<bundled>/waifu2x/`;
+# `resolve_waifu2x_exe` also accepts a copy sitting directly next to the
+# app or on PATH, same bundled-first-then-PATH spirit as ffmpeg.
+# =============================================================================
+WAIFU2X_DIR_NAME = "waifu2x"
+_WAIFU2X_RELEASES_API = "https://api.github.com/repos/nihui/waifu2x-ncnn-vulkan/releases/latest"
+WAIFU2X_MANUAL_DOWNLOAD_URL = "https://github.com/nihui/waifu2x-ncnn-vulkan/releases"
+
+# UI label -> model folder name shipped inside the waifu2x zip.
+WAIFU2X_MODELS = {
+    "CUnet": "models-cunet",
+    "UpConv7 Anime": "models-upconv_7_anime_style_art_rgb",
+    "UpConv7 Photo": "models-upconv_7_photo",
+}
+WAIFU2X_MODEL_OPTIONS = list(WAIFU2X_MODELS)
+WAIFU2X_SCALE_OPTIONS = ["RC compliance", "2x", "3x", "4x"]
+WAIFU2X_FORMAT_OPTIONS = ["jpg", "png"]
+WAIFU2X_DENOISE_OPTIONS = ["-1", "0", "1", "2", "3"]
+
+# osu!'s Ranking Criteria background resolution ceiling.
+RC_MAX_BG_W, RC_MAX_BG_H = 2560, 1440
+
+
+def _waifu2x_search_dirs() -> List[str]:
+    d = _bundled_dir()
+    return [os.path.join(d, WAIFU2X_DIR_NAME), d]
+
+
+def resolve_waifu2x_exe() -> Optional[str]:
+    """Absolute path to waifu2x-ncnn-vulkan(.exe) — bundled under
+    `<app>/waifu2x/`, sitting directly next to the app, or on PATH — or
+    None if it can't be found anywhere."""
+    exe_name = "waifu2x-ncnn-vulkan.exe" if os.name == "nt" else "waifu2x-ncnn-vulkan"
+    for base in _waifu2x_search_dirs():
+        p = os.path.join(base, exe_name)
+        if os.path.isfile(p):
+            return p
+    return shutil.which(exe_name)
+
+
+def waifu2x_available() -> bool:
+    return resolve_waifu2x_exe() is not None
+
+
+def _find_waifu2x_zip_url() -> str:
+    """The latest release's Windows zip asset URL, from the GitHub releases
+    API — the asset name is date-versioned (e.g.
+    waifu2x-ncnn-vulkan-20220728-windows.zip) so there's no fixed URL."""
+    req = urllib.request.Request(_WAIFU2X_RELEASES_API, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        raise RuntimeError(f"Couldn't reach GitHub to find a waifu2x build ({e}).")
+    for asset in data.get("assets", []):
+        name = asset.get("name", "")
+        if name.endswith("-windows.zip") and asset.get("browser_download_url"):
+            return asset["browser_download_url"]
+    raise RuntimeError("Couldn't find a Windows waifu2x build in the latest release — "
+                        "its release layout may have changed.")
+
+
+def _download_and_extract_waifu2x_zip(dest_dir: str):
+    """Downloads the current waifu2x-ncnn-vulkan Windows zip and unpacks its
+    contents (the exe, every models-* folder, the vulkan DLL) into
+    `dest_dir`. The zip's single top-level folder is version-named, so its
+    contents are flattened one level as they're written out. Raises
+    RuntimeError with a user-facing message on any failure."""
+    url = _find_waifu2x_zip_url()
+    tmp_zip = None
+    try:
+        fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        _download_to_file(url, tmp_zip, timeout=120)
+
+        with zipfile.ZipFile(tmp_zip) as zf:
+            names = zf.namelist()
+            exe_entries = [n for n in names
+                           if n.replace("\\", "/").lower().endswith("waifu2x-ncnn-vulkan.exe")]
+            if not exe_entries:
+                raise RuntimeError(f"Downloaded waifu2x build from {url} didn't contain the "
+                                    "executable — the build layout may have changed.")
+            exe_norm = exe_entries[0].replace("\\", "/")
+            root = exe_norm.rsplit("/", 1)[0] if "/" in exe_norm else ""
+            prefix = root + "/" if root else ""
+
+            os.makedirs(dest_dir, exist_ok=True)
+            for n in names:
+                nn = n.replace("\\", "/")
+                if nn.endswith("/"):
+                    continue
+                if prefix and not nn.startswith(prefix):
+                    continue
+                rel = nn[len(prefix):] if prefix else nn
+                if not rel:
+                    continue
+                out_path = os.path.join(dest_dir, *rel.split("/"))
+                os.makedirs(os.path.dirname(out_path) or dest_dir, exist_ok=True)
+                with zf.open(n) as src_f, open(out_path, "wb") as out_f:
+                    shutil.copyfileobj(src_f, out_f)
+    except (OSError, urllib.error.URLError, zipfile.BadZipFile) as e:
+        raise RuntimeError(f"Couldn't download/extract waifu2x ({e}). Install it manually from "
+                            f"{WAIFU2X_MANUAL_DOWNLOAD_URL} instead.")
+    finally:
+        if tmp_zip and os.path.exists(tmp_zip):
+            os.remove(tmp_zip)
+
+
+def install_waifu2x_bundled() -> str:
+    """Gets waifu2x-ncnn-vulkan sitting under `<app>/waifu2x/`. Meant to run
+    on a worker thread — blocks for as long as the download takes. No-op
+    (returns "already") if it's already resolvable. Raises RuntimeError
+    with a user-facing message on failure."""
+    if waifu2x_available():
+        return "already"
+    if os.name != "nt":
+        raise RuntimeError("Automatic waifu2x install is only wired up for Windows. Get a build "
+                            f"for your platform from {WAIFU2X_MANUAL_DOWNLOAD_URL}.")
+    dest_dir = os.path.join(_bundled_dir(), WAIFU2X_DIR_NAME)
+    _download_and_extract_waifu2x_zip(dest_dir)
+    if not waifu2x_available():
+        raise RuntimeError("waifu2x was downloaded but still couldn't be located afterward.")
+    return dest_dir
+
+
+def _next_pow2_at_least(x: float) -> int:
+    """Smallest of waifu2x's supported scale levels (1, 2, 4, 8, 16, 32)
+    that is >= x."""
+    s = 1
+    while s < x and s < 32:
+        s *= 2
+    return s
+
+
+def compute_bg_upscale_target(w: int, h: int, scale_opt: str) -> "tuple[int, int]":
+    """Final pixel size the upscaled background should end up at.
+
+    "2x"/"3x"/"4x" are literal multipliers. "RC compliance" enlarges the
+    image (keeping its exact aspect ratio) until whichever of its
+    dimensions hits its RC ceiling first — height 1440 or width 2560 —
+    without either dimension going past its ceiling. An image already at
+    or above a ceiling is left untouched."""
+    if w <= 0 or h <= 0:
+        return w, h
+    if scale_opt == "2x":
+        return w * 2, h * 2
+    if scale_opt == "3x":
+        return w * 3, h * 3
+    if scale_opt == "4x":
+        return w * 4, h * 4
+    # RC compliance
+    factor = min(RC_MAX_BG_W / w, RC_MAX_BG_H / h)
+    if factor <= 1.0:
+        return w, h
+    tw = min(RC_MAX_BG_W, int(w * factor))
+    th = min(RC_MAX_BG_H, int(h * factor))
+    return tw, th
+
+
+def upscale_bg_image(folder: str, bg_file: str, model: str, scale_opt: str,
+                      out_format: str, denoise) -> str:
+    """Upscales the map folder's background image in place with
+    waifu2x-ncnn-vulkan and returns the resulting filename (the base name
+    with a `.jpg`/`.png` extension per `out_format`; the original file is
+    removed if the extension changed). waifu2x only upscales by powers of
+    2, so for "3x" or an "RC compliance" target that isn't an exact power
+    of 2, the power-of-2 result is Lanczos-downscaled to the exact target
+    afterwards. Raises RuntimeError with a user-facing message on failure."""
+    from PIL import Image
+
+    exe = resolve_waifu2x_exe()
+    if not exe:
+        raise RuntimeError("waifu2x-ncnn-vulkan was not found.")
+    src_path = os.path.join(folder, bg_file)
+    if not os.path.isfile(src_path):
+        raise RuntimeError(f"Background image {bg_file} not found.")
+    try:
+        noise = int(denoise)
+    except (TypeError, ValueError):
+        noise = 0
+    out_format = "png" if str(out_format).lower() == "png" else "jpg"
+
+    with Image.open(src_path) as im:
+        w, h = im.size
+
+    tw, th = compute_bg_upscale_target(w, h, scale_opt)
+    needed = max(tw / w, th / h) if w and h else 1.0
+    w2x_scale = _next_pow2_at_least(needed) if needed > 1.0 else 1
+
+    if w2x_scale == 1 and noise < 0:
+        # Nothing to do — no enlargement, and denoising is off.
+        return bg_file
+
+    exe_dir = os.path.dirname(exe)
+    model_path = os.path.join(exe_dir, WAIFU2X_MODELS.get(model, "models-cunet"))
+
+    base = os.path.splitext(bg_file)[0]
+    ext = ".png" if out_format == "png" else ".jpg"
+    fd, tmp_out = tempfile.mkstemp(suffix=ext, dir=folder)
+    os.close(fd)
+    try:
+        cmd = [exe, "-i", src_path, "-o", tmp_out,
+               "-n", str(noise), "-s", str(w2x_scale), "-f", out_format]
+        if os.path.isdir(model_path):
+            cmd += ["-m", model_path]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=1800,
+                            creationflags=_SUBPROCESS_FLAGS, cwd=exe_dir)
+        except subprocess.CalledProcessError as e:
+            detail = ""
+            for stream in (e.stderr, e.stdout):
+                if stream:
+                    detail = stream.decode("utf-8", "ignore").strip()
+                    if detail:
+                        break
+            raise RuntimeError(f"waifu2x failed: {detail or e}")
+        except subprocess.SubprocessError as e:
+            raise RuntimeError(f"waifu2x failed: {e}")
+
+        # waifu2x only scales by powers of 2 — for "3x" or an RC-compliance
+        # target that isn't a clean power of 2, downscale the power-of-2
+        # result to the exact intended size. Load fully and drop the file
+        # handle before writing back to the same path.
+        if tw >= 1 and th >= 1:
+            with Image.open(tmp_out) as im:
+                im.load()
+                needs_resize = im.size != (tw, th)
+                resized = im.resize((tw, th), Image.LANCZOS) if needs_resize else None
+            if resized is not None:
+                if ext == ".jpg":
+                    resized.convert("RGB").save(tmp_out, "JPEG", quality=95)
+                else:
+                    resized.save(tmp_out)
+
+        final_name = base + ext
+        final_path = os.path.join(folder, final_name)
+        if os.path.abspath(final_path) != os.path.abspath(src_path) and os.path.exists(src_path):
+            try:
+                os.remove(src_path)
+            except OSError:
+                pass
+        os.replace(tmp_out, final_path)
+        tmp_out = None
+        return final_name
+    finally:
+        if tmp_out and os.path.exists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+
+
+# =============================================================================
 # Video Offset Shifter
 # =============================================================================
 def list_song_folder_videos(folder: str) -> List[str]:
@@ -1889,6 +2151,259 @@ def get_audio_filename(folder: str) -> Optional[str]:
         return None
     bm = Beatmap(os.path.join(folder, diffs[0]))
     return bm.get_kv("General", "AudioFilename")
+
+
+# =============================================================================
+# Advanced Timing editor (screens.AdvancedTimingWindow)
+#
+# Three pieces:
+#   - decode_audio_peaks: a lightweight waveform for the editor's timeline
+#     strip (ffmpeg -> mono 8kHz s16le on stdout -> per-bucket peak).
+#   - retime_beatmap: the actual "move the map onto new timing" mutation —
+#     every red line is rewritten to a new offset/BPM, and every hit
+#     object / green line is repositioned to the SAME beat position within
+#     its (now differently-timed) section so nothing drifts off the grid.
+#   - apply_advanced_timing: the per-diff file wrapper (mirrors apply_offset).
+# =============================================================================
+_audio_peaks_cache: dict = {}
+
+
+def decode_audio_peaks(audio_path: str, buckets_per_second: int = 200):
+    """Decode `audio_path` to mono low-rate PCM via ffmpeg and return
+    `(peaks, duration_ms)` where `peaks` is a list of floats in [0, 1] —
+    one per `1/buckets_per_second` second, each the max absolute amplitude
+    in that slice. Returns `([], 0.0)` when ffmpeg isn't available or the
+    decode fails (the editor still opens, just without a waveform).
+
+    Result is memoised in-process keyed by (abspath, mtime) — the song
+    rarely changes during a session and a full decode of a 3-4 min track
+    is a noticeable fraction of a second.
+
+    NB: this deliberately does NOT go through `_run_ffmpeg` — that helper
+    discards stdout, and the raw PCM stream *is* stdout here."""
+    try:
+        key = (os.path.abspath(audio_path), os.path.getmtime(audio_path))
+    except OSError:
+        return [], 0.0
+    cached = _audio_peaks_cache.get(key)
+    if cached is not None:
+        return cached
+    if not ffmpeg_available():
+        return [], 0.0
+
+    sr = 8000
+    cmd = [_resolve_binary("ffmpeg"), "-v", "quiet", "-i", audio_path,
+           "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=600,
+                              creationflags=_SUBPROCESS_FLAGS)
+    except (subprocess.SubprocessError, OSError):
+        return [], 0.0
+    raw = proc.stdout or b""
+    if len(raw) < 2:
+        return [], 0.0
+
+    samples = array.array("h")
+    samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+    total = len(samples)
+    duration_ms = total / sr * 1000.0
+    per_bucket = max(1, sr // max(1, buckets_per_second))
+    peaks = []
+    for i in range(0, total, per_bucket):
+        chunk = samples[i:i + per_bucket]
+        if not chunk:
+            break
+        peaks.append(min(1.0, max(abs(s) for s in chunk) / 32768.0))
+    result = (peaks, duration_ms)
+    _audio_peaks_cache[key] = result
+    return result
+
+
+def _retime_section_index(t: float, old_reds: list) -> int:
+    """Index of the red line governing old time `t` — the last red line
+    whose time is <= t, or 0 for a time before the first (matches
+    osu_parser._governing_timing_point)."""
+    i = 0
+    for j in range(len(old_reds)):
+        if old_reds[j][0] <= t + 1e-6:
+            i = j
+        else:
+            break
+    return i
+
+
+def _build_retime_mapper(old_reds: list, new_reds: list):
+    """`old_reds`/`new_reds`: parallel lists of `(time, beat_length)` for
+    the existing red lines (equal length, time-ordered). Returns a
+    function mapping an old timestamp to a new one, preserving each
+    object's beat position within its section."""
+    def mapper(t: float) -> float:
+        i = _retime_section_index(t, old_reds)
+        old_t, old_bl = old_reds[i]
+        new_t, new_bl = new_reds[i]
+        if not old_bl:
+            return new_t + (t - old_t)
+        beat = (t - old_t) / old_bl
+        return new_t + beat * new_bl
+    return mapper
+
+
+def retime_beatmap(bm: Beatmap, segments: list):
+    """Retime `bm` in place onto a new set of red lines.
+
+    `segments` is an ordered (by new_time) list of dicts, one per FINAL
+    red line the map should end up with:
+
+        {
+          "old_time": float | None,          # None for a brand-new line
+          "old_beat_length": float | None,
+          "new_time": float,
+          "new_beat_length": float,
+          "omit_barline": bool,
+          "is_new": bool,
+          "meter": int, "sample_set": int,
+          "sample_index": int, "volume": int, "effects": int,
+        }
+
+    Existing red lines (is_new False) define the old->new piecewise time
+    map; every hit object, spinner/hold end time, green line, break, the
+    video event and PreviewTime are moved through it so they keep the same
+    beat position within their section. Green lines additionally get their
+    SV magnitude rescaled by new_bl/old_bl so the visible scroll speed is
+    unchanged across a BPM edit. Brand-new lines only split the grid going
+    forward — they don't remap anything.
+
+    Caller is responsible for `bm.save()` (see CLAUDE.md)."""
+    existing = [s for s in segments if not s.get("is_new")]
+    if not existing:
+        return
+    old_reds = [(s["old_time"], s["old_beat_length"]) for s in existing]
+    new_reds = [(s["new_time"], s["new_beat_length"]) for s in existing]
+    mapper = _build_retime_mapper(old_reds, new_reds)
+
+    def gov_pair(t: float):
+        i = _retime_section_index(t, old_reds)
+        return old_reds[i][1], new_reds[i][1]
+
+    # ---- hit objects (+ spinner / hold end times) --------------------
+    for ho in bm.hit_objects:
+        if ho.obj_type & 8 or ho.obj_type & 0x80:
+            parts = ho.remainder.split(",", 1)
+            if parts and parts[0]:
+                try:
+                    end_new = stable_round(mapper(float(parts[0])))
+                    rest = "," + parts[1] if len(parts) > 1 else ""
+                    ho.remainder = f"{end_new}{rest}"
+                except ValueError:
+                    pass
+        ho.time = mapper(ho.time)
+
+    # ---- green lines: retime + SV compensation -----------------------
+    for tp in bm.timing_points:
+        if tp.uninherited == 1:
+            continue
+        old_bl, new_bl = gov_pair(tp.time)
+        tp.time = mapper(tp.time)
+        if tp.beat_length < 0 and old_bl and new_bl:
+            # green line beat_length is -100/SV. Visible taiko scroll speed
+            # is proportional to SV * red-line BPM, i.e. SV / red_beat_length.
+            # To hold that constant across the BPM edit, SV must scale by
+            # new_bl/old_bl, so -100/SV (== beat_length) scales by
+            # old_bl/new_bl.
+            tp.beat_length *= (old_bl / new_bl)
+
+    # ---- break times ------------------------------------------------
+    ev = bm.sections.get("Events", [])
+    for i, line in enumerate(ev):
+        p = line.strip()
+        if p.startswith("2,") or p.startswith("Break,"):
+            parts = p.split(",")
+            if len(parts) >= 3:
+                try:
+                    parts[1] = str(stable_round(mapper(float(parts[1]))))
+                    parts[2] = str(stable_round(mapper(float(parts[2]))))
+                    ev[i] = ",".join(parts)
+                except ValueError:
+                    pass
+
+    # ---- video event + PreviewTime ---------------------------------
+    vt = bm.get_video_time()
+    if vt is not None:
+        bm.set_video_time(stable_round(mapper(vt)))
+    pt = bm.get_kv("General", "PreviewTime")
+    if pt is not None:
+        try:
+            pv = float(pt)
+            if pv >= 0:
+                bm.set_kv("General", "PreviewTime", str(stable_round(mapper(pv))))
+        except ValueError:
+            pass
+
+    # ---- rewrite the red lines ------------------------------------
+    greens = [tp for tp in bm.timing_points if tp.uninherited == 0]
+    new_tps = list(greens)
+    for s in segments:
+        new_tps.append(TimingPoint(
+            time=float(stable_round(s["new_time"])),
+            beat_length=s["new_beat_length"],
+            meter=int(s.get("meter", 4)),
+            sample_set=int(s.get("sample_set", 0)),
+            sample_index=int(s.get("sample_index", 0)),
+            volume=int(s.get("volume", 100)),
+            uninherited=1,
+            effects=(int(s.get("effects", 0)) & ~8) | (8 if s.get("omit_barline") else 0),
+        ))
+    bm.timing_points = new_tps
+
+
+def apply_advanced_timing(folder: str, diff_files: List[str], segments: list):
+    """Runs `retime_beatmap` + save for every selected diff. `segments` is
+    built from one diff's red lines but applied to all of them (a mapset
+    normally shares timing across diffs). Each *existing* segment is matched
+    to a diff's own red line by nearest `old_time` (tolerance ~2ms), so a
+    diff is retimed correctly even when the editor **deleted** some red
+    lines (the matched-then-missing lines simply aren't written, and their
+    section folds into the previous one) or **added** new ones. A red line
+    a segment can't be matched to is left untouched."""
+    existing = [s for s in segments if not s.get("is_new")]
+    new_lines = [s for s in segments if s.get("is_new")]
+    for fname in diff_files:
+        path = os.path.join(folder, fname)
+        bm = Beatmap(path)
+        reds = sorted([tp for tp in bm.timing_points if tp.uninherited == 1],
+                      key=lambda t: t.time)
+        local = []
+        used = set()
+        for s in existing:
+            best_i, best_d = None, 1e18
+            for i, tp in enumerate(reds):
+                if i in used:
+                    continue
+                d = abs(tp.time - s["old_time"])
+                if d < best_d:
+                    best_i, best_d = i, d
+            if best_i is None or best_d > 2.0:
+                # this diff doesn't have that red line — apply the segment's
+                # own old/new as-is (correct for the diff the editor read).
+                local.append(dict(s))
+                continue
+            used.add(best_i)
+            tp = reds[best_i]
+            local.append({
+                "old_time": tp.time, "old_beat_length": tp.beat_length,
+                "new_time": tp.time + (s["new_time"] - s["old_time"]),
+                "new_beat_length": s["new_beat_length"],
+                "omit_barline": s.get("omit_barline", False), "is_new": False,
+                "meter": s.get("meter", tp.meter), "sample_set": tp.sample_set,
+                "sample_index": tp.sample_index, "volume": tp.volume,
+                "effects": tp.effects,
+            })
+        local.extend(dict(s) for s in new_lines)
+        local.sort(key=lambda s: s["new_time"])
+        if not any(not s.get("is_new") for s in local):
+            continue
+        retime_beatmap(bm, local)
+        bm.save()
 
 
 # =============================================================================

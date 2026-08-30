@@ -59,7 +59,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.11"
+APP_VERSION = "1.13"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -430,6 +430,7 @@ SIDEBAR_ITEMS = [
     "Volume/Kiai Copier",
     "Map Cleaner",
     "Audio/Offset Settings",
+    "Timing Editor",
     "BG Settings",
     "Video Settings",
     "Early Volume Settings",
@@ -446,6 +447,7 @@ WINDOW_GEOMETRY_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_
 FIRST_RUN_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_firstrun.txt")
 METADATA_AUTOFILL_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_metadata_autofill.txt")
 EARLY_VOLUME_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_early_volume.json")
+WAIFU2X_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_waifu2x.json")
 SONG_INDEX_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_songindex_cache.json")
 
 # Explicit position (not just size) — leaving this to the window manager's
@@ -615,6 +617,31 @@ def save_early_volume_config(settings: dict):
         pass
 
 
+WAIFU2X_DEFAULTS = {
+    "model": "CUnet", "scale": "RC compliance", "format": "jpg", "denoise": "0",
+}
+
+
+def load_waifu2x_config() -> dict:
+    settings = dict(WAIFU2X_DEFAULTS)
+    try:
+        with open(WAIFU2X_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            settings.update({k: str(data[k]) for k in WAIFU2X_DEFAULTS if k in data})
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        pass
+    return settings
+
+
+def save_waifu2x_config(settings: dict):
+    try:
+        with open(WAIFU2X_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({k: settings[k] for k in WAIFU2X_DEFAULTS if k in settings}, f)
+    except OSError:
+        pass
+
+
 def load_window_geometry_config() -> str:
     try:
         with open(WINDOW_GEOMETRY_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -746,6 +773,7 @@ class App(tk.Tk):
         self._last_live_sync_key = None
         self.metadata_autofill = load_metadata_autofill_config()
         self.early_volume_settings = load_early_volume_config()
+        self.waifu2x_config = load_waifu2x_config()
 
         self._busy_depth = 0
         self._busy_win = None
@@ -776,6 +804,10 @@ class App(tk.Tk):
     def save_early_volume_settings(self, settings: dict):
         self.early_volume_settings = settings
         save_early_volume_config(settings)
+
+    def save_waifu2x_settings(self, settings: dict):
+        self.waifu2x_config = settings
+        save_waifu2x_config(settings)
 
     _UNFOCUS_EXEMPT_TYPES = (tk.Entry, tk.Spinbox, tk.Text, ttk.Entry, ttk.Spinbox, ttk.Combobox)
 
@@ -1545,7 +1577,8 @@ class App(tk.Tk):
         section_heading(download_card.body, "5. Download Resources",
                          "Including\n\n"
                          "- ffmpeg + ffprobe\n"
-                         "- VLC Player")
+                         "- VLC Player\n"
+                         "- waifu2x")
 
         tk.Label(download_card.body, text="They are required to use certain tools.",
                  bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
@@ -1565,8 +1598,10 @@ class App(tk.Tk):
             need_ffmpeg_bin = not logic.ffmpeg_available()
             need_ffprobe_bin = not logic.ffprobe_available()
             need_vlc = not logic.vlc_available()
-            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc:
-                _show_alert(win, "Download resources", "ffmpeg, ffprobe and VLC are already installed.")
+            need_waifu2x = not logic.waifu2x_available()
+            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc and not need_waifu2x:
+                _show_alert(win, "Download resources",
+                            "ffmpeg, ffprobe, VLC and waifu2x are already installed.")
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
@@ -1588,6 +1623,12 @@ class App(tk.Tk):
                         installed.append("VLC")
                     except Exception as e:
                         errors.append(f"VLC: {e}")
+                if need_waifu2x and not cancel_event.is_set():
+                    try:
+                        logic.install_waifu2x_bundled()
+                        installed.append("waifu2x")
+                    except Exception as e:
+                        errors.append(f"waifu2x: {e}")
                 return installed, errors
 
             def reset_button():
@@ -1610,7 +1651,7 @@ class App(tk.Tk):
                     _show_alert(win, "Download resources", err_msg)
 
             self.run_cancellable_job(
-                "Installing ffmpeg + ffprobe and VLC (may take a few minutes)... Please wait...",
+                "Installing ffmpeg + ffprobe, VLC and waifu2x (may take a few minutes)... Please wait...",
                 work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
                 cancelled_toast="Installation Cancelled!",
             )
@@ -1855,7 +1896,8 @@ class App(tk.Tk):
         section_heading(download_card.body, "2. Download Extra Resources",
                          "Including:\n\n"
                          "- ffmpeg + ffprobe\n"
-                         "- VLC Player")
+                         "- VLC Player\n"
+                         "- waifu2x")
 
         tk.Label(download_card.body, text="These are required to run certain features in this tool. "
                                            "You can install them now or later in Settings.",
@@ -1877,8 +1919,10 @@ class App(tk.Tk):
             need_ffmpeg_bin = not logic.ffmpeg_available()
             need_ffprobe_bin = not logic.ffprobe_available()
             need_vlc = not logic.vlc_available()
-            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc:
-                _show_alert(win, "Download resources", "ffmpeg, ffprobe and VLC are already installed.")
+            need_waifu2x = not logic.waifu2x_available()
+            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc and not need_waifu2x:
+                _show_alert(win, "Download resources",
+                            "ffmpeg, ffprobe, VLC and waifu2x are already installed.")
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
@@ -1900,6 +1944,12 @@ class App(tk.Tk):
                         installed.append("VLC")
                     except Exception as e:
                         errors.append(f"VLC: {e}")
+                if need_waifu2x and not cancel_event.is_set():
+                    try:
+                        logic.install_waifu2x_bundled()
+                        installed.append("waifu2x")
+                    except Exception as e:
+                        errors.append(f"waifu2x: {e}")
                 return installed, errors
 
             def reset_button():
@@ -1922,7 +1972,7 @@ class App(tk.Tk):
                     _show_alert(win, "Download resources", err_msg)
 
             self.run_cancellable_job(
-                "Installing ffmpeg + ffprobe and VLC (may take a few minutes)... Please wait...",
+                "Installing ffmpeg + ffprobe, VLC and waifu2x (may take a few minutes)... Please wait...",
                 work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
                 cancelled_toast="Installation Cancelled!",
             )
@@ -2460,8 +2510,17 @@ class App(tk.Tk):
                              fg=UI_TEXT, activeforeground=UI_ACCENT,
                              font=("Segoe UI", 12), padx=16, pady=12,
                              cursor="hand2",
+                             highlightthickness=0, takefocus=0,
+                             highlightbackground=UI_BG, highlightcolor=UI_BG,
                              command=lambda i=item: self.show_frame(i))
             btn.pack(side="top", fill="x", padx=10, pady=3)
+            btn.bind("<Enter>", lambda e, i=item: self._on_sidebar_hover(i, True))
+            btn.bind("<Leave>", lambda e, i=item: self._on_sidebar_hover(i, False))
+            # A mouse click still gives a tk.Button keyboard focus on Windows
+            # (takefocus=0 only blocks Tab traversal), and the focused button
+            # draws a dotted rectangle inside itself. Bounce focus straight
+            # back to the sidebar frame so that ring never appears.
+            btn.bind("<FocusIn>", lambda e: self.sidebar.focus_set())
             self.sidebar_buttons[item] = btn
 
         self.container = ttk.Frame(body)
@@ -2470,8 +2529,9 @@ class App(tk.Tk):
     def _build_frames(self):
         from screens import (
             FrontPage, MetadataManagerFrame, VolumeKiaiCopierFrame, MapCleanerFrame,
-            OffsetShifterFrame, BgOffsetShifterFrame, VideoOffsetShifterFrame,
-            EarlyVolumeSettingFrame, PatternGalleryFrame, FileNameCheckerFrame,
+            OffsetShifterFrame, TimingEditorFrame, BgOffsetShifterFrame,
+            VideoOffsetShifterFrame, EarlyVolumeSettingFrame, PatternGalleryFrame,
+            FileNameCheckerFrame,
         )
         tool_classes = [
             ("front", FrontPage),
@@ -2479,6 +2539,7 @@ class App(tk.Tk):
             ("Volume/Kiai Copier", VolumeKiaiCopierFrame),
             ("Map Cleaner", MapCleanerFrame),
             ("Audio/Offset Settings", OffsetShifterFrame),
+            ("Timing Editor", TimingEditorFrame),
             ("BG Settings", BgOffsetShifterFrame),
             ("Video Settings", VideoOffsetShifterFrame),
             ("Early Volume Settings", EarlyVolumeSettingFrame),
@@ -2509,6 +2570,17 @@ class App(tk.Tk):
                           font=("Segoe UI", 12, "bold" if active else "normal"))
         if hasattr(frame, "on_shown"):
             frame.on_shown()
+
+    def _on_sidebar_hover(self, item, entering):
+        """Hover state for sidebar buttons — skipped for the active tool,
+        which keeps its selected (soft-accent) styling."""
+        btn = self.sidebar_buttons.get(item)
+        if btn is None:
+            return
+        if item == getattr(self, "_current_frame_name", None):
+            return
+        btn.configure(bg=UI_SOFT if entering else UI_BG,
+                      fg=UI_ACCENT if entering else UI_TEXT)
 
     # ------------------------------------------------------------------
     def get_diff_files(self):
