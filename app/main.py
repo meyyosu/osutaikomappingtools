@@ -59,7 +59,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.13"
+APP_VERSION = "1.14"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -446,6 +446,7 @@ COORD_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_coo
 WINDOW_GEOMETRY_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_geometry.txt")
 FIRST_RUN_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_firstrun.txt")
 METADATA_AUTOFILL_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_metadata_autofill.txt")
+METADATA_DISPLAY_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_metadata_display.txt")
 EARLY_VOLUME_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_early_volume.json")
 WAIFU2X_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_waifu2x.json")
 SONG_INDEX_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_songindex_cache.json")
@@ -571,6 +572,25 @@ def save_live_sync_config(value: bool):
     try:
         with open(LIVE_SYNC_CONFIG_PATH, "w", encoding="utf-8") as f:
             f.write("1" if value else "0")
+    except OSError:
+        pass
+
+
+def load_metadata_display_mode() -> str:
+    """Returns "unicode" or "romanised" — the default form artist/title
+    fields are shown in throughout the app (Now Playing label, search
+    results). Defaults to "unicode"."""
+    try:
+        with open(METADATA_DISPLAY_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return "romanised" if f.read().strip() == "romanised" else "unicode"
+    except OSError:
+        return "unicode"
+
+
+def save_metadata_display_mode(value: str):
+    try:
+        with open(METADATA_DISPLAY_CONFIG_PATH, "w", encoding="utf-8") as f:
+            f.write("romanised" if value == "romanised" else "unicode")
     except OSError:
         pass
 
@@ -761,7 +781,8 @@ class App(tk.Tk):
         self.now_selecting_var = tk.StringVar(value="Now Selecting: (no map selected)")
         self._current_map_meta = None
         self.current_diff_filename = None
-        self.use_romanised_display = False
+        self.metadata_display_mode = load_metadata_display_mode()
+        self.use_romanised_display = (self.metadata_display_mode == "romanised")
         self.song_index = []          # list of dicts, see build_song_index()
         self._indexing = False
         self._indexed_once = False
@@ -782,6 +803,12 @@ class App(tk.Tk):
         self._busy_focusin_binding = None
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self.bind_all("<Button-1>", self._on_global_click_unfocus, add="+")
+        # Live search dropdown: one permanent, never-removed handler pair
+        # (same reasoning as LightDropdown's global handlers — unbind_all
+        # would wipe the co-installed unfocus handler above). Both no-op
+        # unless a search dropdown is currently open.
+        self.bind_all("<Button-1>", self._search_dd_global_click, add="+")
+        self.bind("<Configure>", self._reposition_search_dropdown, add="+")
 
         self._build_titlebar()
         self._build_body()
@@ -1218,7 +1245,14 @@ class App(tk.Tk):
         search_entry.pack(side="left", padx=(10, 4), pady=8)
         search_entry.bind("<Return>", lambda e: self._on_search())
         search_entry.bind("<FocusIn>", self._on_search_focus_in)
+        search_entry.bind("<Down>", self._on_search_nav)
+        search_entry.bind("<Up>", self._on_search_nav)
+        search_entry.bind("<Escape>", lambda e: self._close_search_dropdown())
         self.search_entry = search_entry
+        self._search_wrap = search_wrap
+        self._search_dropdown = None
+        self._search_type_job = None
+        self.search_var.trace_add("write", self._on_search_type)
 
         search_btn = tk.Button(search_wrap, text="🔍", command=self._on_search,
                                 font=("Segoe UI Emoji", 10), bg=UI_SOFT, activebackground=UI_SOFT,
@@ -1438,6 +1472,7 @@ class App(tk.Tk):
             "index_mode": self.song_index_mode,
             "confirm_pattern_delete": self.confirm_pattern_delete,
             "live_sync": self.live_sync_enabled,
+            "metadata_display": self.metadata_display_mode,
         }
 
         body = make_scrollable_toplevel_body(win, bg=FRONT_BG)
@@ -1523,10 +1558,29 @@ class App(tk.Tk):
         refresh_status()
 
         # ------------------------------------------------------------------
-        # 2. Live-sync song select
+        # 2. Metadata Display Preferences
+        # ------------------------------------------------------------------
+        meta_display_card = section_card()
+        section_heading(meta_display_card.body, "2. Metadata Display Preferences",
+                         "Sets the default form artist and title are shown in\n"
+                         "for Now Playing and search results. The \"あ\" title-bar\n"
+                         "button still toggles it live per-session.")
+
+        meta_display_var = tk.StringVar(value=pending["metadata_display"])
+
+        def on_meta_display_change():
+            pending["metadata_display"] = meta_display_var.get()
+
+        LightRadiobutton(meta_display_card.body, "Unicode", meta_display_var, "unicode",
+                          command=on_meta_display_change).pack(anchor="w", pady=3)
+        LightRadiobutton(meta_display_card.body, "Romanised", meta_display_var, "romanised",
+                          command=on_meta_display_change).pack(anchor="w", pady=3)
+
+        # ------------------------------------------------------------------
+        # 3. Live-sync song select
         # ------------------------------------------------------------------
         sync_card = section_card()
-        section_heading(sync_card.body, "2. Live-sync Song Select")
+        section_heading(sync_card.body, "3. Live-sync Song Select")
 
         live_sync_var = tk.StringVar(value="auto" if pending["live_sync"] else "manual")
 
@@ -1539,10 +1593,10 @@ class App(tk.Tk):
                           live_sync_var, "manual", command=on_live_sync_change).pack(anchor="w", pady=3)
 
         # ------------------------------------------------------------------
-        # 3. Song Index on Startup
+        # 4. Song Index on Startup
         # ------------------------------------------------------------------
         index_card = section_card()
-        section_heading(index_card.body, "3. Song Index on Startup",
+        section_heading(index_card.body, "4. Song Index on Startup",
                          "- Manual: Disable auto-indexing\n"
                          "- Partial: Auto-index 100 most recent taiko maps\n"
                          "- Full: Auto-index your entire songs folder")
@@ -1557,10 +1611,10 @@ class App(tk.Tk):
                               command=on_index_mode_change).pack(anchor="w", pady=3)
 
         # ------------------------------------------------------------------
-        # 4. Confirm Gallery Pattern Deletion
+        # 5. Confirm Gallery Pattern Deletion
         # ------------------------------------------------------------------
         confirm_card = section_card()
-        section_heading(confirm_card.body, "4. Confirm Gallery Pattern Deletion")
+        section_heading(confirm_card.body, "5. Confirm Gallery Pattern Deletion")
 
         disable_warning_var = tk.BooleanVar(value=not pending["confirm_pattern_delete"])
 
@@ -1571,10 +1625,10 @@ class App(tk.Tk):
                       disable_warning_var, command=on_disable_warning_change).pack(anchor="w")
 
         # ------------------------------------------------------------------
-        # 5. Download resources
+        # 6. Download resources
         # ------------------------------------------------------------------
         download_card = section_card()
-        section_heading(download_card.body, "5. Download Resources",
+        section_heading(download_card.body, "6. Download Resources",
                          "Including\n\n"
                          "- ffmpeg + ffprobe\n"
                          "- VLC Player\n"
@@ -1663,7 +1717,8 @@ class App(tk.Tk):
             return (pending["folder"] != (self.osu_songs_folder or "")
                     or pending["index_mode"] != self.song_index_mode
                     or pending["confirm_pattern_delete"] != self.confirm_pattern_delete
-                    or pending["live_sync"] != self.live_sync_enabled)
+                    or pending["live_sync"] != self.live_sync_enabled
+                    or pending["metadata_display"] != self.metadata_display_mode)
 
         def do_apply():
             changed_folder = pending["folder"] != (self.osu_songs_folder or "")
@@ -1690,6 +1745,8 @@ class App(tk.Tk):
                 save_confirm_pattern_delete(pending["confirm_pattern_delete"])
             if pending["live_sync"] != self.live_sync_enabled:
                 self._set_live_sync_enabled(pending["live_sync"])
+            if pending["metadata_display"] != self.metadata_display_mode:
+                self.set_metadata_display_mode(pending["metadata_display"])
 
         def apply_and_notify():
             do_apply()
@@ -2034,8 +2091,100 @@ class App(tk.Tk):
         # A tool name takes priority (cheap, instant); otherwise treat it as
         # a song search over the indexed Songs folder.
         if self._search_tools(query):
+            self._close_search_dropdown()
             return
+        dd = getattr(self, "_search_dropdown", None)
+        if dd is not None and dd.winfo_exists():
+            folder = dd.activate()
+            if folder:
+                self._on_search_pick(folder)
+                return
         self.search_songs(query)
+
+    # -- live search-as-you-type dropdown ---------------------------------
+    def _on_search_type(self, *_):
+        """Debounced trace on search_var — refreshes the results dropdown
+        ~140ms after the last keystroke."""
+        if self._search_type_job:
+            try:
+                self.after_cancel(self._search_type_job)
+            except Exception:
+                pass
+        self._search_type_job = self.after(140, self._update_search_dropdown)
+
+    def _update_search_dropdown(self):
+        # Cancel any still-pending debounced job — this method is also
+        # called directly (keyboard nav, the 🔍 button), and a stale
+        # trailing job firing afterward would reopen a just-closed dropdown.
+        if self._search_type_job:
+            try:
+                self.after_cancel(self._search_type_job)
+            except Exception:
+                pass
+            self._search_type_job = None
+        raw = self.search_var.get().strip()
+        if not raw or raw == "Search osu! map...":
+            self._close_search_dropdown()
+            return
+        if self._indexing or not self.song_index:
+            # Nothing to search yet — the 🔍 button still gives the
+            # helpful "index first" alerts via search_songs().
+            self._close_search_dropdown()
+            return
+        q = raw.lower()
+        matches = [e for e in self.song_index if q in e["blob"]][:25]
+        self._show_search_dropdown(matches)
+
+    def _show_search_dropdown(self, matches):
+        dd = getattr(self, "_search_dropdown", None)
+        if dd is None or not dd.winfo_exists():
+            from screens import SongSearchDropdown
+            dd = SongSearchDropdown(self, self._search_wrap, self._on_search_pick)
+            self._search_dropdown = dd
+        dd.set_results(matches, romanised=self.use_romanised_display)
+        dd.present()
+
+    def _close_search_dropdown(self, *_):
+        if self._search_type_job:
+            try:
+                self.after_cancel(self._search_type_job)
+            except Exception:
+                pass
+            self._search_type_job = None
+        dd = getattr(self, "_search_dropdown", None)
+        if dd is not None and dd.winfo_exists():
+            dd.destroy()
+        self._search_dropdown = None
+
+    def _on_search_pick(self, folder):
+        self._close_search_dropdown()
+        self._select_map_folder(folder)
+
+    def _on_search_nav(self, event):
+        dd = getattr(self, "_search_dropdown", None)
+        if dd is None or not dd.winfo_exists():
+            if event.keysym == "Down":
+                self._update_search_dropdown()
+            return "break"
+        dd.move_active(1 if event.keysym == "Down" else -1)
+        return "break"
+
+    def _search_dd_global_click(self, event):
+        dd = getattr(self, "_search_dropdown", None)
+        if dd is None or not dd.winfo_exists():
+            return
+        try:
+            ws = str(event.widget)
+            if ws.startswith(str(dd)) or ws.startswith(str(self._search_wrap)):
+                return
+        except Exception:
+            pass
+        self._close_search_dropdown()
+
+    def _reposition_search_dropdown(self, _event=None):
+        dd = getattr(self, "_search_dropdown", None)
+        if dd is not None and dd.winfo_exists():
+            dd.reposition()
 
     def set_osu_folder(self):
         from screens import _show_alert
@@ -2364,11 +2513,6 @@ class App(tk.Tk):
 
     def search_songs(self, query, _retries=0):
         from screens import _show_alert
-        existing = getattr(self, "_search_win", None)
-        if existing is not None and existing.winfo_exists():
-            existing.lift()
-            existing.focus_force()
-            return
 
         if self._indexing:
             if _retries > 100:  # ~20s safety cap
@@ -2403,8 +2547,7 @@ class App(tk.Tk):
         if not matches:
             _show_alert(self, APP_TITLE, f'No songs matched "{query}".')
             return
-        from screens import SongSearchResultsWindow
-        self._search_win = SongSearchResultsWindow(self, matches, self._select_map_folder)
+        self._show_search_dropdown(matches[:25])
 
     def _select_map_folder(self, folder, diff_filename=None):
         """diff_filename, if given, is the specific difficulty to show in
@@ -2453,10 +2596,28 @@ class App(tk.Tk):
         """Switches the "Now Selecting" label between original (unicode)
         and romanised metadata for the current map."""
         self.use_romanised_display = not self.use_romanised_display
+        self._refresh_metadata_display()
+
+    def set_metadata_display_mode(self, mode: str):
+        """Applies (and persists) the default artist/title display form —
+        "unicode" or "romanised" — used by the Now Selecting label and the
+        search results. Called from Settings."""
+        mode = "romanised" if mode == "romanised" else "unicode"
+        self.metadata_display_mode = mode
+        save_metadata_display_mode(mode)
+        self.use_romanised_display = (mode == "romanised")
+        self._refresh_metadata_display()
+
+    def _refresh_metadata_display(self):
+        """Re-renders anything that shows artist/title text after the
+        unicode/romanised preference changes."""
         folder = self.current_map_folder.get()
         if folder:
             diffs = osu_parser.list_difficulty_files(folder)
             self._refresh_now_selecting_label(folder, diffs)
+        dd = getattr(self, "_search_dropdown", None)
+        if dd is not None and dd.winfo_exists():
+            self._update_search_dropdown()
 
     def open_current_map_folder(self):
         """Opens the currently selected map's folder in the OS file

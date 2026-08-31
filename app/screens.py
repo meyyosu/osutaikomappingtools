@@ -965,6 +965,333 @@ class SongSearchResultsWindow(tk.Toplevel):
             pass  # keep the (already correctly-sized) placeholder on any read/decode error
 
 
+class SongSearchDropdown(tk.Toplevel):
+    """Search-as-you-type results panel anchored directly beneath the
+    title-bar search field. Borderless (`overrideredirect`), `-topmost`,
+    and deliberately **never** grabs focus or the keyboard — the search
+    Entry keeps every key (Up/Down move the highlight, Enter picks, Esc
+    closes) and this window is a pure mouse-driven display that repaints
+    live as `main.py` feeds it fresh matches via `set_results()`.
+
+    Replaces the old modal `SongSearchResultsWindow` for the common
+    "type and pick" case. main.py owns the single instance and drives it:
+    `set_results()` → `present()` to show/refresh, `move_active(±1)` /
+    `activate()` for keyboard nav, `reposition()` on a window move/resize,
+    `destroy()` to close.
+
+    A small "あ" button in the header toggles romanised artist/title for
+    every row — wired to `app.toggle_metadata_display()` so it stays in
+    lockstep with the title bar's own あ button. Long entries wrap onto a
+    second line (`wraplength` on the row label) rather than being clipped,
+    so row height is variable and geometry is measured, not computed from
+    a fixed per-row constant.
+
+    Thumbnails are loaded lazily on an idle callback (and memoised in
+    `_thumb_cache`, keyed by bg path, for the whole widget lifetime) so a
+    keystroke that rebuilds 25 rows paints instantly and the image decode
+    doesn't stutter typing."""
+
+    THUMB_W, THUMB_H = 56, 32
+    WIDTH = 460
+    LABEL_WRAP = 372          # px before a row's title wraps to a 2nd line
+    MAX_BODY_H = 320          # px; taller result lists scroll
+    ROW_BG = FRONT_CARD_BG
+    ROW_ACTIVE_BG = LIGHT_ACCENT_SOFT
+
+    def __init__(self, app, anchor_widget, on_select):
+        super().__init__(app)
+        self.withdraw()
+        self.overrideredirect(True)
+        try:
+            self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        # 1px hairline border: the toplevel's own bg shows through the
+        # padx/pady=1 gap around the inner FRONT_BG frame.
+        self.configure(bg=FRONT_BORDER)
+        self.app = app
+        self.anchor_widget = anchor_widget
+        self.on_select = on_select
+        self._thumb_images = []          # live PhotoImage refs (this rebuild)
+        self._thumb_cache = {}           # bg_path -> PhotoImage, whole lifetime
+        self._rows = []                  # list of row dicts
+        self._entries = []
+        self._romanised = bool(getattr(app, "use_romanised_display", False))
+        self._visible = False
+        self._thumb_job = None
+        self.active_index = -1
+
+        outer = tk.Frame(self, bg=FRONT_BG)
+        outer.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # Header: result count on the left, あ romanisation toggle on the
+        # right. Plain clickable tk.Label (not _make_ghost_button) — a
+        # classic tk.Button grabs OS focus on click, which would pull it
+        # off the search Entry; a Label never does.
+        self._header = tk.Frame(outer, bg=FRONT_BG)
+        self._header.pack(side="top", fill="x")
+        self._count_label = tk.Label(self._header, text="", bg=FRONT_BG,
+                                      fg=FRONT_TEXT_MUTED, font=("Segoe UI", 9))
+        self._count_label.pack(side="left", padx=12, pady=(8, 6))
+        self._roman_btn = tk.Label(self._header, text="あ", font=("Segoe UI", 11, "bold"),
+                                    bg=LIGHT_ACCENT_SOFT, fg=LIGHT_ACCENT,
+                                    cursor="hand2", padx=10, pady=2)
+        self._roman_btn.pack(side="right", padx=8, pady=(6, 6))
+        self._roman_btn.bind("<Button-1>", self._on_roman_click)
+        self._roman_btn.bind(
+            "<Enter>", lambda e: self._roman_btn.configure(bg=LIGHT_ACCENT, fg="#ffffff"))
+        self._roman_btn.bind(
+            "<Leave>", lambda e: self._roman_btn.configure(bg=LIGHT_ACCENT_SOFT, fg=LIGHT_ACCENT))
+        tk.Frame(outer, bg=FRONT_BORDER, height=1).pack(side="top", fill="x")
+
+        body = tk.Frame(outer, bg=FRONT_BG)
+        body.pack(side="top", fill="both", expand=True)
+        self._canvas = tk.Canvas(body, width=self.WIDTH, highlightthickness=0, bg=FRONT_BG)
+        self._sb = ttk.Scrollbar(body, orient="vertical", command=self._canvas.yview)
+        self._inner = tk.Frame(self._canvas, bg=FRONT_BG)
+        self._inner.bind(
+            "<Configure>",
+            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.create_window((0, 0), window=self._inner, anchor="nw", width=self.WIDTH)
+        self._canvas.configure(yscrollcommand=self._sb.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._msg_label = None
+
+        def _on_wheel(event):
+            if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                self._canvas.yview_scroll(-2, "units")
+            elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                self._canvas.yview_scroll(2, "units")
+            return "break"
+        self._wheel_handler = _on_wheel
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self._canvas.bind(seq, _on_wheel)
+            self._inner.bind(seq, _on_wheel)
+
+        self.bind("<Destroy>", self._on_destroy)
+
+    # -- public API used by main.py -------------------------------------
+    def set_results(self, entries, romanised=False):
+        self._entries = list(entries)
+        self._romanised = romanised
+        self.active_index = -1
+        if self._thumb_job is not None:
+            try:
+                self.app.after_cancel(self._thumb_job)
+            except Exception:
+                pass
+            self._thumb_job = None
+        for r in self._rows:
+            r["frame"].destroy()
+        self._rows = []
+        self._thumb_images = []
+        if self._msg_label is not None:
+            self._msg_label.destroy()
+            self._msg_label = None
+
+        n = len(self._entries)
+        self._count_label.configure(
+            text=f"{n} result{'s' if n != 1 else ''}" if n else "No matches")
+
+        if not self._entries:
+            self._msg_label = tk.Label(self._inner, text="No songs matched.",
+                                        bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
+                                        font=("Segoe UI", 11), anchor="w")
+            self._msg_label.pack(fill="x", padx=14, pady=12)
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self._msg_label.bind(seq, self._wheel_handler)
+        else:
+            for i, entry in enumerate(self._entries):
+                self._build_row(i, entry)
+            self._thumb_job = self.app.after(1, self._hydrate_thumbnails)
+
+        self._canvas.yview_moveto(0.0)
+        self._update_geometry()
+
+    def present(self):
+        self._update_geometry()
+        if not self._visible:
+            self._visible = True
+            self.deiconify()
+            try:
+                self.lift()
+            except tk.TclError:
+                pass
+
+    def reposition(self):
+        if self._visible:
+            self._update_geometry()
+
+    def move_active(self, delta):
+        if not self._rows:
+            return
+        n = len(self._rows)
+        if self.active_index < 0:
+            self.active_index = 0 if delta > 0 else n - 1
+        else:
+            self.active_index = max(0, min(n - 1, self.active_index + delta))
+        self._paint()
+        self._scroll_to(self.active_index)
+
+    def activate(self):
+        """The folder of the highlighted row (or the first row if nothing
+        is highlighted yet); None if there are no results."""
+        if not self._rows:
+            return None
+        idx = self.active_index if self.active_index >= 0 else 0
+        return self._rows[idx]["entry"]["folder"]
+
+    # -- internals -----------------------------------------------------
+    def _on_destroy(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        if self._thumb_job is not None:
+            try:
+                self.app.after_cancel(self._thumb_job)
+            except Exception:
+                pass
+            self._thumb_job = None
+
+    def _build_row(self, index, entry):
+        row = tk.Frame(self._inner, bg=self.ROW_BG, cursor="hand2")
+        row.pack(fill="x")
+
+        thumb = tk.Label(row, bg="black")
+        thumb.pack(side="left", padx=(8, 8), pady=7, anchor="n")
+        self._set_placeholder_thumbnail(thumb)
+
+        display = entry.get("display_romanised") if self._romanised else entry.get("display")
+        lbl = tk.Label(row, text=display or entry.get("display", ""), anchor="w",
+                        justify="left", wraplength=self.LABEL_WRAP,
+                        bg=self.ROW_BG, fg=FRONT_TEXT, font=("Segoe UI", 11))
+        lbl.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=7)
+
+        rec = {"frame": row, "label": lbl, "thumb": thumb, "entry": entry, "index": index}
+        self._rows.append(rec)
+
+        for w in (row, thumb, lbl):
+            w.bind("<Button-1>", lambda e, i=index: self._pick(i))
+            w.bind("<Enter>", lambda e, i=index: self._hover(i))
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                w.bind(seq, self._wheel_handler)
+
+    _set_placeholder_thumbnail = SongSearchResultsWindow._set_placeholder_thumbnail
+
+    def _make_thumb(self, bg_path):
+        if not bg_path or not os.path.exists(bg_path):
+            return None
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(bg_path).convert("RGB")
+            img.thumbnail((self.THUMB_W, self.THUMB_H))
+            canvas_img = Image.new("RGB", (self.THUMB_W, self.THUMB_H), (0, 0, 0))
+            canvas_img.paste(img, ((self.THUMB_W - img.width) // 2,
+                                    (self.THUMB_H - img.height) // 2))
+            return ImageTk.PhotoImage(canvas_img)
+        except Exception:
+            return None
+
+    def _hydrate_thumbnails(self):
+        self._thumb_job = None
+        for r in self._rows:
+            if not r["thumb"].winfo_exists():
+                continue
+            bg = r["entry"].get("bg_path")
+            if not bg:
+                continue
+            img = self._thumb_cache.get(bg)
+            if img is None:
+                img = self._make_thumb(bg)
+                if img is None:
+                    continue
+                self._thumb_cache[bg] = img
+            r["thumb"].configure(image=img, width=self.THUMB_W, height=self.THUMB_H)
+
+    def _on_roman_click(self, _event=None):
+        self._toggle_romanised()
+        return "break"   # keep the search Entry's focus / the dropdown open
+
+    def _toggle_romanised(self):
+        # Drive the app-wide toggle so this and the title bar's あ button
+        # never disagree, then repaint every row's title.
+        try:
+            self.app.toggle_metadata_display()
+        except Exception:
+            pass
+        self._romanised = bool(getattr(self.app, "use_romanised_display", False))
+        for r in self._rows:
+            entry = r["entry"]
+            txt = entry.get("display_romanised") if self._romanised else entry.get("display")
+            r["label"].configure(text=txt or entry.get("display", ""))
+        self._update_geometry()
+
+    def _hover(self, index):
+        self.active_index = index
+        self._paint()
+
+    def _paint(self):
+        for r in self._rows:
+            bg = self.ROW_ACTIVE_BG if r["index"] == self.active_index else self.ROW_BG
+            r["frame"].configure(bg=bg)
+            r["label"].configure(bg=bg)
+
+    def _pick(self, index):
+        if not (0 <= index < len(self._rows)):
+            return
+        folder = self._rows[index]["entry"]["folder"]
+        # Defer past this child-widget event so on_select can tear the
+        # whole dropdown down without "application has been destroyed".
+        self.app.after_idle(lambda: self.on_select(folder))
+
+    def _scroll_to(self, index):
+        """Scroll the just-highlighted row fully into view. Row heights are
+        variable (text wraps), so this reads real widget geometry rather
+        than multiplying by a fixed row height."""
+        if not (0 <= index < len(self._rows)):
+            return
+        self._canvas.update_idletasks()
+        fr = self._rows[index]["frame"]
+        row_top = fr.winfo_y()
+        row_bot = row_top + fr.winfo_height()
+        total = max(1, self._inner.winfo_height())
+        view_h = self._canvas.winfo_height()
+        top_px = self._canvas.yview()[0] * total
+        if row_top < top_px:
+            self._canvas.yview_moveto(row_top / total)
+        elif row_bot > top_px + view_h:
+            self._canvas.yview_moveto((row_bot - view_h) / total)
+
+    def _chrome_height(self):
+        try:
+            self._header.update_idletasks()
+            return self._header.winfo_reqheight() + 1   # + 1px divider
+        except tk.TclError:
+            return 33
+
+    def _update_geometry(self):
+        aw = self.anchor_widget
+        if not aw.winfo_exists():
+            return
+        try:
+            aw.update_idletasks()
+            self._inner.update_idletasks()
+        except tk.TclError:
+            return
+        has_content = bool(self._rows) or self._msg_label is not None
+        content_h = self._inner.winfo_reqheight() if has_content else 40
+        body_h = min(content_h, self.MAX_BODY_H)
+        self._canvas.configure(height=body_h)
+        need_sb = content_h > body_h + 1
+        if need_sb and not self._sb.winfo_ismapped():
+            self._sb.pack(side="right", fill="y")
+        elif not need_sb and self._sb.winfo_ismapped():
+            self._sb.pack_forget()
+        w = self.WIDTH + (self._sb.winfo_reqwidth() if need_sb else 0) + 2
+        x = aw.winfo_rootx()
+        y = aw.winfo_rooty() + aw.winfo_height() + 2
+        self.geometry(f"{w}x{self._chrome_height() + body_h + 2}+{x}+{y}")
+
+
 def _rounded_rect_points(x1, y1, x2, y2, r):
     """Point list for a smoothed create_polygon rounded rectangle — the
     standard tkinter recipe (a polygon with a corner point pulled in by
@@ -3536,6 +3863,9 @@ class TimingEditorFrame(BaseToolFrame):
         self.divisor_var.trace_add("write", lambda *_a: self._redraw_timeline())
         # extend the timeline's barlines down into the waveform / onset strip
         self.wave_barlines_var = tk.BooleanVar(value=False)
+        # when set, the mouse can only seek on the timeline/waveform — red-line
+        # drag-to-move is disabled (see _tl_press)
+        self.timeline_locked_var = tk.BooleanVar(value=False)
 
         body = self.body
 
@@ -3571,11 +3901,11 @@ class TimingEditorFrame(BaseToolFrame):
         self.hdr_canvas.grid(row=0, column=0, sticky="ew")
         self.hdr_frame = tk.Frame(self.hdr_canvas, bg=FRONT_CARD_BG)
         self.hdr_canvas.create_window((0, 0), window=self.hdr_frame, anchor="nw")
-        headers = ["Sel", "Old offset", "BPM", "Δ offset", "Δ BPM", "BL",
+        headers = ["Sel", "Old Offset", "BPM", "Δ Offset", "Δ BPM", "Omit BL",
                    "New Offset", "New BPM", "Time sig"]
         for col, txt in enumerate(headers):
             tk.Label(self.hdr_frame, text=txt, bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED,
-                     font=("Segoe UI", 9, "bold")).grid(row=0, column=col, padx=6, pady=(6, 4), sticky="w")
+                     font=("Segoe UI", 9, "bold")).grid(row=0, column=col, padx=6, pady=(6, 4))
         self.hdr_frame.bind("<Configure>", lambda _e: self._sync_scrollregions())
         tk.Frame(tbl_wrap, bg=FRONT_BORDER, height=1).grid(row=1, column=0, sticky="ew")
 
@@ -3652,9 +3982,14 @@ class TimingEditorFrame(BaseToolFrame):
         self.seek_scroll = ttk.Scrollbar(body, orient="horizontal", command=self._seek_scroll)
         self.seek_scroll.pack(fill="x", padx=24, pady=(0, 4))
         self.seek_scroll.set(0.0, 1.0)
-        LightCheckbox(body, "Display barlines in waveform view", self.wave_barlines_var,
+        wf_opts = tk.Frame(body, bg=FRONT_BG)
+        wf_opts.pack(fill="x", padx=24, pady=(0, 8))
+        LightCheckbox(wf_opts, "Display barlines in waveform view", self.wave_barlines_var,
                        bg=FRONT_BG, font=("Segoe UI", 9),
-                       command=self._redraw_timeline).pack(anchor="w", padx=24, pady=(0, 8))
+                       command=self._redraw_timeline).pack(side="left")
+        LightCheckbox(wf_opts, "Lock timeline", self.timeline_locked_var,
+                       bg=FRONT_BG, font=("Segoe UI", 9),
+                       command=self._redraw_timeline).pack(side="right")
 
         # Both canvases share the same time transform. Wheel + press + drag are
         # identical on either (a drag on the waveform scrolls the current-time
@@ -3894,35 +4229,35 @@ class TimingEditorFrame(BaseToolFrame):
         old_lbl = _fmt_ms_timestamp(old_time)
         oe = _make_light_entry(rf, width=11, state="readonly")
         oe.configure(state="normal"); oe.insert(0, old_lbl); oe.configure(state="readonly")
-        oe.grid(row=0, column=1, padx=6, pady=3, sticky="w")
+        oe.grid(row=0, column=1, padx=6, pady=3)
         row["oe"] = oe
         be = _make_light_entry(rf, width=8, state="readonly")
         be.configure(state="normal"); be.insert(0, self._fmt_bpm(old_bpm)); be.configure(state="readonly")
-        be.grid(row=0, column=2, padx=6, pady=3, sticky="w")
+        be.grid(row=0, column=2, padx=6, pady=3)
         row["be"] = be
 
         row["doff_spin"] = LightSpinner(rf, row["doff_var"], from_=-10_000_000,
                                          to=10_000_000, increment=1, width=6, fmt="%d",
                                          validate=("key", self._vc_sint))
-        row["doff_spin"].grid(row=0, column=3, padx=6, pady=3, sticky="w")
+        row["doff_spin"].grid(row=0, column=3, padx=6, pady=3)
         row["dbpm_spin"] = LightSpinner(rf, row["dbpm_var"], from_=-100000, to=100000,
                                          increment=0.1, width=6, fmt="%.1f",
                                          validate=("key", self._vc_snum))
-        row["dbpm_spin"].grid(row=0, column=4, padx=6, pady=3, sticky="w")
+        row["dbpm_spin"].grid(row=0, column=4, padx=6, pady=3)
         row["bl_chk"] = LightCheckbox(rf, "", row["bl_var"], bg=cbg)
         row["bl_chk"].grid(row=0, column=5, padx=6, pady=3)
         row["noff_spin"] = LightSpinner(rf, row["noff_var"], from_=-10_000_000,
                                          to=10_000_000, increment=1, width=10,
                                          fmt=_fmt_ms_timestamp, parse=_parse_ms_timestamp,
                                          validate=("key", self._vc_offset))
-        row["noff_spin"].grid(row=0, column=6, padx=6, pady=3, sticky="w")
+        row["noff_spin"].grid(row=0, column=6, padx=6, pady=3)
         row["nbpm_spin"] = LightSpinner(rf, row["nbpm_var"], from_=1, to=100000,
                                          increment=0.1, width=7,
                                          validate=("key", self._vc_snum))
-        row["nbpm_spin"].grid(row=0, column=7, padx=6, pady=3, sticky="w")
+        row["nbpm_spin"].grid(row=0, column=7, padx=6, pady=3)
         row["ts_spin"] = LightSpinner(rf, row["ts_var"], from_=2, to=10, increment=1,
                                        width=4, fmt="%d", validate=("key", self._vc_uint))
-        row["ts_spin"].grid(row=0, column=8, padx=6, pady=3, sticky="w")
+        row["ts_spin"].grid(row=0, column=8, padx=6, pady=3)
 
         row["noff_spin"].entry.bind("<FocusOut>", lambda _e, rr=row: self._normalize_offset(rr), add="+")
         row["noff_spin"].entry.bind("<Return>", lambda _e, rr=row: self._normalize_offset(rr), add="+")
@@ -4735,6 +5070,11 @@ class TimingEditorFrame(BaseToolFrame):
             cx + 3, H * 0.5, anchor="nw", fill="#4a4a4a", font=("Segoe UI", 8, "bold"),
             text=_fmt_ms_timestamp(self.cursor_ms), tags="cursor")
 
+        if self.timeline_locked_var.get():
+            c.create_text((c.winfo_width() or 1000) - 4, 3, anchor="ne",
+                           fill="#8a8a8a", font=("Segoe UI", 8, "bold"),
+                           text="LOCK")
+
         self._redraw_waveform(draw0, draw1)
         self._sync_seek_scrollbar()
 
@@ -4748,8 +5088,10 @@ class TimingEditorFrame(BaseToolFrame):
     def _compute_onsets(self):
         """Energy-based onset detection over the (5ms/bucket) peak envelope:
         half-wave-rectified first difference of a lightly smoothed curve,
-        then adaptive-threshold local-max peak-picking. Returns onset
-        *bucket indices* (file-time = idx * bucket_ms)."""
+        then adaptive-threshold local-max peak-picking. Returns a list of
+        `(bucket_index, strength)` pairs — `strength` is the onset flux
+        normalised to 0..1 (drives each marker's size in the onset view);
+        file-time = idx * bucket_ms."""
         peaks = self._peaks
         if not peaks:
             return []
@@ -4771,7 +5113,7 @@ class TimingEditorFrame(BaseToolFrame):
         mx = max(flux) or 1.0
         win = max(1, int(160.0 / bm))       # ~160ms local-mean window
         min_gap = max(1, int(45.0 / bm))    # ~45ms minimum onset spacing
-        onsets = []
+        onsets = []   # (bucket_idx, strength 0..1)
         last = -10 ** 9
         for i in range(1, n - 1):
             f = flux[i]
@@ -4781,12 +5123,13 @@ class TimingEditorFrame(BaseToolFrame):
             local_mean = (pref[hi] - pref[lo]) / (hi - lo)
             if f < local_mean * 2.2 + mx * 0.05:
                 continue
+            strength = min(1.0, f / mx)
             if i - last < min_gap:
-                if onsets and f > flux[onsets[-1]]:
-                    onsets[-1] = i
+                if onsets and strength > onsets[-1][1]:
+                    onsets[-1] = (i, strength)
                     last = i
                 continue
-            onsets.append(i)
+            onsets.append((i, strength))
             last = i
         return onsets
 
@@ -4848,32 +5191,41 @@ class TimingEditorFrame(BaseToolFrame):
             xa = max(-3000, int(self._t_to_x(draw0)))
             xb = min(int(W) + 3000, int(self._t_to_x(draw1)) + 1)
             top, bot = [], []
-            for x in range(xa, xb):
-                # sample 20ms later in the file than the grid time at this x
-                # (matches osu!lazer's WAVEFORM_VISUAL_OFFSET, see class const)
-                t = self._x_to_t(x) + off
-                bi = int(t / bm) if t >= 0 else -1
-                a = peaks[bi] * (mid - 1) if 0 <= bi < n else 0.0
-                top.append(x); top.append(mid - a)
-                bot.append(x); bot.append(mid + a)
-            # one filled polygon (top envelope + reversed bottom) instead of
-            # ~W separate create_line calls — the per-item overhead was what
-            # made playback scroll stutter. Dimmed in onset mode so the
-            # detected-attack lines read on top.
-            if len(top) >= 4:
-                poly = top + [v for i in range(len(bot) - 2, -1, -2) for v in (bot[i], bot[i + 1])]
-                c.create_polygon(poly, fill="#e7dff4" if onset_mode else "#c9b8ea",
-                                  outline="", tags="scroll")
-
+            if not onset_mode:
+                for x in range(xa, xb):
+                    # sample 20ms later in the file than the grid time at this x
+                    # (matches osu!lazer's WAVEFORM_VISUAL_OFFSET, see class const)
+                    t = self._x_to_t(x) + off
+                    bi = int(t / bm) if t >= 0 else -1
+                    a = peaks[bi] * (mid - 1) if 0 <= bi < n else 0.0
+                    top.append(x); top.append(mid - a)
+                    bot.append(x); bot.append(mid + a)
             if onset_mode:
+                # Onset view: instead of the full envelope dimmed under
+                # full-height marker lines (cluttered, hard to read against),
+                # draw one small diamond per detected attack — height/width
+                # scaled by the onset strength, a thin stem at the exact
+                # onset time — on an otherwise empty strip, so each note-hit
+                # reads as its own discrete mark.
                 if self._onsets is None:
                     self._onsets = self._compute_onsets()
-                for idx in self._onsets:
-                    ot = idx * bm - off        # onset file time -> grid time
-                    if ot < draw0 or ot > draw1:
+                c.create_line(xa, mid, xb, mid, fill="#e4e0ef", tags="scroll")
+                amp = mid - 3
+                for idx, st in self._onsets:
+                    x = self._t_to_x(idx * bm - off)   # onset file->grid time
+                    if x < xa - 20 or x > xb + 20:
                         continue
-                    x = self._t_to_x(ot)
-                    c.create_line(x, 2, x, H - 2, fill="#12a594", width=1, tags="scroll")
+                    h = max(0.25, st) * amp
+                    w = 3 + 2 * st
+                    c.create_polygon(x - w, mid, x, mid - h, x + w, mid, x, mid + h,
+                                      fill="#8fd0c4", outline="", tags="scroll")
+                    c.create_line(x, mid - h, x, mid + h, fill="#2f9d8c", tags="scroll")
+            elif len(top) >= 4:
+                # one filled polygon (top envelope + reversed bottom) instead
+                # of ~W separate create_line calls — the per-item overhead was
+                # what made playback scroll stutter.
+                poly = top + [v for i in range(len(bot) - 2, -1, -2) for v in (bot[i], bot[i + 1])]
+                c.create_polygon(poly, fill="#c9b8ea", outline="", tags="scroll")
 
         reds = self._new_redlines()
         if self.wave_barlines_var.get():
@@ -5142,6 +5494,8 @@ class TimingEditorFrame(BaseToolFrame):
         self._drag_cursor0 = self.cursor_ms
         self._drag_moved = False
         self._drag_red = None
+        if self.timeline_locked_var.get():
+            return   # locked: mouse can only seek, never grab a red line
         for r in self._new_redlines():
             if abs(self._t_to_x(r["t"]) - e.x) <= 5:
                 self._drag_red = r["row"]
