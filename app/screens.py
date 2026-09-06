@@ -8,8 +8,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import wave
+from array import array
 import webbrowser
 from fractions import Fraction
 import tkinter as tk
@@ -524,6 +527,115 @@ def _scale_value_at_x(scale, x: int) -> float:
     to_ = float(scale.cget("to"))
     frac = max(0.0, min(1.0, x / max(1, width)))
     return from_ + frac * (to_ - from_)
+
+
+class _WaveMetronomeStream:
+    """Seekable, pauseable Windows PCM stream with no LibVLC gain state.
+
+    One prepared waveOut buffer contains the complete rendered metronome. A
+    seek submits a view into that same buffer at the requested frame, so no
+    large PCM copy is made while playback is running.
+    """
+
+    def __init__(self, wav_path):
+        if os.name != "nt":
+            raise OSError("waveOut metronome is only available on Windows")
+        import ctypes
+
+        self._ctypes = ctypes
+        self._winmm = ctypes.windll.winmm
+        with wave.open(wav_path, "rb") as src:
+            if src.getsampwidth() != 2 or src.getcomptype() != "NONE":
+                raise OSError("Metronome stream must be uncompressed 16-bit PCM")
+            self.channels = src.getnchannels()
+            self.rate = src.getframerate()
+            self.sample_width = src.getsampwidth()
+            pcm = src.readframes(src.getnframes())
+
+        class WAVEFORMATEX(ctypes.Structure):
+            _fields_ = [("wFormatTag", ctypes.c_ushort),
+                        ("nChannels", ctypes.c_ushort),
+                        ("nSamplesPerSec", ctypes.c_uint32),
+                        ("nAvgBytesPerSec", ctypes.c_uint32),
+                        ("nBlockAlign", ctypes.c_ushort),
+                        ("wBitsPerSample", ctypes.c_ushort),
+                        ("cbSize", ctypes.c_ushort)]
+
+        class WAVEHDR(ctypes.Structure):
+            pass
+
+        WAVEHDR._fields_ = [("lpData", ctypes.c_void_p),
+                            ("dwBufferLength", ctypes.c_uint32),
+                            ("dwBytesRecorded", ctypes.c_uint32),
+                            ("dwUser", ctypes.c_size_t),
+                            ("dwFlags", ctypes.c_uint32),
+                            ("dwLoops", ctypes.c_uint32),
+                            ("lpNext", ctypes.POINTER(WAVEHDR)),
+                            ("reserved", ctypes.c_size_t)]
+
+        block_align = self.channels * self.sample_width
+        fmt = WAVEFORMATEX(1, self.channels, self.rate,
+                           self.rate * block_align, block_align, 16, 0)
+        self._WAVEHDR = WAVEHDR
+        self._buffer = ctypes.create_string_buffer(pcm)
+        self._pcm_len = len(pcm)
+        self._handle = ctypes.c_void_p()
+        self._header = None
+        result = self._winmm.waveOutOpen(ctypes.byref(self._handle),
+                                         ctypes.c_uint32(-1).value,
+                                         ctypes.byref(fmt), 0, 0, 0)
+        if result != 0:
+            raise OSError(f"waveOutOpen failed ({result})")
+
+    def _unprepare(self):
+        if self._header is None or not self._handle:
+            return
+        self._winmm.waveOutUnprepareHeader(
+            self._handle, self._ctypes.byref(self._header),
+            self._ctypes.sizeof(self._header))
+        self._header = None
+
+    def play_from(self, ms):
+        if not self._handle:
+            return
+        self._winmm.waveOutReset(self._handle)
+        self._unprepare()
+        frame = max(0, int(round(float(ms) * self.rate / 1000.0)))
+        offset = min(self._pcm_len, frame * self.channels * self.sample_width)
+        remaining = self._pcm_len - offset
+        if remaining <= 0:
+            return
+        ptr = self._ctypes.cast(self._ctypes.byref(self._buffer, offset),
+                                self._ctypes.c_void_p)
+        self._header = self._WAVEHDR(ptr, remaining, 0, 0, 0, 0, None, 0)
+        size = self._ctypes.sizeof(self._header)
+        result = self._winmm.waveOutPrepareHeader(
+            self._handle, self._ctypes.byref(self._header), size)
+        if result != 0:
+            self._header = None
+            raise OSError(f"waveOutPrepareHeader failed ({result})")
+        result = self._winmm.waveOutWrite(
+            self._handle, self._ctypes.byref(self._header), size)
+        if result != 0:
+            self._winmm.waveOutReset(self._handle)
+            self._unprepare()
+            raise OSError(f"waveOutWrite failed ({result})")
+
+    def pause(self):
+        if self._handle:
+            self._winmm.waveOutPause(self._handle)
+
+    def stop(self):
+        if self._handle:
+            self._winmm.waveOutReset(self._handle)
+            self._unprepare()
+
+    def close(self):
+        if not self._handle:
+            return
+        self.stop()
+        self._winmm.waveOutClose(self._handle)
+        self._handle = None
 
 
 # A valid osu! timestamp is "mm:ss:mmm" (matching osu! stable's own editor
@@ -2413,15 +2525,25 @@ class DiffCheckList(ttk.LabelFrame):
 
     MAX_ROWS_PER_COLUMN = 3
 
-    def refresh(self):
+    def refresh(self, preselect_files=None):
+        """Rebuild the list, optionally ticking only the given filenames.
+
+        ``None`` preserves the long-standing default of ticking every diff;
+        an iterable (including an empty one) is treated as an explicit
+        selection.
+        """
         for w in self.inner.winfo_children():
             w.destroy()
         self.vars.clear()
         folder, diffs = self.app.get_diff_files()
         self.label_to_file = osu_parser.get_diff_display_map(folder, diffs) if folder else {}
+        selected = None if preselect_files is None else {
+            os.path.normcase(name) for name in preselect_files
+        }
         ordered_labels = sorted(self.label_to_file.keys(), key=osu_parser.taiko_diff_sort_key)
         for i, label in enumerate(ordered_labels):
-            v = tk.BooleanVar(value=True)
+            filename = self.label_to_file[label]
+            v = tk.BooleanVar(value=(selected is None or os.path.normcase(filename) in selected))
             if self.light:
                 cb = LightCheckbox(self.inner, label, v, font=("Segoe UI", 11))
             else:
@@ -3763,15 +3885,18 @@ class TimingEditorFrame(BaseToolFrame):
     Timeline: red lines drawn from the *current New* values with a live
     beat grid at the chosen divisor; barlines shown as thick black bars;
     drag a red line to snap it, left-drag empty space to scroll, wheel =
-    scroll by one tick, Shift+wheel = zoom, Ctrl+wheel = change divisor.
+    scroll by one tick, Alt+wheel = zoom, Ctrl+wheel = change divisor.
     "+ Add new redline" drops an editable red line at the cursor.
 
     Apply retimes every ticked difficulty (this tool's own "Apply to"
-    list): red lines rewritten, hit objects / green lines moved to the same
-    beat position in their new section, green line SV compensated for the
-    BPM change — see tools_logic.retime_beatmap. Reads the red lines from
-    the first difficulty in the folder; rebuilds on every map change
-    (on_map_changed) and whenever the tab is shown (on_shown)."""
+    list). By default it only rewrites the red lines and leaves notes and
+    green lines untouched. Ticking "Resnap notes and equalise SV"
+    (experimental, off by default) restores the old behaviour: hit objects
+    / green lines moved to the same beat position in their new section and
+    green line SV compensated for the BPM change — see
+    tools_logic.retime_beatmap. Reads the red lines from the first
+    difficulty in the folder; rebuilds on every map change (on_map_changed)
+    and whenever the tab is shown (on_shown)."""
 
     # "None" = barlines only (no beat grid); its "tick" for scrolling/
     # snapping is a whole bar. Otherwise the value is the beat subdivision.
@@ -3784,6 +3909,23 @@ class TimingEditorFrame(BaseToolFrame):
     BUCKETS_PER_SEC = 200
     TABLE_COLS = 9
     CURSOR_FRAC = 0.30           # the fixed "current time" line sits this far from the left
+    # Tk/canvas work at 240fps saturated the event loop and made the apparent
+    # scroll rate uneven. The metronome is now a separate waveOut PCM stream, so
+    # visual rendering can use a stable 60fps cadence without affecting clicks.
+    PLAY_TICK_MS = 16
+    # Playhead-vs-libVLC low-pass time constant (seconds). The correction that
+    # trims the free-running monotonic estimate toward libVLC's get_time() is
+    # `1 - exp(-dt/TAU)` per frame, not a fixed percentage. This keeps the
+    # correction stable if the actual Tk frame cadence varies under load.
+    # A larger TAU leans more on the (real-time-accurate) monotonic free-run
+    # and less on get_time()'s chunky ~100ms-stale reporting, so the playhead
+    # jitters less and lags less between get_time() updates.
+    PLAYHEAD_SMOOTH_TAU = 0.35
+    # libVLC's get_time() reads well behind the audio actually reaching the
+    # speakers (output buffer + Windows audio stack, ~100ms typical); nudge
+    # the visual playhead this many ms ahead of it so the timeline and waveform
+    # line up with what's heard. The metronome uses its own native PCM stream.
+    PLAYBACK_LATENCY_COMP_MS = 110.0
 
     # osu!lazer shifts its editor waveform visual by +20ms
     # (Editor.WAVEFORM_VISUAL_OFFSET, Editor.cs) — "osu! beatmaps have an
@@ -3826,6 +3968,7 @@ class TimingEditorFrame(BaseToolFrame):
         self._loaded_src = None      # (folder, filename) the table was last built from
         self._wave_token = 0         # bumps per map change, so a stale decode result is ignored
         self._peaks = None
+        self._audio_duration_ms = 0.0
         self._bucket_ms = 1000.0 / self.BUCKETS_PER_SEC
         self._wave_msg = "Loading waveform..."
         self._wave_mode = "amplitude"   # or "onset" — toggled by double-clicking the waveform
@@ -3841,10 +3984,23 @@ class TimingEditorFrame(BaseToolFrame):
         # gently corrected toward libVLC's own (coarse, laggy) get_time().
         self._play_anchor_ms = 0.0
         self._play_anchor_wall = 0.0
+        self._play_last_frame_wall = 0.0
+        self._play_aux_ui_wall = 0.0
         self._play_floor_ms = 0.0     # last explicit seek target — est never dips below it
         self._seek_guard_until = 0.0  # window after a seek where libVLC's time is untrusted
         self._seek_job = None         # debounce: pending after() id for a coalesced seek
         self._pending_seek_ms = None
+        self._play_volume = 40        # song only; metronome PCM bypasses VLC gain
+        self._priming_audio = False
+        # The metronome is rendered to a continuous WAV and played by a second
+        # VLC player. It therefore shares the song's audio-clock operations and
+        # never depends on Tk/canvas frames arriving on time.
+        self.metronome_var = tk.BooleanVar(value=True)
+        self._metro_stream = None
+        self._metro_resume_ms = 0
+        self._metro_track_path = None
+        self._metro_track_signature = None
+        self._tick1_path, self._tick2_path = self._resolve_metro_sounds()
         # smooth-scroll state: a full render covers the visible range plus a
         # margin and tags its items "scroll"; during playback we just
         # canvas.move() those by the frame's delta and only re-render fully
@@ -3866,6 +4022,10 @@ class TimingEditorFrame(BaseToolFrame):
         # when set, the mouse can only seek on the timeline/waveform — red-line
         # drag-to-move is disabled (see _tl_press)
         self.timeline_locked_var = tk.BooleanVar(value=False)
+        # when set, Apply also remaps hit objects onto the new grid and rescales
+        # green-line SV so visible scroll speed is unchanged (the old default
+        # behaviour). Off by default: Apply then only rewrites the red lines.
+        self.resnap_equalise_var = tk.BooleanVar(value=False)
 
         body = self.body
 
@@ -3966,6 +4126,19 @@ class TimingEditorFrame(BaseToolFrame):
                             padx=8, pady=3).pack(side="right")
         tk.Label(div_row, text="Snap:", bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
                  font=("Segoe UI", 9)).pack(side="right", padx=(0, 4))
+        # audio playback volume — sits just left of the snap controls
+        ttk.Style().configure("Light.Horizontal.TScale", background=FRONT_BG,
+                               troughcolor=FRONT_BORDER)
+        self.play_volume_scale = ttk.Scale(div_row, from_=0, to=100, orient="horizontal",
+                                            length=90, style="Light.Horizontal.TScale",
+                                            command=self._on_play_volume_change)
+        self.play_volume_scale.set(self._play_volume)
+        self.play_volume_scale.pack(side="right", padx=(0, 12))
+        self.play_volume_scale.bind("<Button-1>", self._on_play_volume_click)
+        self.play_volume_scale.bind("<B1-Motion>", self._on_play_volume_click)
+        _add_hover_tooltip(self.play_volume_scale, "Song volume")
+        tk.Label(div_row, text="🔊", bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
+                 font=("Segoe UI", 10)).pack(side="right", padx=(0, 3))
 
         # ---- timeline + waveform ----
         # highlightcolor pinned to highlightbackground so the 1px border
@@ -3990,6 +4163,9 @@ class TimingEditorFrame(BaseToolFrame):
         LightCheckbox(wf_opts, "Lock timeline", self.timeline_locked_var,
                        bg=FRONT_BG, font=("Segoe UI", 9),
                        command=self._redraw_timeline).pack(side="right")
+        LightCheckbox(wf_opts, "Metronome", self.metronome_var, bg=FRONT_BG,
+                       font=("Segoe UI", 9),
+                       command=self._on_metronome_toggle).pack(side="left", expand=True)
 
         # Both canvases share the same time transform. Wheel + press + drag are
         # identical on either (a drag on the waveform scrolls the current-time
@@ -4000,7 +4176,7 @@ class TimingEditorFrame(BaseToolFrame):
         for c in (self.timeline, self.wave):
             c.bind("<Configure>", lambda _e: self._redraw_timeline())
             c.bind("<MouseWheel>", self._tl_wheel)
-            c.bind("<Shift-MouseWheel>", self._tl_wheel_shift)
+            c.bind("<Alt-MouseWheel>", self._tl_wheel_alt)
             c.bind("<Control-MouseWheel>", self._tl_wheel_ctrl)
             c.bind("<Button-4>", lambda e: self._tl_wheel_like(e, 1))
             c.bind("<Button-5>", lambda e: self._tl_wheel_like(e, -1))
@@ -4019,6 +4195,14 @@ class TimingEditorFrame(BaseToolFrame):
                  font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=24, pady=(2, 6))
         self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
         self.diff_list.pack(fill="x", padx=24, pady=(0, 12))
+
+        resnap_row = tk.Frame(body, bg=FRONT_BG)
+        resnap_row.pack(fill="x", padx=24, pady=(0, 12))
+        LightCheckbox(resnap_row, "Resnap notes and compensate SV",
+                       self.resnap_equalise_var, bg=FRONT_BG).pack(side="left")
+        InfoIcon(resnap_row,
+                 "EXPERIMENTAL! Works best on single BPM, and/or double/half BPM "
+                 "change. May not work well with multiple timing points.").pack(side="left", padx=(6, 0))
 
         foot = tk.Frame(body, bg=FRONT_BG)
         foot.pack(fill="x", padx=24, pady=(0, 20))
@@ -4180,6 +4364,7 @@ class TimingEditorFrame(BaseToolFrame):
         self._wave_token += 1
         token = self._wave_token
         self._peaks = None
+        self._audio_duration_ms = 0.0
         self._onsets = None
         self._wave_msg = "Loading waveform..."
         audio = logic.get_audio_filename(folder)
@@ -5023,6 +5208,12 @@ class TimingEditorFrame(BaseToolFrame):
                             c.create_line(x, H, x, H - 44, fill="#000000", width=1, tags="scroll")
                         else:
                             c.create_line(x, 4, x, H, fill="#000000", width=3, tags="scroll")
+                        # running barline number, at the bottom — restarts from
+                        # 0 at every red line; dropped when barlines get too
+                        # tightly packed to read
+                        if b >= 0 and bar_len * self.px_per_ms >= 26:
+                            c.create_text(x + 2, H - 1, anchor="sw", fill="#8a8a8a",
+                                           font=("Segoe UI", 7), text=str(b), tags="scroll")
 
             # --- beat + sub ticks (skipped entirely when snap is "None") ---
             if denom is None:
@@ -5260,30 +5451,198 @@ class TimingEditorFrame(BaseToolFrame):
             c2.move("scroll", dx, 0)
             self._panned_cursor = new_cursor
         self.cursor_ms = new_cursor
-        if self._cursor_text_id is not None:
-            try:
-                c1.itemconfigure(self._cursor_text_id, text=_fmt_ms_timestamp(new_cursor))
-            except tk.TclError:
-                pass
-        self._sync_seek_scrollbar()
+        # Text layout and ttk scrollbar updates are comparatively expensive.
+        # Keep the canvases at 60fps, but update these auxiliary controls at
+        # 30fps so they cannot congest Tk's event queue.
+        now = time.monotonic()
+        if now - self._play_aux_ui_wall >= 1.0 / 30.0:
+            self._play_aux_ui_wall = now
+            if self._cursor_text_id is not None:
+                try:
+                    c1.itemconfigure(self._cursor_text_id, text=_fmt_ms_timestamp(new_cursor))
+                except tk.TclError:
+                    pass
+            self._sync_seek_scrollbar()
         vs = self._view_start()
         if vs < self._rendered_lo or vs + self._visible_ms() > self._rendered_hi:
             self._redraw_timeline()
 
     def _decode_wave(self, path, token):
-        peaks, _dur = logic.decode_audio_peaks(path, self.BUCKETS_PER_SEC)
-        self.after(0, lambda: self._on_peaks(peaks, token))
+        peaks, duration_ms = logic.decode_audio_peaks(path, self.BUCKETS_PER_SEC)
+        self.after(0, lambda: self._on_peaks(peaks, duration_ms, token))
 
-    def _on_peaks(self, peaks, token):
+    def _on_peaks(self, peaks, duration_ms, token):
         if token != self._wave_token or not self.winfo_exists():
             return  # a newer map was loaded while this decode was running
         if peaks:
             self._peaks = peaks
+            self._audio_duration_ms = float(duration_ms)
             self._onsets = None
         else:
             self._wave_msg = "Waveform decode failed"
         # full redraw so the seek scrollbar's range picks up the song length
         self._redraw_timeline()
+
+    # ------------------------------------------------------------------
+    # Metronome — tick sounds played along with the song during playback
+    # ------------------------------------------------------------------
+    def _resolve_metro_sounds(self):
+        """Absolute paths to tick1.wav (barline) / tick2.wav (beat), or None
+        each if missing. Same _MEIPASS / source-folder resolution as icon.png
+        (see _load_logo_image) — under a frozen build `--add-data` extracts
+        both into _MEIPASS as real files, so a path works in both modes."""
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        out = []
+        for fn in ("tick1.wav", "tick2.wav"):
+            p = os.path.join(base_dir, fn)
+            out.append(p if os.path.isfile(p) else None)
+        return out[0], out[1]
+
+    @staticmethod
+    def _read_metro_wav(path):
+        """Return (PCM samples, channels, rate) for one bundled 16-bit WAV."""
+        if not path:
+            return None
+        try:
+            with wave.open(path, "rb") as src:
+                if src.getsampwidth() != 2 or src.getcomptype() != "NONE":
+                    return None
+                channels, rate = src.getnchannels(), src.getframerate()
+                samples = array("h")
+                samples.frombytes(src.readframes(src.getnframes()))
+                if channels > 1:
+                    mono = array("h")
+                    for i in range(0, len(samples), channels):
+                        mono.append(sum(samples[i:i + channels]) // channels)
+                    samples, channels = mono, 1
+                # The supplied click assets peak around 17-21% of full-scale,
+                # so an unmodified stream still sounds quiet. Normalize each
+                # click here; waveOut then emits full-level metronome PCM that
+                # is independent of the song player's 40% VLC gain.
+                peak = max((abs(sample) for sample in samples), default=0)
+                if peak:
+                    gain = 30000.0 / peak
+                    for i, sample in enumerate(samples):
+                        samples[i] = max(-32768, min(32767, int(round(sample * gain))))
+                return samples, channels, rate
+        except (OSError, wave.Error):
+            return None
+
+    def _metro_signature_for(self, duration_ms):
+        reds = self._new_redlines()
+        grid = tuple((round(r["t"], 6), round(r["bl"], 6),
+                      max(1, self._row_meter(r["row"]))) for r in reds)
+        return round(duration_ms), grid
+
+    def _build_metro_track(self, duration_ms):
+        """Render the current 1/1 grid to one continuous PCM audio stream.
+
+        tick1 is overlaid at every barline and tick2 at every other beat.
+        Because VLC plays this stream beside the song, canvas stalls cannot
+        change when a click reaches the audio device.
+        """
+        bar_tick = self._read_metro_wav(self._tick1_path)
+        beat_tick = self._read_metro_wav(self._tick2_path)
+        if not bar_tick or not beat_tick:
+            return None
+        bar_samples, channels, rate = bar_tick
+        beat_samples, beat_channels, beat_rate = beat_tick
+        if beat_channels != channels or beat_rate != rate:
+            return None
+
+        duration_ms = max(1000.0, float(duration_ms) + 500.0)
+        frame_count = int(math.ceil(duration_ms * rate / 1000.0))
+        mixed = array("h", [0]) * (frame_count * channels)
+        for beat_ms, is_barline in self._iter_grid_beats(duration_ms):
+            tick = bar_samples if is_barline else beat_samples
+            dst = int(round(beat_ms * rate / 1000.0)) * channels
+            if dst < 0:
+                continue
+            limit = min(len(tick), len(mixed) - dst)
+            for j in range(limit):
+                value = mixed[dst + j] + tick[j]
+                mixed[dst + j] = max(-32768, min(32767, value))
+
+        tmp = tempfile.NamedTemporaryFile(prefix="osu_taiko_metronome_",
+                                           suffix=".wav", delete=False)
+        path = tmp.name
+        tmp.close()
+        try:
+            with wave.open(path, "wb") as dst:
+                dst.setnchannels(channels)
+                dst.setsampwidth(2)
+                dst.setframerate(rate)
+                dst.writeframes(mixed.tobytes())
+            return path
+        except (OSError, wave.Error):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return None
+
+    def _release_metro_stream(self):
+        try:
+            if self._metro_stream is not None:
+                self._metro_stream.close()
+        except Exception:
+            pass
+        self._metro_stream = None
+
+    def _remove_metro_track(self):
+        self._release_metro_stream()
+        path = self._metro_track_path
+        self._metro_track_path = None
+        self._metro_track_signature = None
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def _prepare_metro_stream(self, duration_ms):
+        signature = self._metro_signature_for(duration_ms)
+        if signature != self._metro_track_signature or not self._metro_track_path:
+            self._remove_metro_track()
+            self._metro_track_path = self._build_metro_track(duration_ms)
+            self._metro_track_signature = signature if self._metro_track_path else None
+        if not self._metro_track_path:
+            return
+        self._release_metro_stream()
+        try:
+            self._metro_stream = _WaveMetronomeStream(self._metro_track_path)
+        except Exception:
+            self._metro_stream = None
+
+    def _on_metronome_toggle(self):
+        if self._metro_stream is None:
+            return
+        try:
+            if not self.metronome_var.get() or not self._playing:
+                self._metro_stream.stop()
+            else:
+                song_ms = self._player.get_time() if self._player is not None else -1
+                start_ms = song_ms if song_ms is not None and song_ms >= 0 else self.cursor_ms
+                self._metro_stream.play_from(start_ms)
+        except Exception:
+            pass
+
+    def _iter_grid_beats(self, duration_ms):
+        """Yield (time_ms, is_barline) over the current New-value grid."""
+        reds = self._new_redlines()
+        for i, r in enumerate(reds):
+            bl = r["bl"]
+            if bl <= 0:
+                continue
+            meter = max(1, self._row_meter(r["row"]))
+            seg_start = r["t"] if i > 0 else -1e18
+            seg_end = reds[i + 1]["t"] if i + 1 < len(reds) else duration_ms
+            lo, hi = max(0.0, seg_start), min(duration_ms, seg_end)
+            k = math.ceil((lo - r["t"]) / bl - 1e-9)
+            while r["t"] + k * bl < hi - 1e-6:
+                t = r["t"] + k * bl
+                yield t, k % meter == 0
+                k += 1
 
     # ------------------------------------------------------------------
     # Audio playback (VLC) — the timeline scrolls with the playhead
@@ -5331,10 +5690,26 @@ class TimingEditorFrame(BaseToolFrame):
                 self._vlc_instance = (vlc.Instance() if os.name == "nt"
                                        else vlc.Instance("--no-xlib"))
             self._player = self._vlc_instance.media_player_new()
-            self._player.set_media(self._vlc_instance.media_new(path))
+            media = self._vlc_instance.media_new(path)
+            self._player.set_media(media)
+            duration_ms = self._audio_duration_ms
+            if duration_ms <= 0:
+                try:
+                    media.parse()
+                    duration_ms = max(0.0, float(media.get_duration()))
+                except Exception:
+                    duration_ms = 0.0
+            duration_ms = max(duration_ms, self._total_ms())
+            self._prepare_metro_stream(duration_ms)
+            # Start muted while both decoders warm up; _safe_set_time then
+            # aligns them and _resume_after_seek restores their volumes.
+            self._player.audio_set_mute(True)
+            self._player.audio_set_volume(0)
+            self._priming_audio = True
             self._player.play()
         except Exception as e:
             self._player = None
+            self._remove_metro_track()
             _show_alert(self, "Playback error", str(e))
             return
         self._playing = True
@@ -5342,13 +5717,18 @@ class TimingEditorFrame(BaseToolFrame):
         start = int(max(0.0, self.cursor_ms))
         self._reset_play_anchor(start, latency=0.15)
         self._redraw_timeline()   # fresh render extent for the pan loop
-        # libVLC only honours set_time once the player is actually Playing
-        if start > 60:
-            self.after(150, lambda: self._safe_set_time(start))
+        # Prime both decoders, then pause/seek/resume them together. Doing this
+        # even at time zero removes the different MP3/OGG-vs-WAV startup delay
+        # that two back-to-back play() calls would otherwise expose.
+        self.after(150, lambda: self._safe_set_time(start))
         self._tick_play()
 
     def _resume_audio(self):
         try:
+            duration_ms = max(self._audio_duration_ms, self._total_ms())
+            signature = self._metro_signature_for(duration_ms)
+            if signature != self._metro_track_signature or self._metro_stream is None:
+                self._prepare_metro_stream(duration_ms)
             self._player.set_pause(0)
         except Exception:
             self._player = None
@@ -5359,12 +5739,41 @@ class TimingEditorFrame(BaseToolFrame):
         cur = int(max(0.0, self.cursor_ms))
         self._reset_play_anchor(cur, latency=0.06)
         self._safe_set_time(cur)
+        self._apply_play_volume()
         self._tick_play()
+
+    def _apply_play_volume(self):
+        if self._player is None:
+            return
+        try:
+            self._player.audio_set_volume(int(self._play_volume))
+        except Exception:
+            pass
+
+    def _apply_play_volume_soon(self):
+        """libVLC only creates the player's audio output once it reaches
+        Playing, so audio_set_volume() right after play() can be dropped —
+        reapply a few times over the next second to close that race (same
+        reasoning as VideoPreviewWindow._apply_volume_soon)."""
+        self._apply_play_volume()
+        for delay in (100, 300, 600, 1000):
+            self.after(delay, self._apply_play_volume)
+
+    def _on_play_volume_change(self, _value):
+        self._play_volume = int(float(self.play_volume_scale.get()))
+        self._apply_play_volume()
+
+    def _on_play_volume_click(self, event):
+        # jump exactly to the clicked position rather than ttk.Scale's tiny step
+        self.play_volume_scale.set(_scale_value_at_x(self.play_volume_scale, event.x))
+        return "break"
 
     def _reset_play_anchor(self, ms, latency=0.0):
         t = time.monotonic()
         self._play_anchor_ms = float(ms)
         self._play_anchor_wall = t + latency   # audio won't actually reach `ms` until ~now+latency
+        self._play_last_frame_wall = t
+        self._play_aux_ui_wall = 0.0
         self._play_floor_ms = float(ms)
         self._seek_guard_until = t + latency + 0.2
 
@@ -5383,6 +5792,8 @@ class TimingEditorFrame(BaseToolFrame):
         try:
             if self._player is not None:
                 self._player.set_pause(1)   # explicit, not pause() which toggles
+            if self._metro_stream is not None:
+                self._metro_stream.pause()
         except Exception:
             pass
 
@@ -5395,6 +5806,8 @@ class TimingEditorFrame(BaseToolFrame):
         except Exception:
             pass
         self._player = None
+        self._priming_audio = False
+        self._remove_metro_track()
 
     def _safe_set_time(self, ms):
         try:
@@ -5409,10 +5822,15 @@ class TimingEditorFrame(BaseToolFrame):
             if self._playing:
                 try:
                     self._player.set_pause(1)
+                    if self._metro_stream is not None:
+                        self._metro_stream.stop()
                 except Exception:
                     pass
             self._player.set_time(ms)
-            self._reset_play_anchor(ms, latency=0.12)
+            self._metro_resume_ms = ms
+            # The players resume 40ms below, so the visual clock should begin
+            # advancing at that same point instead of waiting an extra 80ms.
+            self._reset_play_anchor(ms, latency=0.04)
             if self._playing:
                 self.after(40, self._resume_after_seek)
         except Exception:
@@ -5422,6 +5840,15 @@ class TimingEditorFrame(BaseToolFrame):
         try:
             if self._playing and self._player is not None:
                 self._player.set_pause(0)
+                if self._metro_stream is not None:
+                    if self.metronome_var.get():
+                        self._metro_stream.play_from(self._metro_resume_ms)
+                    else:
+                        self._metro_stream.stop()
+                if self._priming_audio:
+                    self._priming_audio = False
+                    self._player.audio_set_mute(False)
+                    self._apply_play_volume_soon()
         except Exception:
             pass
 
@@ -5440,23 +5867,28 @@ class TimingEditorFrame(BaseToolFrame):
             return
 
         now = time.monotonic()
+        frame_dt = max(0.001, min(0.1, now - self._play_last_frame_wall))
+        self._play_last_frame_wall = now
         # free-running estimate from the anchor (this is what makes the
-        # scroll advance every frame instead of once per libVLC update)
+        # scroll advance every frame instead of once per libVLC update, and
+        # is what carries the true real-time *rate*)
         est = self._play_anchor_ms + (now - self._play_anchor_wall) * 1000.0
         if now >= self._seek_guard_until and vt is not None and vt >= 0:
-            drift = vt - est
+            target = float(vt) + self.PLAYBACK_LATENCY_COMP_MS
+            drift = target - est
             if abs(drift) > 200.0:          # discontinuity (user seeked, buffer skip) — hard resync
-                self._play_anchor_ms = float(vt)
+                self._play_anchor_ms = target
                 self._play_anchor_wall = now
-                est = float(vt)
-            else:                            # ease the anchor toward reality (~10%/frame)
-                corr = drift * 0.10
+                est = target
+            else:                            # framerate-independent low-pass toward libVLC time
+                alpha = 1.0 - math.exp(-frame_dt / self.PLAYHEAD_SMOOTH_TAU)
+                corr = drift * alpha
                 self._play_anchor_ms += corr
                 est += corr
         # never scroll backward during continuous playback / before the seek target
         est = max(est, self._play_floor_ms, self._panned_cursor - 0.5)
         self._pan_timeline(est)
-        self._play_after = self.after(20, self._tick_play)
+        self._play_after = self.after(self.PLAY_TICK_MS, self._tick_play)
 
     def _audio_seek_to_cursor(self):
         """Keep the audio playhead in step with a manual scroll/seek while
@@ -5593,11 +6025,12 @@ class TimingEditorFrame(BaseToolFrame):
     def _tl_wheel_like(self, e, direction):
         self._step_cursor(-1 if direction > 0 else 1)
 
-    def _tl_wheel_shift(self, e):
+    def _tl_wheel_alt(self, e):
         # Zoom about the current-time line (cursor_ms stays put).
         factor = 1.25 if e.delta > 0 else 1 / 1.25
         self.px_per_ms = max(0.004, min(4.0, self.px_per_ms * factor))
         self._redraw_timeline()
+        return "break"
 
     def _tl_wheel_ctrl(self, e):
         self._step_divisor(1 if e.delta > 0 else -1)
@@ -5677,12 +6110,15 @@ class TimingEditorFrame(BaseToolFrame):
                         "Leave at least one existing red line to retime against.")
             return
 
+        resnap_equalise = bool(self.resnap_equalise_var.get())
+
         self.apply_btn.configure(state="disabled")
         self.status_var.set("Retiming...")
 
         def work():
             try:
-                logic.apply_advanced_timing(folder, targets, segments)
+                logic.apply_advanced_timing(folder, targets, segments,
+                                            resnap_equalise=resnap_equalise)
             except Exception as exc:
                 err = str(exc)
                 self.after(0, lambda: self._apply_failed(err))
@@ -5790,7 +6226,7 @@ class BgOffsetShifterFrame(BaseToolFrame):
             self.bg_var.set(images[0])
         else:
             self.bg_var.set("")
-        self.diff_list.refresh()
+        self._refresh_diff_selection(folder, diffs)
         # See OffsetShifterFrame.refresh for why this outer card needs an
         # explicit redraw after the nested diff checklist's own height
         # changes — the diff_list's own card only resyncs itself.
@@ -5798,7 +6234,29 @@ class BgOffsetShifterFrame(BaseToolFrame):
         self._prefill_current_offset()
 
     def _on_bg_selected(self, _event=None):
+        folder, diffs = self.app.get_diff_files()
+        self._refresh_diff_selection(folder, diffs)
         self._prefill_current_offset()
+
+    def _refresh_diff_selection(self, folder, diffs):
+        """Tick diffs already using the selected BG.
+
+        A file used by no difficulty is treated as an external/new BG and
+        keeps the traditional all-diffs selection.
+        """
+        selected_bg = os.path.normcase(self.bg_var.get().strip())
+        matching = []
+        if folder and selected_bg:
+            for filename in diffs:
+                try:
+                    bm = osu_parser.Beatmap(os.path.join(folder, filename))
+                except OSError:
+                    continue
+                attached_bg = bm.get_background_filename()
+                if attached_bg and os.path.normcase(attached_bg) == selected_bg:
+                    matching.append(filename)
+        self.diff_list.refresh(preselect_files=matching or None)
+        self.card.redraw()
 
     def browse_bg(self):
         folder, _ = self.app.get_diff_files()
@@ -5814,18 +6272,30 @@ class BgOffsetShifterFrame(BaseToolFrame):
         final_name = logic.import_external_bg_image(folder, path)
         self.refresh()
         self.bg_var.set(final_name)
+        self._refresh_diff_selection(folder, self.app.get_diff_files()[1])
         self._prefill_current_offset()
 
     def _prefill_current_offset(self):
-        """Loads whatever y offset is already saved in the map for the
-        selected background, matching the reference tool's behavior of
-        opening on the current value rather than always starting at 0."""
+        """Load the selected background's saved y offset.
+
+        Different backgrounds in one set can have different offsets, so
+        read from the first difficulty actually attached to this image.
+        A new/external image has no saved offset yet and starts at zero.
+        """
         folder, diffs = self.app.get_diff_files()
-        if not folder or not diffs:
-            return
-        bm = osu_parser.Beatmap(os.path.join(folder, diffs[0]))
-        _, y = bm.get_background_offset()
-        self.offset_var.set(str(y))
+        selected_bg = os.path.normcase(self.bg_var.get().strip())
+        if folder and selected_bg:
+            for filename in diffs:
+                try:
+                    bm = osu_parser.Beatmap(os.path.join(folder, filename))
+                except OSError:
+                    continue
+                attached_bg = bm.get_background_filename()
+                if attached_bg and os.path.normcase(attached_bg) == selected_bg:
+                    _, y = bm.get_background_offset()
+                    self.offset_var.set(str(y))
+                    return
+        self.offset_var.set("0")
 
     def open_preview(self):
         existing = getattr(self, "_preview_win", None)

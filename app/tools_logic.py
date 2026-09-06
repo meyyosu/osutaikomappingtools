@@ -2248,7 +2248,7 @@ def _build_retime_mapper(old_reds: list, new_reds: list):
     return mapper
 
 
-def retime_beatmap(bm: Beatmap, segments: list):
+def retime_beatmap(bm: Beatmap, segments: list, resnap_equalise: bool = False):
     """Retime `bm` in place onto a new set of red lines.
 
     `segments` is an ordered (by new_time) list of dicts, one per FINAL
@@ -2265,18 +2265,28 @@ def retime_beatmap(bm: Beatmap, segments: list):
           "sample_index": int, "volume": int, "effects": int,
         }
 
-    Existing red lines (is_new False) define the old->new piecewise time
-    map; every hit object, spinner/hold end time, green line, break, the
-    video event and PreviewTime are moved through it so they keep the same
-    beat position within their section. Green lines additionally get their
-    SV magnitude rescaled by new_bl/old_bl so the visible scroll speed is
-    unchanged across a BPM edit. Brand-new lines only split the grid going
-    forward — they don't remap anything.
+    By default this ONLY rewrites the red lines — hit objects, green lines,
+    breaks, the video event and PreviewTime are left exactly where they are.
+
+    When `resnap_equalise` is True (the Timing Editor's "Resnap notes and
+    equalise SV" toggle — the old default behaviour), the existing red lines
+    (is_new False) define an old->new piecewise time map and every hit
+    object, spinner/hold end time, green line, break, the video event and
+    PreviewTime are moved through it so they keep the same beat position
+    within their section. Green lines additionally get their SV magnitude
+    rescaled by new_bl/old_bl so the visible scroll speed is unchanged
+    across a BPM edit. Brand-new lines only split the grid going forward —
+    they don't remap anything.
 
     Caller is responsible for `bm.save()` (see CLAUDE.md)."""
     existing = [s for s in segments if not s.get("is_new")]
     if not existing:
         return
+
+    if not resnap_equalise:
+        _rewrite_red_lines(bm, segments)
+        return
+
     old_reds = [(s["old_time"], s["old_beat_length"]) for s in existing]
     new_reds = [(s["new_time"], s["new_beat_length"]) for s in existing]
     mapper = _build_retime_mapper(old_reds, new_reds)
@@ -2340,6 +2350,12 @@ def retime_beatmap(bm: Beatmap, segments: list):
             pass
 
     # ---- rewrite the red lines ------------------------------------
+    _rewrite_red_lines(bm, segments)
+
+
+def _rewrite_red_lines(bm: Beatmap, segments: list):
+    """Replace every uninherited (red) timing point in `bm` with a fresh one
+    per `segments` entry, keeping all existing green lines untouched."""
     greens = [tp for tp in bm.timing_points if tp.uninherited == 0]
     new_tps = list(greens)
     for s in segments:
@@ -2356,7 +2372,8 @@ def retime_beatmap(bm: Beatmap, segments: list):
     bm.timing_points = new_tps
 
 
-def apply_advanced_timing(folder: str, diff_files: List[str], segments: list):
+def apply_advanced_timing(folder: str, diff_files: List[str], segments: list,
+                          resnap_equalise: bool = False):
     """Runs `retime_beatmap` + save for every selected diff. `segments` is
     built from one diff's red lines but applied to all of them (a mapset
     normally shares timing across diffs). Each *existing* segment is matched
@@ -2364,7 +2381,10 @@ def apply_advanced_timing(folder: str, diff_files: List[str], segments: list):
     diff is retimed correctly even when the editor **deleted** some red
     lines (the matched-then-missing lines simply aren't written, and their
     section folds into the previous one) or **added** new ones. A red line
-    a segment can't be matched to is left untouched."""
+    a segment can't be matched to is left untouched.
+
+    `resnap_equalise` is forwarded to `retime_beatmap` — see its docstring
+    (default False: only the red lines are rewritten)."""
     existing = [s for s in segments if not s.get("is_new")]
     new_lines = [s for s in segments if s.get("is_new")]
     for fname in diff_files:
@@ -2402,7 +2422,7 @@ def apply_advanced_timing(folder: str, diff_files: List[str], segments: list):
         local.sort(key=lambda s: s["new_time"])
         if not any(not s.get("is_new") for s in local):
             continue
-        retime_beatmap(bm, local)
+        retime_beatmap(bm, local, resnap_equalise=resnap_equalise)
         bm.save()
 
 

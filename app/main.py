@@ -59,7 +59,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.14"
+APP_VERSION = "1.15"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
