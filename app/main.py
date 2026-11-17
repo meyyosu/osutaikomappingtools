@@ -59,7 +59,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.15"
+APP_VERSION = "1.17"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -1463,7 +1463,9 @@ class App(tk.Tk):
         win.title("Settings")
         win.configure(bg=FRONT_BG)
         win.resizable(False, False)
-        _position_over_window(win, self, width=580, height=780)
+
+        def settings_height():
+            return max(1, min(self.winfo_height() - 40, win.winfo_screenheight() - 80))
 
         # Staged values — nothing here actually takes effect (or gets
         # written to disk) until Apply/Restart is clicked.
@@ -1474,6 +1476,11 @@ class App(tk.Tk):
             "live_sync": self.live_sync_enabled,
             "metadata_display": self.metadata_display_mode,
         }
+
+        # Reserve the footer before the expanding scroll area so its actions
+        # stay visible even when the settings content overflows.
+        btn_row = tk.Frame(win, bg=FRONT_BG)
+        btn_row.pack(side="bottom", fill="x", padx=20, pady=(12, 20))
 
         body = make_scrollable_toplevel_body(win, bg=FRONT_BG)
         body.configure(padding=20)
@@ -1804,27 +1811,29 @@ class App(tk.Tk):
 
             self._check_for_update_async(done)
 
-        btn_row = tk.Frame(body, bg=FRONT_BG)
-        btn_row.pack(fill="x", pady=(4, 0))
         check_update_btn = _make_ghost_button(btn_row, "Check for Update", do_check_for_update)
         check_update_btn.pack(side="left")
         _make_accent_button(btn_row, "Apply", apply_and_notify).pack(side="right")
         _make_ghost_button(btn_row, "Restart", do_restart).pack(side="right", padx=(0, 8))
 
-        # Re-position/re-size using the body's *actual* required height now
-        # that every section is built, instead of the rough guess passed
-        # above — a hand-picked pixel height silently clips whichever
-        # section ends up at the bottom (the footer) as content is added or
-        # font metrics change. Measured off `body` itself (not `win`) since
-        # `body` now sits inside a canvas (see make_scrollable_toplevel_body)
-        # whose own reqheight doesn't follow its embedded content the way a
-        # plain Frame's would. Capped to the screen height minus a little
-        # margin — if content still doesn't fit even at that cap, the
-        # canvas's own scrollbar takes over rather than the window
-        # extending off-screen with the Apply/Restart row unreachable.
+        # Match the main window's current height with a small margin;
+        # overflowing cards scroll independently of the fixed footer.
         win.update_idletasks()
-        target_h = min(body.winfo_reqheight() + 16, win.winfo_screenheight() - 80)
-        _position_over_window(win, self, width=580, height=target_h)
+        _position_over_window(win, self, width=580, height=settings_height())
+
+        def sync_settings_height(event):
+            if event.widget is self and win.winfo_exists():
+                target_h = settings_height()
+                if win.winfo_height() != target_h:
+                    win.geometry(f"580x{target_h}")
+
+        resize_binding = self.bind("<Configure>", sync_settings_height, add="+")
+
+        def cleanup_resize_binding(event):
+            if event.widget is win:
+                self.unbind("<Configure>", resize_binding)
+
+        win.bind("<Destroy>", cleanup_resize_binding, add="+")
 
         win.protocol("WM_DELETE_WINDOW", on_close)
         win.bind("<Escape>", lambda e: on_close())
@@ -1849,7 +1858,7 @@ class App(tk.Tk):
             existing.focus_force()
             return
         from screens import (make_scrollable_toplevel_body, InfoIcon, show_toast, RoundedCard,
-                              _make_light_entry, _make_accent_button, _make_ghost_button,
+                              LightRadiobutton, _make_light_entry, _make_accent_button, _make_ghost_button,
                               _show_alert, FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
@@ -1862,7 +1871,8 @@ class App(tk.Tk):
         win.configure(bg=FRONT_BG)
         win.resizable(False, False)
 
-        pending = {"folder": self.osu_songs_folder or ""}
+        pending = {"folder": self.osu_songs_folder or "",
+                   "metadata_display": self.metadata_display_mode}
 
         body = make_scrollable_toplevel_body(win, bg=FRONT_BG)
         body.configure(padding=20)
@@ -1947,10 +1957,29 @@ class App(tk.Tk):
         refresh_status()
 
         # ------------------------------------------------------------------
-        # 2. Download extra resources
+        # 2. Metadata Display Preferences
+        # ------------------------------------------------------------------
+        meta_display_card = section_card()
+        section_heading(meta_display_card.body, "2. Metadata Display Preferences",
+                         "Sets the default form artist and title are shown in\n"
+                         "for Now Playing and search results. The \"あ\" title-bar\n"
+                         "button still toggles it live per-session.")
+
+        meta_display_var = tk.StringVar(value=pending["metadata_display"])
+
+        def on_meta_display_change():
+            pending["metadata_display"] = meta_display_var.get()
+
+        LightRadiobutton(meta_display_card.body, "Unicode", meta_display_var, "unicode",
+                          command=on_meta_display_change).pack(anchor="w", pady=3)
+        LightRadiobutton(meta_display_card.body, "Romanised", meta_display_var, "romanised",
+                          command=on_meta_display_change).pack(anchor="w", pady=3)
+
+        # ------------------------------------------------------------------
+        # 3. Download extra resources
         # ------------------------------------------------------------------
         download_card = section_card()
-        section_heading(download_card.body, "2. Download Extra Resources",
+        section_heading(download_card.body, "3. Download Extra Resources",
                          "Including:\n\n"
                          "- ffmpeg + ffprobe\n"
                          "- VLC Player\n"
@@ -2053,6 +2082,8 @@ class App(tk.Tk):
                 self._previously_indexed_full = self._check_previously_indexed_full()
                 self._start_indexing_per_mode()
                 self._refresh_manual_index_button()
+            if pending["metadata_display"] != self.metadata_display_mode:
+                self.set_metadata_display_mode(pending["metadata_display"])
             save_first_run_done()
             win.destroy()
             self._first_time_win = None
@@ -2279,16 +2310,21 @@ class App(tk.Tk):
         moves on."""
         if not self.winfo_exists():
             return
-        if self.live_sync_enabled and self.osu_songs_folder and os.path.isdir(self.osu_songs_folder):
-            try:
-                import osu_memory
-                result = osu_memory.get_current_beatmap_folder_and_diff(self.osu_songs_folder)
-            except Exception:
-                result = None
-            if result and result != self._last_live_sync_key:
-                self._last_live_sync_key = result
-                self._select_map_folder(result[0], diff_filename=result[1])
-        self.after(1000, self._poll_live_osu_map)
+        try:
+            if self.live_sync_enabled and self.osu_songs_folder and os.path.isdir(self.osu_songs_folder):
+                try:
+                    import osu_memory
+                    result = osu_memory.get_current_beatmap_folder_and_diff(self.osu_songs_folder)
+                except Exception:
+                    result = None
+                if result and result != self._last_live_sync_key:
+                    self._select_map_folder(result[0], diff_filename=result[1])
+                    # Commit only after loading succeeds, so a file temporarily
+                    # locked/replaced during an osu! save is retried next poll.
+                    self._last_live_sync_key = result
+        finally:
+            # A failed map read or frame refresh must not kill polling forever.
+            self.after(1000, self._poll_live_osu_map)
 
     # ------------------------------------------------------------------
     # Song search
@@ -2601,7 +2637,7 @@ class App(tk.Tk):
     def set_metadata_display_mode(self, mode: str):
         """Applies (and persists) the default artist/title display form —
         "unicode" or "romanised" — used by the Now Selecting label and the
-        search results. Called from Settings."""
+        search results. Called from Settings and first-time setup."""
         mode = "romanised" if mode == "romanised" else "unicode"
         self.metadata_display_mode = mode
         save_metadata_display_mode(mode)

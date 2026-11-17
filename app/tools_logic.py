@@ -1473,6 +1473,7 @@ def apply_bg_offset(folder: str, diff_files: List[str], bg_file: str, new_offset
     """Writes the y offset directly into each selected diff's background
     event line (x stays 0) — no image pixels are touched for the offset
     itself. Optionally converts .png -> .jpg (a plain re-save, no crop)."""
+    folder = os.path.abspath(folder)
     src_path = os.path.join(folder, bg_file)
 
     final_name = bg_file
@@ -1495,6 +1496,56 @@ def apply_bg_offset(folder: str, diff_files: List[str], bg_file: str, new_offset
         bm.save()
 
     return final_name
+
+
+RC_MAX_BG_W, RC_MAX_BG_H = 2560, 1440
+
+
+def downscale_bg_image(folder: str, bg_file: str) -> "tuple[str, bool]":
+    """Fit an oversized background inside the 2560x1440 RC container.
+
+    If either source dimension exceeds its respective limit, the image is
+    scaled to fit inside the container. Images whose width and height are
+    both already within the limits are left untouched. The original aspect
+    ratio and filename are preserved.
+    """
+    from PIL import Image
+
+    folder = os.path.abspath(folder)
+    src_path = os.path.join(folder, bg_file)
+    if not os.path.isfile(src_path):
+        raise RuntimeError(f"Background image {bg_file} not found.")
+
+    with Image.open(src_path) as im:
+        w, h = im.size
+        if w <= RC_MAX_BG_W and h <= RC_MAX_BG_H:
+            return bg_file, False
+
+        factor = min(RC_MAX_BG_W / w, RC_MAX_BG_H / h)
+        if factor >= 1.0:
+            return bg_file, False
+        tw = max(1, round(w * factor))
+        th = max(1, round(h * factor))
+        resized = im.resize((tw, th), Image.LANCZOS)
+
+        ext = os.path.splitext(bg_file)[1].lower()
+        fd, tmp_out = tempfile.mkstemp(suffix=ext or ".png", dir=folder)
+        os.close(fd)
+        try:
+            if ext in (".jpg", ".jpeg"):
+                resized.convert("RGB").save(tmp_out, "JPEG", quality=95)
+            else:
+                resized.save(tmp_out, "PNG")
+            os.replace(tmp_out, src_path)
+            tmp_out = None
+        finally:
+            if tmp_out and os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except OSError:
+                    pass
+
+    return bg_file, True
 
 
 # =============================================================================
@@ -1524,10 +1575,6 @@ WAIFU2X_MODEL_OPTIONS = list(WAIFU2X_MODELS)
 WAIFU2X_SCALE_OPTIONS = ["RC compliance", "2x", "3x", "4x"]
 WAIFU2X_FORMAT_OPTIONS = ["jpg", "png"]
 WAIFU2X_DENOISE_OPTIONS = ["-1", "0", "1", "2", "3"]
-
-# osu!'s Ranking Criteria background resolution ceiling.
-RC_MAX_BG_W, RC_MAX_BG_H = 2560, 1440
-
 
 def _waifu2x_search_dirs() -> List[str]:
     d = _bundled_dir()
@@ -1643,11 +1690,9 @@ def _next_pow2_at_least(x: float) -> int:
 def compute_bg_upscale_target(w: int, h: int, scale_opt: str) -> "tuple[int, int]":
     """Final pixel size the upscaled background should end up at.
 
-    "2x"/"3x"/"4x" are literal multipliers. "RC compliance" enlarges the
-    image (keeping its exact aspect ratio) until whichever of its
-    dimensions hits its RC ceiling first — height 1440 or width 2560 —
-    without either dimension going past its ceiling. An image already at
-    or above a ceiling is left untouched."""
+    "2x"/"3x"/"4x" are literal multipliers. "RC compliance" preserves the
+    source aspect ratio and scales until either width reaches 2560 or
+    height reaches 1440, whichever limit is reached first."""
     if w <= 0 or h <= 0:
         return w, h
     if scale_opt == "2x":
@@ -1656,13 +1701,11 @@ def compute_bg_upscale_target(w: int, h: int, scale_opt: str) -> "tuple[int, int
         return w * 3, h * 3
     if scale_opt == "4x":
         return w * 4, h * 4
-    # RC compliance
-    factor = min(RC_MAX_BG_W / w, RC_MAX_BG_H / h)
-    if factor <= 1.0:
-        return w, h
-    tw = min(RC_MAX_BG_W, int(w * factor))
-    th = min(RC_MAX_BG_H, int(h * factor))
-    return tw, th
+    width_factor = RC_MAX_BG_W / w
+    height_factor = RC_MAX_BG_H / h
+    if width_factor <= height_factor:
+        return RC_MAX_BG_W, max(1, round(h * width_factor))
+    return max(1, round(w * height_factor)), RC_MAX_BG_H
 
 
 def upscale_bg_image(folder: str, bg_file: str, model: str, scale_opt: str,
@@ -1694,8 +1737,10 @@ def upscale_bg_image(folder: str, bg_file: str, model: str, scale_opt: str,
     tw, th = compute_bg_upscale_target(w, h, scale_opt)
     needed = max(tw / w, th / h) if w and h else 1.0
     w2x_scale = _next_pow2_at_least(needed) if needed > 1.0 else 1
+    ext = ".png" if out_format == "png" else ".jpg"
 
-    if w2x_scale == 1 and noise < 0:
+    if (w2x_scale == 1 and noise < 0 and (tw, th) == (w, h)
+            and os.path.splitext(bg_file)[1].lower() == ext):
         # Nothing to do — no enlargement, and denoising is off.
         return bg_file
 
@@ -1703,32 +1748,47 @@ def upscale_bg_image(folder: str, bg_file: str, model: str, scale_opt: str,
     model_path = os.path.join(exe_dir, WAIFU2X_MODELS.get(model, "models-cunet"))
 
     base = os.path.splitext(bg_file)[0]
-    ext = ".png" if out_format == "png" else ".jpg"
     fd, tmp_out = tempfile.mkstemp(suffix=ext, dir=folder)
     os.close(fd)
     try:
-        cmd = [exe, "-i", src_path, "-o", tmp_out,
-               "-n", str(noise), "-s", str(w2x_scale), "-f", out_format]
-        if os.path.isdir(model_path):
-            cmd += ["-m", model_path]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=1800,
-                            creationflags=_SUBPROCESS_FLAGS, cwd=exe_dir)
-        except subprocess.CalledProcessError as e:
-            detail = ""
-            for stream in (e.stderr, e.stdout):
-                if stream:
-                    detail = stream.decode("utf-8", "ignore").strip()
-                    if detail:
-                        break
-            raise RuntimeError(f"waifu2x failed: {detail or e}")
-        except subprocess.SubprocessError as e:
-            raise RuntimeError(f"waifu2x failed: {e}")
+        # waifu2x-ncnn-vulkan does not overwrite an existing output path. It
+        # may still exit with code 0 while leaving mkstemp's placeholder empty,
+        # which is especially visible with JPG output. Keep the collision-safe
+        # unique name, but let waifu2x create the actual file itself.
+        os.remove(tmp_out)
+        if w2x_scale == 1 and noise < 0:
+            # RC may only need a resize/downscale. Avoid asking waifu2x to do
+            # a no-op scale-1 pass (which some builds reject).
+            with Image.open(src_path) as im:
+                fitted = im.resize((tw, th), Image.LANCZOS)
+                if ext == ".jpg":
+                    fitted.convert("RGB").save(tmp_out, "JPEG", quality=95)
+                else:
+                    fitted.save(tmp_out, "PNG")
+        else:
+            cmd = [exe, "-i", src_path, "-o", tmp_out,
+                   "-n", str(noise), "-s", str(w2x_scale), "-f", out_format]
+            if os.path.isdir(model_path):
+                cmd += ["-m", model_path]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, timeout=1800,
+                                creationflags=_SUBPROCESS_FLAGS, cwd=exe_dir)
+            except subprocess.CalledProcessError as e:
+                detail = ""
+                for stream in (e.stderr, e.stdout):
+                    if stream:
+                        detail = stream.decode("utf-8", "ignore").strip()
+                        if detail:
+                            break
+                raise RuntimeError(f"waifu2x failed: {detail or e}")
+            except subprocess.SubprocessError as e:
+                raise RuntimeError(f"waifu2x failed: {e}")
 
-        # waifu2x only scales by powers of 2 — for "3x" or an RC-compliance
-        # target that isn't a clean power of 2, downscale the power-of-2
-        # result to the exact intended size. Load fully and drop the file
-        # handle before writing back to the same path.
+            if not os.path.isfile(tmp_out) or os.path.getsize(tmp_out) == 0:
+                raise RuntimeError("waifu2x finished without creating a valid output image.")
+
+        # waifu2x only scales by powers of 2. Resize its result to the exact
+        # aspect-preserving target afterward.
         if tw >= 1 and th >= 1:
             with Image.open(tmp_out) as im:
                 im.load()
@@ -1840,6 +1900,11 @@ def probe_video_duration_seconds(path: str) -> Optional[float]:
     exist, or the probe otherwise fails — resize_taiko_video just leaves
     the quality-first CRF pass in place (even if oversized) in that case,
     since there's no duration to convert a size budget into a bitrate."""
+    return probe_media_duration_seconds(path)
+
+
+def probe_media_duration_seconds(path: str) -> Optional[float]:
+    """Audio or video container duration via ffprobe, then ffmpeg; None on failure."""
     if not path or not os.path.isfile(path):
         return None
     return _ffprobe_probe_video_duration(path) or _ffmpeg_probe_video_duration(path)
@@ -2111,8 +2176,7 @@ def _hit_object_end_time_ms(ho: HitObject, bm: Beatmap) -> float:
 
 def get_map_end_time_ms(bm: Beatmap) -> Optional[float]:
     """The map's final note timestamp — a slider/spinner/hold's tail, not
-    just its head. Used as the Taiko Video SB Code's fade-out time (see
-    apply_video_sb_code). None if the map has no hit objects at all."""
+    just its head. None if the map has no hit objects at all."""
     if not bm.hit_objects:
         return None
     return max(_hit_object_end_time_ms(ho, bm) for ho in bm.hit_objects)
@@ -2124,21 +2188,35 @@ def apply_video_sb_code(folder: str, diff_files: List[str], video_file: Optional
     Beatmap.set_video_sb_commands) into each selected diff — filename and
     offset are set the same way apply_video_offset does, plus the S/F/F/MY
     block right under the Video line. endTime (the second F command's
-    timestamp) is each diff's own last hit object's end time, computed
-    independently per diff since different difficulties can end at
-    different times. videoScale is computed once from the actual selected
+    timestamp) is the duration of that diff's AudioFilename, measured from
+    audio time zero without adding the video's offset. All audio durations
+    are checked before saving any diff. videoScale is computed once from the actual selected
     video file's real pixel height (compute_video_sb_scale); the vertical
     position is always VIDEO_SB_Y_POSITION."""
-    scale = compute_video_sb_scale(probe_video_height(os.path.join(folder, video_file)) if video_file else None)
+    pending = []
+    audio_end_times = {}
     for fname in diff_files:
         path = os.path.join(folder, fname)
         bm = Beatmap(path)
+        audio_file = bm.get_kv("General", "AudioFilename")
+        if not audio_file:
+            raise ValueError(f"Cannot determine song ending: {fname} has no AudioFilename.")
+        audio_path = os.path.normpath(os.path.join(folder, audio_file))
+        if audio_path not in audio_end_times:
+            duration = probe_media_duration_seconds(audio_path)
+            if duration is None or not (0 < duration < float("inf")):
+                raise ValueError(
+                    f"Cannot read song duration for {audio_file}. "
+                    "Check that the audio file exists and ffprobe or ffmpeg is installed."
+                )
+            audio_end_times[audio_path] = duration * 1000.0
+        pending.append((bm, audio_end_times[audio_path]))
+
+    scale = compute_video_sb_scale(probe_video_height(os.path.join(folder, video_file)) if video_file else None)
+    for bm, end_time in pending:
         if video_file:
             bm.set_video_filename(video_file)
         bm.set_video_time(start_time)
-        end_time = get_map_end_time_ms(bm)
-        if end_time is None:
-            end_time = start_time
         bm.set_video_sb_commands(start_time, end_time, scale, VIDEO_SB_Y_POSITION)
         bm.save()
 
@@ -3395,6 +3473,8 @@ def capture_pattern_from_osu_selection(name: str, clipboard_text: str, songs_fol
         result = osu_memory.resolve_folder_and_filename(reader)
     except Exception:
         result = None
+    finally:
+        reader.close()
     if result is None:
         raise ValueError("Couldn't determine which beatmap is currently open in osu!.")
     folder_name, osu_filename = result

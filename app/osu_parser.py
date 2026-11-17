@@ -10,11 +10,33 @@ TimingPoints and HitObjects.
 """
 
 from __future__ import annotations
+import csv
 import os
 import re
 import math
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+
+def _parse_event_line(line: str) -> List[str]:
+    """Parse one [Events] CSV row, including quoted filenames containing
+    commas. Plain ``str.split(',')`` silently truncates those names."""
+    try:
+        return next(csv.reader([line], skipinitialspace=True))
+    except (csv.Error, StopIteration):
+        return []
+
+
+def _format_event_line(parts: List[str]) -> str:
+    def field(value: str, force_quote: bool = False) -> str:
+        value = str(value)
+        if force_quote or any(ch in value for ch in ',"\r\n'):
+            return '"' + value.replace('"', '""') + '"'
+        return value
+
+    # osu!'s event examples and serializer convention always quote the
+    # resource filename (field 2), even when CSV would not require it.
+    return ",".join(field(value, i == 2) for i, value in enumerate(parts))
 
 
 # ----------------------------------------------------------------------------
@@ -248,8 +270,8 @@ class Beatmap:
 
     def _background_line_index(self) -> Optional[int]:
         for i, line in enumerate(self.sections.get("Events", [])):
-            parts = line.split(",")
-            if len(parts) >= 3 and parts[0].strip().strip('"') == "0":
+            parts = _parse_event_line(line)
+            if len(parts) >= 3 and parts[0].strip() == "0":
                 return i
         return None
 
@@ -257,8 +279,8 @@ class Beatmap:
         idx = self._background_line_index()
         if idx is None:
             return None
-        parts = self.sections["Events"][idx].split(",")
-        return parts[2].strip().strip('"')
+        parts = _parse_event_line(self.sections["Events"][idx])
+        return parts[2].strip() if len(parts) >= 3 else None
 
     def set_background_filename(self, new_name: str):
         lines = self.sections.setdefault("Events", [])
@@ -266,9 +288,9 @@ class Beatmap:
             self.section_order.append("Events")
         idx = self._background_line_index()
         if idx is not None:
-            parts = lines[idx].split(",")
-            parts[2] = f'"{new_name}"'
-            lines[idx] = ",".join(parts)
+            parts = _parse_event_line(lines[idx])
+            parts[2] = new_name
+            lines[idx] = _format_event_line(parts)
             return
         # No background event line at all yet (e.g. a diff that never had
         # one) — append a fresh one instead of silently doing nothing.
@@ -284,7 +306,7 @@ class Beatmap:
         idx = self._background_line_index()
         if idx is None:
             return 0, 0
-        parts = self.sections["Events"][idx].split(",")
+        parts = _parse_event_line(self.sections["Events"][idx])
         try:
             x = int(float(parts[3])) if len(parts) > 3 and parts[3].strip() != "" else 0
         except ValueError:
@@ -300,12 +322,12 @@ class Beatmap:
         if idx is None:
             return  # nothing to offset without a filename — see set_background_filename
         lines = self.sections["Events"]
-        parts = lines[idx].split(",")
+        parts = _parse_event_line(lines[idx])
         while len(parts) < 5:
             parts.append("0")
         parts[3] = str(int(x))
         parts[4] = str(int(y))
-        lines[idx] = ",".join(parts)
+        lines[idx] = _format_event_line(parts)
 
     def get_video_filename(self) -> Optional[str]:
         for line in self.sections.get("Events", []):
@@ -416,7 +438,7 @@ class Beatmap:
         video scales to `scale` and shifts vertically by `y_position` at
         `start_time`, fades in over the same instant (so it doesn't pop in
         already-shrunk before the offset), then fades back out at
-        `end_time` (the map's own final note)."""
+        `end_time` (the song's audio ending)."""
         rng = self._video_sb_block_range()
         if rng is None:
             return
@@ -645,9 +667,9 @@ def read_basic_metadata(path: str) -> "Optional[dict]":
                     elif k == "Version":
                         version = v
                 elif section == "Events" and bg_filename is None:
-                    parts = line.split(",")
-                    if len(parts) >= 3 and parts[0].strip().strip('"') == "0":
-                        bg_filename = parts[2].strip().strip('"')
+                    parts = _parse_event_line(line)
+                    if len(parts) >= 3 and parts[0].strip() == "0":
+                        bg_filename = parts[2].strip()
     except OSError:
         return None
 

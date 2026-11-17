@@ -4069,7 +4069,8 @@ class TimingEditorFrame(BaseToolFrame):
         self.hdr_frame.bind("<Configure>", lambda _e: self._sync_scrollregions())
         tk.Frame(tbl_wrap, bg=FRONT_BORDER, height=1).grid(row=1, column=0, sticky="ew")
 
-        self.table_canvas = tk.Canvas(tbl_wrap, bg=FRONT_CARD_BG, highlightthickness=0, height=180)
+        self.table_canvas = tk.Canvas(tbl_wrap, bg=FRONT_CARD_BG, highlightthickness=0, height=180,
+                                      yscrollincrement=1)
         self.table_canvas.grid(row=2, column=0, sticky="nsew")
         tbl_scroll = ttk.Scrollbar(tbl_wrap, orient="vertical", command=self._table_yview)
         tbl_scroll.grid(row=0, column=1, rowspan=3, sticky="ns")
@@ -4236,6 +4237,7 @@ class TimingEditorFrame(BaseToolFrame):
         self._load_map()
 
     def on_hidden(self):
+        self._cancel_table_animation()
         self._stop_audio()
         for seq in ("<space>", "<Control-z>", "<Control-Z>", "<Control-y>",
                      "<Control-Y>", "<Delete>", "<Left>", "<Right>"):
@@ -4294,6 +4296,7 @@ class TimingEditorFrame(BaseToolFrame):
         return "break"
 
     def _load_map(self):
+        self._cancel_table_animation()
         folder, diffs = self.app.get_diff_files()
         src = diffs[0] if diffs else None
         key = (folder, src)
@@ -4507,21 +4510,60 @@ class TimingEditorFrame(BaseToolFrame):
         for child in widget.winfo_children():
             self._bind_table_wheel(child)
 
+    def _cancel_table_animation(self):
+        job = getattr(self, "_table_anim_job", None)
+        if job is not None:
+            self.after_cancel(job)
+        self._table_anim_job = None
+        self._table_scroll_target = None
+
     def _table_wheel(self, event, direction=None):
-        if direction is None:
-            direction = 1 if getattr(event, "delta", 0) > 0 else -1
-        # If the whole table already fits (nothing to scroll), swallow the
-        # event rather than letting tk drift the canvas past its content or
-        # letting the wheel bubble up to an ancestor scrollable.
+        delta = direction if direction is not None else getattr(event, "delta", 0) / 120.0
         first, last = self.table_canvas.yview()
-        if first <= 0.0 and last >= 1.0:
+        if not delta or (first <= 0.0 and last >= 1.0):
             return "break"
-        self.table_canvas.yview_scroll(-direction * 2, "units")
-        self._flush_table_redraw()
+        total = max(1, self.table_inner.winfo_reqheight())
+        current = first * total
+        target = getattr(self, "_table_scroll_target", None)
+        if target is None:
+            target = current
+        # Preserve high-resolution wheel deltas and accumulate rapid notches
+        # against the destination, rather than losing them between frames.
+        limit = max(0.0, total * (1.0 - (last - first)))
+        self._table_scroll_target = max(0.0, min(limit, target - delta * 48.0))
+        if getattr(self, "_table_anim_job", None) is None:
+            self._table_anim_wall = time.monotonic()
+            self._table_anim_job = self.after(16, self._animate_table_scroll)
         return "break"
 
+    def _animate_table_scroll(self):
+        self._table_anim_job = None
+        target = self._table_scroll_target
+        if target is None:
+            return
+        total = max(1, self.table_inner.winfo_reqheight())
+        current = self.table_canvas.yview()[0] * total
+        now = time.monotonic()
+        dt = max(0.0, now - self._table_anim_wall)
+        self._table_anim_wall = now
+        remaining = target - current
+        done = abs(remaining) <= 1.0
+        position = target if done else current + remaining * (1.0 - math.exp(-dt / 0.045))
+        self.table_canvas.yview_moveto(position / total)
+        # Queue before pumping Windows paint events: a re-entrant wheel event
+        # must see the existing job instead of starting a second animation.
+        if done:
+            self._table_scroll_target = None
+        else:
+            self._table_anim_job = self.after(16, self._animate_table_scroll)
+        self._flush_table_redraw()
+
     def _table_yview(self, *args):
-        """Vertical-scroll entry point shared by the scrollbar and the wheel."""
+        """Scrollbar drags take over immediately from a wheel animation."""
+        self._cancel_table_animation()
+        if args[0] == "scroll" and args[2] == "units":
+            # Canvas units are now single pixels; keep scrollbar arrows useful.
+            args = ("scroll", int(args[1]) * 24, "units")
         self.table_canvas.yview(*args)
         self._flush_table_redraw()
 
@@ -5984,6 +6026,7 @@ class TimingEditorFrame(BaseToolFrame):
         w = row.get("frame")
         if w is None or row["_deleted"]:
             return
+        self._cancel_table_animation()
         self.table_inner.update_idletasks()
         total = max(1, self.table_inner.winfo_height())
         self.table_canvas.yview_moveto(max(0.0, min(1.0, w.winfo_y() / total)))
@@ -6185,16 +6228,28 @@ class BgOffsetShifterFrame(BaseToolFrame):
         LightCheckbox(body, "Convert to .jpg", self.convert_jpg_var).pack(anchor="w", pady=(0, 12))
 
         upscale_row = tk.Frame(body, bg=FRONT_CARD_BG)
-        upscale_row.pack(fill="x", pady=(0, 12))
+        upscale_row.pack(fill="x", pady=(0, 8))
         self.upscale_bg_var = tk.BooleanVar(value=False)
         LightCheckbox(upscale_row, "Upscale BG", self.upscale_bg_var,
-                      command=self._sync_upscale_state).pack(side="left")
+                      command=self._on_upscale_toggled).pack(side="left")
         _upscale_info = InfoIcon(upscale_row, "Upscale the BG using waifu2x")
         _upscale_info.configure(bg=FRONT_CARD_BG)
         _upscale_info.pack(side="left", padx=(4, 0))
         self.upscale_config_btn = _make_ghost_button(upscale_row, "Configure",
                                                       self.open_upscale_config)
         self.upscale_config_btn.pack(side="left", padx=(10, 0))
+
+        downscale_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        downscale_row.pack(fill="x", pady=(0, 12))
+        self.downscale_bg_var = tk.BooleanVar(value=False)
+        LightCheckbox(downscale_row, "Downscale BG", self.downscale_bg_var,
+                      command=self._on_downscale_toggled).pack(side="left")
+        _downscale_info = InfoIcon(
+            downscale_row,
+            "Make the oversized BG image fit RC dimension",
+        )
+        _downscale_info.configure(bg=FRONT_CARD_BG)
+        _downscale_info.pack(side="left", padx=(4, 0))
         self._sync_upscale_state()
 
         tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
@@ -6215,12 +6270,45 @@ class BgOffsetShifterFrame(BaseToolFrame):
     def refresh(self):
         folder, diffs = self.app.get_diff_files()
         images = logic.list_song_folder_images(folder) if folder else []
-        self.bg_combo.set_values(images)
         current_bg = None
+        image_names = {os.path.normcase(os.path.normpath(name)): name for name in images}
         if folder and diffs:
-            bm = osu_parser.Beatmap(os.path.join(folder, diffs[0]))
-            current_bg = bm.get_background_filename()
-        if current_bg and current_bg in images:
+            # Follow the difficulty the app actually selected (especially
+            # live osu! auto-pickup), rather than an unrelated alphabetic
+            # first file which may use a different background.
+            preferred = getattr(self.app, "current_diff_filename", None)
+            candidates = ([preferred] if preferred in diffs else []) + [
+                name for name in diffs if name != preferred
+            ]
+            for filename in candidates:
+                try:
+                    bm = osu_parser.Beatmap(os.path.join(folder, filename))
+                except OSError:
+                    continue
+                referenced = bm.get_background_filename()
+                if not referenced:
+                    continue
+                key = os.path.normcase(os.path.normpath(referenced))
+                detected = image_names.get(key)
+                if detected:
+                    current_bg = detected
+                    break
+                # A valid .osu event may reference an image in a subfolder;
+                # include that exact relative path without flooding the
+                # dropdown with unrelated storyboard assets.
+                candidate = os.path.abspath(os.path.join(folder, referenced))
+                try:
+                    inside_folder = os.path.commonpath((os.path.abspath(folder), candidate)) == os.path.abspath(folder)
+                except ValueError:
+                    inside_folder = False
+                if (inside_folder and os.path.isfile(candidate)
+                        and referenced.lower().endswith((".jpg", ".jpeg", ".png"))):
+                    images.append(referenced)
+                    image_names[key] = referenced
+                    current_bg = referenced
+                    break
+        self.bg_combo.set_values(sorted(images, key=str.casefold))
+        if current_bg:
             self.bg_var.set(current_bg)
         elif images:
             self.bg_var.set(images[0])
@@ -6320,6 +6408,16 @@ class BgOffsetShifterFrame(BaseToolFrame):
         state = "normal" if self.upscale_bg_var.get() else "disabled"
         self.upscale_config_btn.configure(state=state)
 
+    def _on_upscale_toggled(self):
+        if self.upscale_bg_var.get():
+            self.downscale_bg_var.set(False)
+        self._sync_upscale_state()
+
+    def _on_downscale_toggled(self):
+        if self.downscale_bg_var.get():
+            self.upscale_bg_var.set(False)
+        self._sync_upscale_state()
+
     def open_upscale_config(self):
         existing = getattr(self, "_upscale_cfg_win", None)
         if existing is not None and existing.winfo_exists():
@@ -6349,6 +6447,9 @@ class BgOffsetShifterFrame(BaseToolFrame):
 
         if self.upscale_bg_var.get():
             self._apply_with_upscale(folder, targets, bg, offset, convert_jpg)
+            return
+        if self.downscale_bg_var.get():
+            self._apply_with_downscale(folder, targets, bg, offset, convert_jpg)
             return
 
         try:
@@ -6395,6 +6496,34 @@ class BgOffsetShifterFrame(BaseToolFrame):
                      if install_first else "Upscaling background with waifu2x... Please wait...")
         self.app.run_cancellable_job(busy_msg, work, on_success=on_success, on_error=on_error,
                                       cancelled_toast="Upscale Cancelled!")
+
+    def _apply_with_downscale(self, folder, targets, bg, offset, convert_jpg):
+        def work(cancel_event):
+            downscaled, changed = logic.downscale_bg_image(folder, bg)
+            if cancel_event.is_set():
+                return None
+            final_name = logic.apply_bg_offset(folder, targets, downscaled, offset, convert_jpg)
+            return final_name, changed
+
+        def on_success(result):
+            if result is None:
+                return
+            final_name, changed = result
+            if changed:
+                message = f"Background downscaled and updated ({final_name})"
+            else:
+                message = f"Background did not require downscaling ({final_name})"
+            self.notify_done(f"{message} and applied to {len(targets)} difficulty file(s).")
+            self.refresh()
+
+        def on_error(err_msg):
+            _show_alert(self, "Error", err_msg)
+
+        self.app.run_cancellable_job(
+            "Downscaling background... Please wait...", work,
+            on_success=on_success, on_error=on_error,
+            cancelled_toast="Downscale Cancelled!",
+        )
 
 
 class PreviewWindow(tk.Toplevel):
@@ -6530,6 +6659,10 @@ class Waifu2xConfigWindow(tk.Toplevel):
 
     def __init__(self, parent_frame, app):
         super().__init__(parent_frame)
+        # Keep the native window hidden while its geometry and controls are
+        # created, otherwise Windows briefly maps an empty default-sized
+        # Toplevel before it jumps to the configured position.
+        self.withdraw()
         self.app = app
         self.title("Upscale BG — Configure")
         self.configure(bg=FRONT_BG)
@@ -6560,7 +6693,8 @@ class Waifu2xConfigWindow(tk.Toplevel):
         _row("Model", self.model_var, logic.WAIFU2X_MODEL_OPTIONS,
              "CUnet works best on anime/art.")
         _row("Scale", self.scale_var, logic.WAIFU2X_SCALE_OPTIONS,
-             "RC Compliance will upscale to fit ranking criteria's maximum dimension")
+             "RC compliance preserves aspect ratio and scales until width reaches 2560 "
+             "or height reaches 1440, whichever comes first")
         _row("Format", self.format_var, logic.WAIFU2X_FORMAT_OPTIONS)
         _row("Denoise", self.denoise_var, logic.WAIFU2X_DENOISE_OPTIONS,
              "-1: disable, 0: a light pass. Higher values removes more compression "
@@ -6573,6 +6707,7 @@ class Waifu2xConfigWindow(tk.Toplevel):
 
         self.bind("<Escape>", lambda _e: self.destroy())
         self.transient(parent_frame.winfo_toplevel())
+        self.deiconify()
         self.lift()
         self.focus_force()
         self.grab_set()
@@ -9009,7 +9144,10 @@ class PatternGalleryFrame(BaseToolFrame):
             reader = osu_memory._get_pymem_reader()
             if reader is None:
                 return None
-            result = osu_memory.resolve_folder_and_filename(reader)
+            try:
+                result = osu_memory.resolve_folder_and_filename(reader)
+            finally:
+                reader.close()
             return result[1] if result else None
         except Exception:
             return None

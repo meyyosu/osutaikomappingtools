@@ -23,7 +23,8 @@ always 4 bytes.
 from __future__ import annotations
 import os
 import struct
-from typing import Callable, List, NamedTuple, Optional, Tuple
+import time
+from typing import Iterator, List, NamedTuple, Optional, Tuple
 
 # The exact byte pattern OsuMemoryDataProvider scans for to locate a stable
 # anchor point in osu!'s memory (see SignatureNames.OsuBase in the upstream
@@ -58,6 +59,9 @@ class MemoryReader:
             return None
         return struct.unpack("<I", data)[0]
 
+    def close(self):
+        """Release any OS resources owned by this reader."""
+
 
 # ----------------------------------------------------------------------------
 # Core, OS-independent algorithm (unit-testable against a fake MemoryReader)
@@ -65,6 +69,11 @@ class MemoryReader:
 def find_pattern(reader: MemoryReader, pattern: bytes) -> Optional[int]:
     """Scans every non-execute-only region for `pattern`, returning the
     absolute address of the first match, or None."""
+    return next(find_patterns(reader, pattern), None)
+
+
+def find_patterns(reader: MemoryReader, pattern: bytes) -> Iterator[int]:
+    """Yield all candidates: the byte signature alone is not unique."""
     for region in reader.list_regions():
         if region.executable_only:
             continue
@@ -72,9 +81,9 @@ def find_pattern(reader: MemoryReader, pattern: bytes) -> Optional[int]:
         if not data:
             continue
         idx = data.find(pattern)
-        if idx != -1:
-            return region.base + idx
-    return None
+        while idx != -1:
+            yield region.base + idx
+            idx = data.find(pattern, idx + 1)
 
 
 def read_clr_string(reader: MemoryReader, field_address: int) -> Optional[str]:
@@ -97,41 +106,40 @@ def read_clr_string(reader: MemoryReader, field_address: int) -> Optional[str]:
         return None
 
 
-# OsuBase's address is a stable anchor for the lifetime of a given osu!
-# process (it doesn't move once the module is loaded), so once found for a
-# given pid it's cached here rather than re-scanning the entire address
-# space on every call — needed because resolve_folder_and_filename() is now
-# also called from a continuous once-a-second live-sync poll (main.py's
-# _poll_live_osu_map), where re-running find_pattern's full-region scan that
-# often would be wasteful. Falls back to a fresh scan if the cached address
-# stops resolving (osu! restarted and reused the pid, stale cache, etc.).
-_signature_cache = {"pid": None, "base_addr": None}
-
-
-def resolve_current_beatmap_data_pointer(reader: MemoryReader) -> Optional[int]:
-    """Finds OsuBase, then follows the -12/dereference chain to get the
-    CurrentBeatmapData pointer (see OsuMemoryReader.cs's CreateBeatmapDataSignatures)."""
-    pid = getattr(reader, "pid", None)
-    base_addr = _signature_cache["base_addr"] if pid is not None and _signature_cache["pid"] == pid else None
-    if base_addr is not None:
-        value = reader.read_uint32(base_addr + OSU_BASE_TO_BEATMAP_DATA_OFFSET)
-        if value:
-            return value
-        # Cached address stopped resolving — fall through and rescan.
-
-    base_addr = find_pattern(reader, OSU_BASE_PATTERN)
-    if base_addr is None:
-        return None
-    _signature_cache["pid"] = pid
-    _signature_cache["base_addr"] = base_addr
-    ptr_location = base_addr + OSU_BASE_TO_BEATMAP_DATA_OFFSET
-    return reader.read_uint32(ptr_location)
+# Cache a validated anchor per process. Re-check its full pointer chain on
+# every poll and periodically scan again on failure (including downstream
+# failures), without scanning the whole address space every second at menus.
+_signature_cache = {"pid": None, "base_addr": None, "last_scan": float("-inf")}
+_RESCAN_INTERVAL = 5.0
 
 
 def resolve_folder_and_filename(reader: MemoryReader) -> Optional[Tuple[str, str]]:
     """Returns (folder_name, osu_filename) for the currently loaded beatmap,
     or None if anything along the chain can't be resolved."""
-    beatmap_data_ptr = resolve_current_beatmap_data_pointer(reader)
+    pid = getattr(reader, "pid", None)
+    same_process = pid is not None and _signature_cache["pid"] == pid
+    base_addr = _signature_cache["base_addr"] if same_process else None
+    if base_addr is not None:
+        # Validate the entire chain, not just the first nonzero pointer.
+        # A stale anchor can still point at readable, unrelated memory.
+        if reader.read_bytes(base_addr, len(OSU_BASE_PATTERN)) == OSU_BASE_PATTERN:
+            result = _read_beatmap_at(reader, base_addr)
+            if result:
+                return result
+    now = time.monotonic()
+    if same_process and now - _signature_cache["last_scan"] < _RESCAN_INTERVAL:
+        return None
+    _signature_cache.update(pid=pid, base_addr=None, last_scan=now)
+    for candidate in find_patterns(reader, OSU_BASE_PATTERN):
+        result = _read_beatmap_at(reader, candidate)
+        if result:
+            _signature_cache["base_addr"] = candidate
+            return result
+    return None
+
+
+def _read_beatmap_at(reader: MemoryReader, base_addr: int) -> Optional[Tuple[str, str]]:
+    beatmap_data_ptr = reader.read_uint32(base_addr + OSU_BASE_TO_BEATMAP_DATA_OFFSET)
     if not beatmap_data_ptr:
         return None
     # beatmap_data_ptr itself is a field holding a pointer to the actual
@@ -142,7 +150,7 @@ def resolve_folder_and_filename(reader: MemoryReader) -> Optional[Tuple[str, str
         return None
     folder = read_clr_string(reader, beatmap_obj_ptr + FOLDER_NAME_OFFSET)
     osu_filename = read_clr_string(reader, beatmap_obj_ptr + OSU_FILENAME_OFFSET)
-    if not folder or not osu_filename:
+    if not folder or not osu_filename or not osu_filename.lower().endswith(".osu"):
         return None
     return folder, osu_filename
 
@@ -154,6 +162,10 @@ class PymemReader(MemoryReader):
     def __init__(self, pm):
         self._pm = pm
         self.pid = getattr(pm, "process_id", None)
+
+    def close(self):
+        if self._pm.process_handle:
+            self._pm.close_process()
 
     def list_regions(self) -> List[MemoryRegion]:
         import ctypes
@@ -174,12 +186,16 @@ class PymemReader(MemoryReader):
                 ("Type", wintypes.DWORD),
             ]
 
+        query = ctypes.WinDLL("kernel32", use_last_error=True).VirtualQueryEx
+        query.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+                          ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t]
+        query.restype = ctypes.c_size_t
         handle = self._pm.process_handle
         address = 0
         mbi = MEMORY_BASIC_INFORMATION()
         max_address = 0x7FFFFFFF  # osu! stable is 32-bit
         while address < max_address:
-            result = ctypes.windll.kernel32.VirtualQueryEx(
+            result = query(
                 handle, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)
             )
             if result == 0:
@@ -211,10 +227,37 @@ def _get_pymem_reader():
     except ImportError:
         return None
     try:
-        pm = pymem.Pymem("osu!.exe")
+        # Materialize the generator so its process-snapshot handle is closed
+        # even when we return early. Lazer uses the same executable name;
+        # stable's pointer layout is exclusively 32-bit.
+        # pymem yields the SAME mutable PROCESSENTRY32 for each iteration.
+        processes = [(p.th32ProcessID, p.szExeFile.lower())
+                     for p in pymem.process.list_processes()]
+        seen = set()
+        for pid, name in processes:
+            if name != b"osu!.exe" or pid in seen:
+                continue
+            seen.add(pid)
+            pm = None
+            try:
+                pm = pymem.Pymem()
+                # Read/query access is sufficient. Pymem(pid) requests full
+                # access and enables debug privileges; some pymem versions
+                # leak a token handle on every such privilege adjustment.
+                pm.process_handle = pymem.process.open(
+                    pid, debug=False, process_access=0x0400 | 0x0010)
+                if not pm.process_handle:
+                    continue
+                pm.process_id = pid
+                if not pymem.process.is_64_bit(pm.process_handle):
+                    return PymemReader(pm)
+            except Exception:
+                pass  # A process may exit while we're enumerating it.
+            if pm is not None and pm.process_handle:
+                pm.close_process()
     except Exception:
-        return None
-    return PymemReader(pm)
+        pass
+    return None
 
 
 def get_current_beatmap_folder(songs_folder: str) -> Optional[str]:
@@ -239,6 +282,8 @@ def get_current_beatmap_folder_and_diff(songs_folder: str) -> Optional[Tuple[str
         result = resolve_folder_and_filename(reader)
     except Exception:
         return None
+    finally:
+        reader.close()
     if not result:
         return None
     folder_name, osu_filename = result
