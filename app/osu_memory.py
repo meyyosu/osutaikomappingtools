@@ -7,7 +7,7 @@ tools like OsuMemoryDataProvider / gosumemory do.
 This is inherently Windows-only, requires osu! stable (not lazer) to be
 running, and depends on memory offsets that can change between osu!
 updates. Every public entry point here is designed to fail closed: if
-anything at all goes wrong (wrong OS, pymem missing, osu! not running, a
+anything at all goes wrong (wrong OS, osu! not running, a
 signature not found, garbage pointers), functions return None rather than
 raising, so callers can always fall back to asking the user to pick the
 folder manually.
@@ -158,15 +158,7 @@ def _read_beatmap_at(reader: MemoryReader, base_addr: int) -> Optional[Tuple[str
 # ----------------------------------------------------------------------------
 # Windows-backed implementation (only usable on real Windows with osu! open)
 # ----------------------------------------------------------------------------
-class PymemReader(MemoryReader):
-    def __init__(self, pm):
-        self._pm = pm
-        self.pid = getattr(pm, "process_id", None)
-
-    def close(self):
-        if self._pm.process_handle:
-            self._pm.close_process()
-
+class WindowsMemoryReader(MemoryReader):
     def list_regions(self) -> List[MemoryRegion]:
         import ctypes
         from ctypes import wintypes
@@ -190,7 +182,7 @@ class PymemReader(MemoryReader):
         query.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
                           ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t]
         query.restype = ctypes.c_size_t
-        handle = self._pm.process_handle
+        handle = self.process_handle
         address = 0
         mbi = MEMORY_BASIC_INFORMATION()
         max_address = 0x7FFFFFFF  # osu! stable is 32-bit
@@ -209,6 +201,20 @@ class PymemReader(MemoryReader):
             address += mbi.RegionSize or 0x1000
         return regions
 
+
+class PymemReader(WindowsMemoryReader):
+    def __init__(self, pm):
+        self._pm = pm
+        self.pid = getattr(pm, "process_id", None)
+
+    @property
+    def process_handle(self):
+        return self._pm.process_handle
+
+    def close(self):
+        if self._pm.process_handle:
+            self._pm.close_process()
+
     def read_bytes(self, address: int, size: int) -> Optional[bytes]:
         try:
             return self._pm.read_bytes(address, size)
@@ -216,12 +222,106 @@ class PymemReader(MemoryReader):
             return None
 
 
-def _get_pymem_reader():
-    """Returns a ready PymemReader attached to a running osu!.exe, or None
-    if that's not possible for any reason (not Windows, pymem missing,
-    osu! not running, access denied, ...)."""
+class NativeWindowsReader(WindowsMemoryReader):
+    """Read-only Win32 backend using Python's standard library."""
+
+    def __init__(self, kernel, handle, pid):
+        self._kernel = kernel
+        self.process_handle = handle
+        self.pid = pid
+
+    def close(self):
+        if self.process_handle:
+            self._kernel.CloseHandle(self.process_handle)
+            self.process_handle = None
+
+    def read_bytes(self, address, size):
+        import ctypes
+        if not self.process_handle or size <= 0:
+            return None
+        buffer = ctypes.create_string_buffer(size)
+        count = ctypes.c_size_t()
+        if not self._kernel.ReadProcessMemory(
+                self.process_handle, ctypes.c_void_p(address), buffer,
+                size, ctypes.byref(count)) or count.value != size:
+            return None
+        return buffer.raw
+
+
+def _get_native_reader():
+    """Find the 32-bit stable client without requiring a pip package."""
     if os.name != "nt":
         return None
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    declarations = {
+        "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        "Process32FirstW": ([wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)], wintypes.BOOL),
+        "Process32NextW": ([wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)], wintypes.BOOL),
+        "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "IsWow64Process2": ([wintypes.HANDLE, ctypes.POINTER(wintypes.WORD),
+                             ctypes.POINTER(wintypes.WORD)], wintypes.BOOL),
+        "ReadProcessMemory": ([wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                               ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)], wintypes.BOOL),
+    }
+    for name, (argtypes, restype) in declarations.items():
+        function = getattr(kernel, name)
+        function.argtypes, function.restype = argtypes, restype
+
+    snapshot = kernel.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        return None
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            if entry.szExeFile.lower() == "osu!.exe":
+                handle = kernel.OpenProcess(0x0410, False, entry.th32ProcessID)
+                if handle:
+                    keep = False
+                    try:
+                        process_machine, native_machine = wintypes.WORD(), wintypes.WORD()
+                        if kernel.IsWow64Process2(handle, ctypes.byref(process_machine),
+                                                 ctypes.byref(native_machine)):
+                            # I386, either under WOW64 or on native 32-bit Windows.
+                            if (process_machine.value or native_machine.value) == 0x014c:
+                                reader = NativeWindowsReader(kernel, handle, entry.th32ProcessID)
+                                keep = True
+                                return reader
+                    finally:
+                        if not keep:
+                            kernel.CloseHandle(handle)
+            more = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    return None
+
+
+def _get_pymem_reader():
+    """Return a reader attached to stable (legacy name kept for callers).
+
+    Prefer the built-in Windows backend; pymem supports older Windows
+    versions without IsWow64Process2. Neither backend writes process memory.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        reader = _get_native_reader()
+        if reader is not None:
+            return reader
+    except Exception:
+        pass
     try:
         import pymem
     except ImportError:
@@ -263,7 +363,7 @@ def _get_pymem_reader():
 def get_current_beatmap_folder(songs_folder: str) -> Optional[str]:
     """Best-effort: returns the full path to the beatmap folder currently
     selected/open in a running osu! stable client, or None if it can't be
-    determined (wrong OS, osu! not running, pymem not installed, memory
+    determined (wrong OS, osu! not running, memory
     layout not matching what we expect, etc.) — callers should fall back to
     asking the user to pick the folder manually whenever this returns None."""
     result = get_current_beatmap_folder_and_diff(songs_folder)

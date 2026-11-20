@@ -21,6 +21,9 @@ from tkinter import font as tkfont
 
 import osu_parser
 import tools_logic as logic
+from scrollbars import AutoHideScrollbar
+from bass_audio import BassPlayer
+from playback_audio import PreparedAudioCache
 
 DIVISORS = ["1/1", "1/2", "1/4", "1/6", "1/12", "1/24", "1/36", "1/48"]
 
@@ -45,6 +48,7 @@ def _style_light_body(base_frame):
     ttk frame background every tool screen gets otherwise. Call once at
     the top of a screen's __init__ to opt it into the light look."""
     base_frame._scroll_canvas.configure(bg=FRONT_BG)
+    base_frame._scrollbar.configure(bg=FRONT_BG)
     ttk.Style().configure("FrontBody.TFrame", background=FRONT_BG)
     base_frame.body.configure(style="FrontBody.TFrame")
 
@@ -225,69 +229,159 @@ def _position_over_window(win, reference_widget, width=None, height=None):
     win.geometry(f"{ww}x{wh}+{x}+{y}")
 
 
-def show_toast(widget, message: str, bg="#b5e61d", fg="#000000",
-               display_ms=2000, fade_ms=250, steps=20):
-    """A small borderless banner that fades in over the main window, holds
-    for `display_ms`, then fades back out and destroys itself — used for
-    routine 'it worked' confirmations so the user doesn't have to click a
-    dialog closed every time they hit Apply. Deliberately not `-topmost`
-    (an earlier version was) — that made it float above every other
-    window on the desktop, including other apps, the instant it fired
-    even if the user had already switched away from this app. `transient`
-    keeps it stacked above its owner window without doing that. It never
-    calls `grab_set()` either, so it was never modal — clicking through to
-    the rest of the app while a toast is fading was already fine."""
+def _notification_icon_image(bg, accent, kind="success", progress=None, angle=90):
+    """Render small notification symbols at 6x size for smooth downsampling.
+
+    Composite against the card's actual fill, so antialiased edges never
+    pick up the Toplevel's transparent color key.
+    """
+    from PIL import Image, ImageDraw
+
+    scale, size = 6, 28
+    image = Image.new("RGB", (size * scale, size * scale), bg)
+    draw = ImageDraw.Draw(image)
+
+    def box(coords):
+        return tuple(int(value * scale) for value in coords)
+
+    def dot(x, y, radius, color):
+        draw.ellipse(box((x - radius, y - radius, x + radius, y + radius)), fill=color)
+
+    if kind == "progress":
+        bounds = box((4, 4, 24, 24))
+        stroke = int(2.5 * scale)
+        draw.ellipse(bounds, outline="#f2e4bc", width=stroke)
+        extent = 100 if progress is None else 360 * max(0.0, min(1.0, progress))
+        start = -angle if progress is None else -90
+        if extent >= 360:
+            draw.ellipse(bounds, outline=accent, width=stroke)
+        elif extent > 0:
+            draw.arc(bounds, start=start, end=start + extent, fill=accent, width=stroke)
+            # Pillow strokes sit inside their bounding box. Put round caps
+            # on the stroke's centerline, at both ends of the arc.
+            for degrees in (start, start + extent):
+                radians = math.radians(degrees)
+                dot(14 + 8.75 * math.cos(radians),
+                    14 + 8.75 * math.sin(radians), 1.25, accent)
+    else:
+        draw.ellipse(box((2, 2, 26, 26)), fill=accent)
+        if kind == "success":
+            points = [(9, 14), (13, 18), (20, 10)]
+            draw.line([box(point) for point in points], fill="white",
+                      width=int(2.5 * scale), joint="curve")
+            for x, y in points:
+                dot(x, y, 1.25, "white")
+        else:
+            draw.line(box((14, 8, 14, 15)), fill=bg, width=int(2.5 * scale))
+            dot(14, 8, 1.25, bg)
+            dot(14, 15, 1.25, bg)
+            dot(14, 20, 1.3, bg)
+    return image.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def show_toast(widget, message: str, bg="#effbeb", fg="#20332a",
+               display_ms=3250, fade_ms=250, steps=20):
+    """Rounded, auto-dismissing feedback with a fade and 8px upward entrance.
+
+    Transient ownership keeps it above its owner without floating over
+    other apps. No grab or focus change: feedback remains non-modal.
+    A fresh message replaces the owner's previous toast.
+    """
     top = widget.winfo_toplevel()
+    previous = getattr(top, "_active_toast", None)
+    if previous is not None and previous.winfo_exists():
+        previous.destroy()
     toast = tk.Toplevel(top)
+    toast.withdraw()
+    top._active_toast = toast
     toast.overrideredirect(True)
     toast.transient(top)
-    # `overrideredirect` opts this window out of window-manager handling
-    # entirely — including the "new windows come to the front" behavior a
-    # normal window gets automatically. Without `-topmost` masking it (see
-    # above), that meant the toast could spawn stacked *behind* the main
-    # window and stay fully invisible for its whole lifetime unless
-    # something else happened to raise it — confirmed for real: a fresh
-    # toast rendered with a valid geometry and alpha but never appeared
-    # on screen. `transient` alone only sets an ownership relationship
-    # (taskbar grouping, minimize-together); it doesn't affect initial
-    # stacking order the way `lift()` does.
-    toast.lift()
     toast.attributes("-alpha", 0.0)
-    toast.configure(bg=bg)
-    tk.Label(toast, text=message, bg=bg, fg=fg, font=("Segoe UI", 14, "bold"),
-             padx=24, pady=10).pack()
+    # Windows' color key cuts out the canvas corners rather than leaving
+    # a rectangular window behind the rounded card.
+    transparent = "#ff00ff"
+    toast.configure(bg=transparent)
+    if sys.platform == "win32":
+        toast.attributes("-transparentcolor", transparent)
+    else:
+        transparent = FRONT_BG
+
+    success = bg == "#effbeb"
+    accent = "#4ecb50" if success else fg
+    border = "#a5df91" if success else bg
+    top.update_idletasks()
+    font = tkfont.Font(toast, family="Segoe UI", size=11)
+    width = min(max(280, font.measure(message) + 72),
+                max(180, min(760, top.winfo_width() - 32)))
+    canvas = tk.Canvas(toast, width=width, height=46, bg=transparent,
+                       highlightthickness=0, bd=0)
+    canvas.pack()
+    text = canvas.create_text(54, 23, text=message, anchor="w", fill=fg,
+                              font=font, width=width - 72, justify="left")
+    text_box = canvas.bbox(text)
+    height = max(46, text_box[3] - text_box[1] + 24)
+    canvas.configure(height=height)
+    canvas.coords(text, 54, height / 2)
+    card = _draw_rounded_rect(canvas, 1, 1, width - 1, height - 1, 12,
+                              fill=bg, outline=border, width=1)
+    canvas.tag_lower(card)
+    from PIL import ImageTk
+    toast._icon_image = ImageTk.PhotoImage(
+        _notification_icon_image(bg, accent, "success" if success else "notice"), master=toast)
+    canvas.create_image(30, height / 2, image=toast._icon_image)
 
     toast.update_idletasks()
-    tw, th = toast.winfo_reqwidth(), toast.winfo_reqheight()
-    top.update_idletasks()
-    px, py, pw = top.winfo_x(), top.winfo_y(), top.winfo_width()
-    x = px + max(0, (pw - tw) // 2)
-    y = py + 40
-    toast.geometry(f"{tw}x{th}+{x}+{y}")
-
+    x = top.winfo_rootx() + max(0, (top.winfo_width() - width) // 2)
+    y = top.winfo_rooty() + 40
+    steps = max(1, steps)
     interval = max(1, fade_ms // steps)
+    pending = None
+    dismissing = False
 
-    def set_alpha(a):
-        if toast.winfo_exists():
-            toast.attributes("-alpha", a)
+    def schedule(delay, callback):
+        nonlocal pending
+        pending = toast.after(delay, callback)
 
-    def fade(step, reverse, on_done):
-        if not toast.winfo_exists():
+    def cleanup(_event):
+        nonlocal pending
+        if _event.widget is not toast:
             return
-        set_alpha((steps - step) / steps if reverse else step / steps)
-        if step >= steps:
-            on_done()
-            return
-        toast.after(interval, lambda: fade(step + 1, reverse, on_done))
+        if pending is not None:
+            toast.after_cancel(pending)
+            pending = None
+        if getattr(top, "_active_toast", None) is toast:
+            top._active_toast = None
 
-    def hold():
-        toast.after(display_ms, lambda: fade(0, True, destroy))
+    toast.bind("<Destroy>", cleanup)
 
-    def destroy():
-        if toast.winfo_exists():
+    def animate(step, reverse=False, start_alpha=1.0):
+        progress = step / steps
+        eased = 1 - (1 - progress) ** 3
+        toast.attributes("-alpha", start_alpha * (1 - eased) if reverse else eased)
+        if not reverse:
+            toast.geometry(f"{width}x{height}+{x}+{y + int(8 * (1 - eased))}")
+        if step < steps:
+            schedule(interval, lambda: animate(step + 1, reverse, start_alpha))
+        elif reverse:
             toast.destroy()
+        else:
+            schedule(display_ms, dismiss)
 
-    fade(0, False, hold)
+    def dismiss(_event=None):
+        nonlocal dismissing
+        if dismissing:
+            return
+        dismissing = True
+        if pending is not None:
+            toast.after_cancel(pending)
+        animate(0, True, float(toast.attributes("-alpha")))
+
+    toast.bind("<Escape>", dismiss)
+    animate(0)
+    toast.deiconify()
+    # Explicitly raise borderless windows; transient alone does not do it.
+    toast.lift()
+    return toast
 
 
 def _reveal_in_explorer(path: str):
@@ -529,115 +623,6 @@ def _scale_value_at_x(scale, x: int) -> float:
     return from_ + frac * (to_ - from_)
 
 
-class _WaveMetronomeStream:
-    """Seekable, pauseable Windows PCM stream with no LibVLC gain state.
-
-    One prepared waveOut buffer contains the complete rendered metronome. A
-    seek submits a view into that same buffer at the requested frame, so no
-    large PCM copy is made while playback is running.
-    """
-
-    def __init__(self, wav_path):
-        if os.name != "nt":
-            raise OSError("waveOut metronome is only available on Windows")
-        import ctypes
-
-        self._ctypes = ctypes
-        self._winmm = ctypes.windll.winmm
-        with wave.open(wav_path, "rb") as src:
-            if src.getsampwidth() != 2 or src.getcomptype() != "NONE":
-                raise OSError("Metronome stream must be uncompressed 16-bit PCM")
-            self.channels = src.getnchannels()
-            self.rate = src.getframerate()
-            self.sample_width = src.getsampwidth()
-            pcm = src.readframes(src.getnframes())
-
-        class WAVEFORMATEX(ctypes.Structure):
-            _fields_ = [("wFormatTag", ctypes.c_ushort),
-                        ("nChannels", ctypes.c_ushort),
-                        ("nSamplesPerSec", ctypes.c_uint32),
-                        ("nAvgBytesPerSec", ctypes.c_uint32),
-                        ("nBlockAlign", ctypes.c_ushort),
-                        ("wBitsPerSample", ctypes.c_ushort),
-                        ("cbSize", ctypes.c_ushort)]
-
-        class WAVEHDR(ctypes.Structure):
-            pass
-
-        WAVEHDR._fields_ = [("lpData", ctypes.c_void_p),
-                            ("dwBufferLength", ctypes.c_uint32),
-                            ("dwBytesRecorded", ctypes.c_uint32),
-                            ("dwUser", ctypes.c_size_t),
-                            ("dwFlags", ctypes.c_uint32),
-                            ("dwLoops", ctypes.c_uint32),
-                            ("lpNext", ctypes.POINTER(WAVEHDR)),
-                            ("reserved", ctypes.c_size_t)]
-
-        block_align = self.channels * self.sample_width
-        fmt = WAVEFORMATEX(1, self.channels, self.rate,
-                           self.rate * block_align, block_align, 16, 0)
-        self._WAVEHDR = WAVEHDR
-        self._buffer = ctypes.create_string_buffer(pcm)
-        self._pcm_len = len(pcm)
-        self._handle = ctypes.c_void_p()
-        self._header = None
-        result = self._winmm.waveOutOpen(ctypes.byref(self._handle),
-                                         ctypes.c_uint32(-1).value,
-                                         ctypes.byref(fmt), 0, 0, 0)
-        if result != 0:
-            raise OSError(f"waveOutOpen failed ({result})")
-
-    def _unprepare(self):
-        if self._header is None or not self._handle:
-            return
-        self._winmm.waveOutUnprepareHeader(
-            self._handle, self._ctypes.byref(self._header),
-            self._ctypes.sizeof(self._header))
-        self._header = None
-
-    def play_from(self, ms):
-        if not self._handle:
-            return
-        self._winmm.waveOutReset(self._handle)
-        self._unprepare()
-        frame = max(0, int(round(float(ms) * self.rate / 1000.0)))
-        offset = min(self._pcm_len, frame * self.channels * self.sample_width)
-        remaining = self._pcm_len - offset
-        if remaining <= 0:
-            return
-        ptr = self._ctypes.cast(self._ctypes.byref(self._buffer, offset),
-                                self._ctypes.c_void_p)
-        self._header = self._WAVEHDR(ptr, remaining, 0, 0, 0, 0, None, 0)
-        size = self._ctypes.sizeof(self._header)
-        result = self._winmm.waveOutPrepareHeader(
-            self._handle, self._ctypes.byref(self._header), size)
-        if result != 0:
-            self._header = None
-            raise OSError(f"waveOutPrepareHeader failed ({result})")
-        result = self._winmm.waveOutWrite(
-            self._handle, self._ctypes.byref(self._header), size)
-        if result != 0:
-            self._winmm.waveOutReset(self._handle)
-            self._unprepare()
-            raise OSError(f"waveOutWrite failed ({result})")
-
-    def pause(self):
-        if self._handle:
-            self._winmm.waveOutPause(self._handle)
-
-    def stop(self):
-        if self._handle:
-            self._winmm.waveOutReset(self._handle)
-            self._unprepare()
-
-    def close(self):
-        if not self._handle:
-            return
-        self.stop()
-        self._winmm.waveOutClose(self._handle)
-        self._handle = None
-
-
 # A valid osu! timestamp is "mm:ss:mmm" (matching osu! stable's own editor
 # — see parse_osu_cursor_timestamp in tools_logic.py) or a plain ms number
 # ("x") — this matches any *prefix* of that shape, so it can gate a text
@@ -836,6 +821,23 @@ class CoordinateEditorWindow(tk.Toplevel):
         self.destroy()
 
 
+def _wheel_belongs_to_page(event, canvas):
+    """Leave wheel events owned by nested controls out of page scrolling."""
+    num = getattr(event, "num", None)
+    sequence = f"<Button-{num}>" if num in (4, 5) else "<MouseWheel>"
+    widget = event.widget
+    while widget is not None and widget is not canvas:
+        # Native Text/Listbox/Combobox controls handle wheels on their class
+        # bindtag, rather than the instance. Also respect custom bindings on
+        # nested canvases and their containers, even at their scroll limits.
+        if (widget.bind(sequence)
+                or widget.bind_class(widget.winfo_class(), sequence)):
+            return False
+        widget = widget.master
+    # A global binding can also receive events from unrelated windows.
+    return widget is canvas
+
+
 def make_scrollable_toplevel_body(win, bg=None):
     """Wraps a Toplevel's content in a vertically-scrolling canvas — for a
     window whose content can end up taller than the screen, so whatever's
@@ -861,8 +863,9 @@ def make_scrollable_toplevel_body(win, bg=None):
 
     canvas_bg = bg if bg is not None else (ttk.Style().lookup("TFrame", "background") or None)
     canvas = tk.Canvas(outer, highlightthickness=0, bg=canvas_bg)
-    scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    scrollbar = AutoHideScrollbar(outer, command=canvas.yview, target=canvas)
     canvas.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
 
     body = ttk.Frame(canvas)
@@ -876,11 +879,9 @@ def make_scrollable_toplevel_body(win, bg=None):
         bbox = canvas.bbox("all")
         canvas.configure(scrollregion=bbox if bbox else (0, 0, 0, 0))
         content_h = bbox[3] if bbox else 0
-        if content_h > canvas.winfo_height():
-            if not scrollbar.winfo_ismapped():
-                scrollbar.pack(side="right", fill="y")
-        elif scrollbar.winfo_ismapped():
-            scrollbar.pack_forget()
+        if content_h <= canvas.winfo_height():
+            canvas.yview_moveto(0)
+        scrollbar.set(*canvas.yview())
 
     def _on_canvas_configure(event):
         canvas.itemconfig(window_id, width=event.width)
@@ -890,11 +891,13 @@ def make_scrollable_toplevel_body(win, bg=None):
     canvas.bind("<Configure>", _on_canvas_configure)
 
     def _on_wheel(event):
+        if not _wheel_belongs_to_page(event, canvas):
+            return
         # Nothing to scroll if content already fits — recomputed fresh
         # rather than trusting the last Configure-triggered state (see the
         # matching guard in BaseToolFrame for why).
         _update_scroll_state()
-        if not scrollbar.winfo_ismapped():
+        if not scrollbar.can_scroll:
             return
         if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
             canvas.yview_scroll(-3, "units")
@@ -912,7 +915,7 @@ def make_scrollable_toplevel_body(win, bg=None):
         win.unbind_all("<Button-5>")
 
     win.bind("<Enter>", _bind_wheel)
-    win.bind("<Leave>", _unbind_wheel)
+    win.bind("<Leave>", _unbind_wheel, add="+")
     win.bind("<Destroy>", _unbind_wheel)
 
     return body
@@ -957,7 +960,7 @@ class SongSearchResultsWindow(tk.Toplevel):
         outer.pack(fill="both", expand=True)
 
         self._canvas = canvas = tk.Canvas(outer, width=480, highlightthickness=0, bg=FRONT_BG)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        scrollbar = AutoHideScrollbar(outer, command=canvas.yview, target=canvas)
         inner = tk.Frame(canvas, bg=FRONT_BG)
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -973,6 +976,8 @@ class SongSearchResultsWindow(tk.Toplevel):
         # anywhere over this window (toggled on Enter/Leave) catches wheel
         # events regardless of which child widget is actually under it.
         def _on_wheel(event):
+            if not _wheel_belongs_to_page(event, canvas):
+                return
             if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
                 canvas.yview_scroll(-3, "units")
             elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
@@ -989,7 +994,7 @@ class SongSearchResultsWindow(tk.Toplevel):
             self.unbind_all("<Button-5>")
 
         self.bind("<Enter>", _bind_wheel)
-        self.bind("<Leave>", _unbind_wheel)
+        self.bind("<Leave>", _unbind_wheel, add="+")
         self.bind("<Destroy>", _unbind_wheel)
         self.bind("<Escape>", lambda e: self.destroy())
 
@@ -1159,12 +1164,13 @@ class SongSearchDropdown(tk.Toplevel):
         body = tk.Frame(outer, bg=FRONT_BG)
         body.pack(side="top", fill="both", expand=True)
         self._canvas = tk.Canvas(body, width=self.WIDTH, highlightthickness=0, bg=FRONT_BG)
-        self._sb = ttk.Scrollbar(body, orient="vertical", command=self._canvas.yview)
+        self._sb = AutoHideScrollbar(body, command=self._canvas.yview, target=self._canvas)
         self._inner = tk.Frame(self._canvas, bg=FRONT_BG)
         self._inner.bind(
             "<Configure>",
             lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
         self._canvas.create_window((0, 0), window=self._inner, anchor="nw", width=self.WIDTH)
+        self._sb.pack(side="right", fill="y")
         self._canvas.configure(yscrollcommand=self._sb.set)
         self._canvas.pack(side="left", fill="both", expand=True)
         self._msg_label = None
@@ -1394,11 +1400,7 @@ class SongSearchDropdown(tk.Toplevel):
         body_h = min(content_h, self.MAX_BODY_H)
         self._canvas.configure(height=body_h)
         need_sb = content_h > body_h + 1
-        if need_sb and not self._sb.winfo_ismapped():
-            self._sb.pack(side="right", fill="y")
-        elif not need_sb and self._sb.winfo_ismapped():
-            self._sb.pack_forget()
-        w = self.WIDTH + (self._sb.winfo_reqwidth() if need_sb else 0) + 2
+        w = self.WIDTH + self._sb.winfo_reqwidth() + 2
         x = aw.winfo_rootx()
         y = aw.winfo_rooty() + aw.winfo_height() + 2
         self.geometry(f"{w}x{self._chrome_height() + body_h + 2}+{x}+{y}")
@@ -1619,39 +1621,82 @@ class RoundedCard(ttk.Frame):
     DiffCheckList's docstring for the specifics that were confirmed the
     hard way).
 
-    Pack arbitrary content into `.body` (bg=FRONT_CARD_BG) — the card
-    resizes to fit body's own requested height automatically on every
-    canvas resize. Call `.redraw()` after changing body's content (e.g.
-    adding/removing rows) so the card catches up immediately instead of
-    waiting for the next resize event to notice."""
+    ``flat=True`` blends the body and outline into ``page_bg`` for tool
+    sections that need layout padding without a visible panel. Flat
+    sections use normal frame geometry rather than an embedded canvas.
+
+    Pack arbitrary content into `.body` — the card
+    resizes to fit body's own requested height when the canvas or content
+    changes size. `.redraw()` can also request an update explicitly;
+    repeated requests are combined into one idle callback so nested cards
+    settle without recursively processing the whole window's layout."""
 
     RADIUS = 14
     PAD_X = 18
     PAD_Y_TOP = 12
     PAD_Y_BOTTOM = 14
 
-    def __init__(self, master, page_bg=FRONT_BG):
+    def __init__(self, master, page_bg=FRONT_BG, flat=False):
+        self._surface_bg = page_bg if flat else FRONT_CARD_BG
+        self._outline = page_bg if flat else FRONT_BORDER
         ttk.Frame.__init__(self, master)
+        self._flat = flat
+        self._redraw_job = None
+        if flat:
+            # Invisible sections follow their children's natural height.
+            # A canvas's default request and expanding packs can otherwise
+            # leave large gaps before its first visible redraw settles.
+            ttk.Style(self).configure("FlatSection.TFrame", background=page_bg)
+            self.configure(style="FlatSection.TFrame")
+            self.body = tk.Frame(self, bg=page_bg)
+            self.body.pack(fill="x", padx=self.PAD_X,
+                           pady=(self.PAD_Y_TOP, self.PAD_Y_BOTTOM))
+            return
         self._canvas = tk.Canvas(self, highlightthickness=0, bg=page_bg)
         self._canvas.pack(fill="both", expand=True)
-        self.body = tk.Frame(self._canvas, bg=FRONT_CARD_BG)
+        self.body = tk.Frame(self._canvas, bg=self._surface_bg)
         self._window_item = self._canvas.create_window(
             self.PAD_X, self.PAD_Y_TOP, anchor="nw", window=self.body)
+        self._redraw_job = None
+        self._card_size = None
+        self._background_item = None
         self._canvas.bind("<Configure>", lambda e: self.redraw())
+        self.body.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<Destroy>", self._cancel_redraw, add="+")
+
+    def _cancel_redraw(self, event):
+        if event.widget is self and self._redraw_job is not None:
+            self.after_cancel(self._redraw_job)
+            self._redraw_job = None
 
     def redraw(self):
+        """Coalesce layout changes without recursively flushing Tk's idle queue."""
+        if not self._flat and self._redraw_job is None:
+            self._redraw_job = self.after_idle(self._redraw)
+
+    def _redraw(self):
+        self._redraw_job = None
         canvas = self._canvas
-        canvas.update_idletasks()
         w = canvas.winfo_width()
         if w <= 1:
             return
+        body_width = max(1, w - self.PAD_X * 2)
+        if int(float(canvas.itemcget(self._window_item, "width"))) != body_width:
+            canvas.itemconfig(self._window_item, width=body_width)
         h = self.body.winfo_reqheight() + self.PAD_Y_TOP + self.PAD_Y_BOTTOM
-        canvas.configure(height=h)
-        canvas.delete("card_bg")
-        _draw_rounded_rect(canvas, 1, 1, w - 2, h - 1, self.RADIUS,
-                            fill=FRONT_CARD_BG, outline=FRONT_BORDER, tags="card_bg")
-        canvas.tag_lower("card_bg")
-        canvas.itemconfig(self._window_item, width=w - self.PAD_X * 2)
+        if int(canvas.cget("height")) != h:
+            canvas.configure(height=h)
+        if self._card_size == (w, h):
+            return
+        self._card_size = (w, h)
+        points = _rounded_rect_points(1, 1, w - 2, h - 1, self.RADIUS)
+        if self._background_item is None:
+            self._background_item = canvas.create_polygon(
+                points, smooth=True, fill=self._surface_bg,
+                outline=self._outline, tags="card_bg")
+            canvas.tag_lower(self._background_item)
+        else:
+            canvas.coords(self._background_item, *points)
 
 
 # =============================================================================
@@ -2458,63 +2503,52 @@ class LightEntry(tk.Frame):
 
 
 # =============================================================================
+class _DiffSelectionGroup(tk.Frame):
+    """A background-matched fieldset with a single-pixel border and legend.
+
+    Frame geometry follows the rows directly, avoiding stale card space
+    after a selector is refreshed.
+    """
+
+    def __init__(self, master, label, surface):
+        try:
+            bg = surface.cget("background")
+        except tk.TclError:
+            style = surface.cget("style") or "TFrame"
+            bg = ttk.Style(surface).lookup(style, "background") or FRONT_BG
+        super().__init__(master, bg=bg)
+        self._border = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self._border.place(x=0, y=0, relwidth=1, relheight=1)
+        self.body = tk.Frame(self, bg=bg)
+        self.body.pack(fill="both", expand=True, padx=10, pady=(30, 12))
+        self._legend = tk.Label(
+            self, text=label.rstrip(":").strip(), bg=bg, fg=FRONT_TEXT,
+            font=("Segoe UI", 11, "bold"), padx=5, pady=0, bd=0)
+        self._legend.place(x=8, y=0)
+        self._border.bind("<Configure>", self._draw_border)
+
+    def _draw_border(self, event):
+        self._border.delete("border")
+        top = self._legend.winfo_reqheight() // 2
+        self._border.create_rectangle(
+            0, top, event.width - 1, event.height - 1,
+            outline="#d8d8e0", width=1, tags="border")
+
+
 class DiffCheckList(ttk.LabelFrame):
-    """The recurring 'Apply to: [x] Diff1 [x] Diff2 ...' widget, ticked by
-    default. Displays each difficulty's [Version] name (e.g. "Oni") rather
-    than the full filename, for compactness.
+    """Priority-sorted difficulty checkboxes, selected by default.
 
-    `light=True` (opt-in, default off so every other caller is unaffected)
-    replaces the native ttk.LabelFrame chrome entirely with a RoundedCard,
-    plus tk.Checkbutton (not ttk) rows with an indigo `selectcolor` — a
-    native-themed ttk.Checkbutton's indicator glyph, and a ttk.LabelFrame's
-    own border/label, are drawn by Windows' own UxTheme under the "vista"
-    theme and ignore style color/geometry overrides (confirmed empirically
-    elsewhere in this redesign — see main.py's title bar / sidebar, which
-    hit the same wall), so matching the light theme's card look needs
-    fully custom rendering instead of trying to reskin the native widgets.
-
-    `label_inside=False` skips drawing the bold "Apply to" label inside
-    the card — for a caller (e.g. CopySection) that wants to put its own
-    label above the card instead, as part of a larger enclosing layout."""
+    Light mode uses a thin fieldset matching its surrounding background.
+    ``label_inside`` and ``nested`` remain accepted for older callers.
+    """
 
     def __init__(self, master, app, label="Apply to:", light=False, label_inside=True, nested=False):
         self.light = light
         if light:
-            # Deliberately calls ttk.Frame.__init__ instead of going through
-            # super()/LabelFrame — even with text="", a real ttk::labelframe
-            # Tk widget still reserves a label-margin strip above its content
-            # on this theme (confirmed empirically: a persistent gray band
-            # appeared above the card no matter what padding/borderwidth was
-            # configured), since that margin is baked into the "labelframe"
-            # layout itself, not conditional on the label text being empty.
-            # A plain ttk::frame widget has no such reserved region.
             ttk.Frame.__init__(self, master)
-            if nested:
-                # `nested=True` (opt-in — every pre-existing caller is
-                # unaffected) is for a caller whose own master is already
-                # sitting inside another RoundedCard's body (CopySection,
-                # for Volume/Kiai Copier) — a second RoundedCard here would
-                # just be a card drawn inside a card, adding a whole extra
-                # ring of padding for no visual benefit, and it was real,
-                # measurable bloat: Volume/Kiai Copier stacks two full
-                # CopySection blocks, each double-carded this way, and the
-                # combined height didn't fit the app's own default window
-                # size — a scrollbar appeared on a fresh launch even
-                # before any pattern/diff content grew it further. A plain
-                # Frame matching the surrounding card's own background
-                # draws nothing extra and needs no separate redraw() call.
-                self._card = None
-                card_body = tk.Frame(self, bg=FRONT_CARD_BG)
-                card_body.pack(fill="both", expand=True)
-            else:
-                self._card = RoundedCard(self)
-                self._card.pack(fill="both", expand=True)
-                card_body = self._card.body
-            if label_inside:
-                tk.Label(card_body, text=label.rstrip(":").strip(), bg=FRONT_CARD_BG,
-                         fg=FRONT_TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-            self.inner = tk.Frame(card_body, bg=FRONT_CARD_BG)
-            self.inner.pack(fill="both", expand=True)
+            self._group = _DiffSelectionGroup(self, label, surface=master)
+            self._group.pack(fill="both", expand=True)
+            self.inner = self._group.body
         else:
             super().__init__(master, text=label)
             self.inner = ttk.Frame(self)
@@ -2534,6 +2568,8 @@ class DiffCheckList(ttk.LabelFrame):
         """
         for w in self.inner.winfo_children():
             w.destroy()
+        if self.light:
+            self.inner.configure(width=1, height=1)
         self.vars.clear()
         folder, diffs = self.app.get_diff_files()
         self.label_to_file = osu_parser.get_diff_display_map(folder, diffs) if folder else {}
@@ -2545,44 +2581,29 @@ class DiffCheckList(ttk.LabelFrame):
             filename = self.label_to_file[label]
             v = tk.BooleanVar(value=(selected is None or os.path.normcase(filename) in selected))
             if self.light:
-                cb = LightCheckbox(self.inner, label, v, font=("Segoe UI", 11))
+                cb = LightCheckbox(self.inner, label, v, bg=self.inner.cget("bg"),
+                                   font=("Segoe UI", 11))
             else:
                 cb = ttk.Checkbutton(self.inner, text=label, variable=v)
             row = i % self.MAX_ROWS_PER_COLUMN
             col = i // self.MAX_ROWS_PER_COLUMN
             cb.grid(row=row, column=col, sticky="w", padx=(0, 16), pady=1)
             self.vars[label] = v
-        if self.light and self._card is not None:
-            self._card.redraw()
 
     def selected(self):
         return [self.label_to_file[label] for label, v in self.vars.items() if v.get()]
 
 
 class DiffRadioList(ttk.LabelFrame):
-    """Single-select variant of DiffCheckList — radio buttons instead of
-    checkboxes, for a tool that only ever targets one difficulty at a
-    time (unlike the usual "apply to several diffs at once" pattern
-    DiffCheckList is for). Supports preselecting a specific difficulty
-    (e.g. whichever one is actually open in a live osu! editor) instead
-    of always defaulting to the alphabetically/priority-first one.
-
-    `light=True` (opt-in, default off so every other caller is unaffected)
-    renders as a RoundedCard with LightRadiobutton rows instead of a
-    native LabelFrame+ttk.Radiobutton — same rationale as DiffCheckList's
-    own light mode (see its docstring)."""
+    """Single-select counterpart of DiffCheckList, with live-diff preselection."""
 
     def __init__(self, master, app, label="Apply to:", light=False, label_inside=True):
         self.light = light
         if light:
             ttk.Frame.__init__(self, master)
-            self._card = RoundedCard(self)
-            self._card.pack(fill="both", expand=True)
-            if label_inside:
-                tk.Label(self._card.body, text=label.rstrip(":").strip(), bg=FRONT_CARD_BG,
-                         fg=FRONT_TEXT, font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-            self.inner = tk.Frame(self._card.body, bg=FRONT_CARD_BG)
-            self.inner.pack(fill="both", expand=True)
+            self._group = _DiffSelectionGroup(self, label, surface=master)
+            self._group.pack(fill="both", expand=True)
+            self.inner = self._group.body
         else:
             super().__init__(master, text=label)
             self.inner = ttk.Frame(self)
@@ -2596,12 +2617,15 @@ class DiffRadioList(ttk.LabelFrame):
     def refresh(self, preselect_file: str = None):
         for w in self.inner.winfo_children():
             w.destroy()
+        if self.light:
+            self.inner.configure(width=1, height=1)
         folder, diffs = self.app.get_diff_files()
         self.label_to_file = osu_parser.get_diff_display_map(folder, diffs) if folder else {}
         ordered_labels = sorted(self.label_to_file.keys(), key=osu_parser.taiko_diff_sort_key)
         for i, label in enumerate(ordered_labels):
             if self.light:
-                rb = LightRadiobutton(self.inner, label, self.var, label)
+                rb = LightRadiobutton(self.inner, label, self.var, label,
+                                      bg=self.inner.cget("bg"))
             else:
                 rb = ttk.Radiobutton(self.inner, text=label, value=label, variable=self.var)
             row = i % self.MAX_ROWS_PER_COLUMN
@@ -2617,8 +2641,6 @@ class DiffRadioList(ttk.LabelFrame):
         if preselect_label is None and ordered_labels:
             preselect_label = ordered_labels[0]
         self.var.set(preselect_label or "")
-        if self.light:
-            self._card.redraw()
 
     def selected(self):
         return self.label_to_file.get(self.var.get())
@@ -2640,7 +2662,8 @@ class BaseToolFrame(ttk.Frame):
 
         bg = ttk.Style().lookup("TFrame", "background") or None
         canvas = tk.Canvas(self, highlightthickness=0, bg=bg)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        scrollbar = AutoHideScrollbar(self, command=canvas.yview, target=canvas)
+        scrollbar.pack(side="right", fill="y")
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         self._scroll_canvas = canvas
@@ -2654,17 +2677,12 @@ class BaseToolFrame(ttk.Frame):
 
         def _on_wheel(event):
             # Only the tool actually on top should react — every
-            # BaseToolFrame instance stays alive (place()'d, never
-            # destroyed) behind whichever one is currently shown, so this
+            # BaseToolFrame instance stays alive while hidden, so this
             # guards against a hidden tool's own binding stealing the
             # scroll.
             if self.app.frames.get(getattr(self.app, "_current_frame_name", None)) is not self:
                 return
-            # Defer to a widget that already owns wheel scrolling itself
-            # (e.g. Pattern Gallery's horizontally-scrolling card row) —
-            # only its own instance-level binding counts here, not this
-            # bind_all fallback, so this check can't see itself.
-            if event.widget.bind("<MouseWheel>"):
+            if not _wheel_belongs_to_page(event, canvas):
                 return
             # Nothing to scroll if this tool's content already fits —
             # recomputed fresh rather than trusting the last Configure-
@@ -2674,7 +2692,7 @@ class BaseToolFrame(ttk.Frame):
             # Without this, a tool that fits could still creep a few
             # pixels on every wheel tick even with the scrollbar hidden.
             self._update_scroll_state()
-            if not self._scrollbar.winfo_ismapped():
+            if not self._scrollbar.can_scroll:
                 return
             if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
                 canvas.yview_scroll(-3, "units")
@@ -2715,12 +2733,9 @@ class BaseToolFrame(ttk.Frame):
         bbox = canvas.bbox("all")
         canvas.configure(scrollregion=bbox if bbox else (0, 0, 0, 0))
         content_h = bbox[3] if bbox else 0
-        if content_h > canvas_h:
-            if not self._scrollbar.winfo_ismapped():
-                self._scrollbar.pack(side="right", fill="y")
-        elif self._scrollbar.winfo_ismapped():
-            self._scrollbar.pack_forget()
+        if content_h <= canvas_h:
             canvas.yview_moveto(0)
+        self._scrollbar.set(*canvas.yview())
 
     def on_shown(self):
         pass
@@ -2763,6 +2778,7 @@ class FrontPage(BaseToolFrame):
         # background (see BaseToolFrame) — overridden here, and only here,
         # to the FrontPage-specific light card palette (FRONT_* above).
         self._scroll_canvas.configure(bg=FRONT_BG)
+        self._scrollbar.configure(bg=FRONT_BG)
         ttk.Style().configure("FrontBody.TFrame", background=FRONT_BG)
         self.body.configure(style="FrontBody.TFrame")
 
@@ -2864,7 +2880,7 @@ class MetadataManagerFrame(BaseToolFrame):
         for i, (label, key) in enumerate(labels):
             tk.Label(form, text=label, bg=FRONT_BG, fg=FRONT_TEXT,
                      font=("Segoe UI", 11)).grid(row=i, column=0, sticky="w", pady=8)
-            e = _make_light_entry(form, width=60)
+            e = _make_light_entry(form, width=60, bg=FRONT_BG)
             e.grid(row=i, column=1, sticky="we", pady=8, padx=(12, 0), ipadx=8, ipady=6)
             self.fields[key] = e
         form.columnconfigure(1, weight=1)
@@ -2873,13 +2889,13 @@ class MetadataManagerFrame(BaseToolFrame):
         tags_row = len(labels)
         tk.Label(form, text="Tags", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).grid(row=tags_row, column=0, sticky="nw", pady=8)
-        tags_frame = tk.Frame(form, bg=FRONT_CARD_BG, highlightthickness=1,
+        tags_frame = tk.Frame(form, bg=FRONT_BG, highlightthickness=1,
                                highlightbackground=FRONT_BORDER, highlightcolor=LIGHT_ACCENT)
         tags_frame.grid(row=tags_row, column=1, sticky="we", pady=8, padx=(12, 0))
         self.tags_text = tk.Text(tags_frame, width=60, height=5, wrap="word", font=("Segoe UI", 11),
-                                  relief="flat", bd=0, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                                  relief="flat", bd=0, bg=FRONT_BG, fg=FRONT_TEXT,
                                   insertbackground=FRONT_TEXT, padx=8, pady=6)
-        tags_scroll = ttk.Scrollbar(tags_frame, orient="vertical", command=self.tags_text.yview)
+        tags_scroll = AutoHideScrollbar(tags_frame, command=self.tags_text.yview, target=self.tags_text)
         self.tags_text.configure(yscrollcommand=tags_scroll.set)
         self.tags_text.pack(side="left", fill="both", expand=True)
         tags_scroll.pack(side="right", fill="y")
@@ -2898,7 +2914,7 @@ class MetadataManagerFrame(BaseToolFrame):
         preview_row = tags_row + 2
         tk.Label(form, text="Preview Point", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).grid(row=preview_row, column=0, sticky="w", pady=(4, 8))
-        self.preview_point = _make_light_entry(form, width=15)
+        self.preview_point = _make_light_entry(form, width=15, bg=FRONT_BG)
         self.preview_point.grid(row=preview_row, column=1, sticky="w", pady=(4, 8), padx=(12, 0))
 
         self.diff_list = DiffCheckList(self.body, app, light=True)
@@ -3002,8 +3018,8 @@ class CopySection(ttk.Frame):
         self.light = light
         if light:
             ttk.Frame.__init__(self, master)
-            self._card = RoundedCard(self)
-            self._card.pack(fill="both", expand=True)
+            self._card = RoundedCard(self, flat=True)
+            self._card.pack(fill="x")
             body = self._card.body
         else:
             super().__init__(master, relief="groove", borderwidth=1)
@@ -3013,34 +3029,28 @@ class CopySection(ttk.Frame):
         self.noun = noun
 
         if light:
-            header_row = tk.Frame(body, bg=FRONT_CARD_BG)
+            header_row = tk.Frame(body, bg=FRONT_BG)
             header_row.pack(fill="x", pady=(0, 6))
-            tk.Label(header_row, text=title, bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
+            tk.Label(header_row, text=title, bg=FRONT_BG, fg=LIGHT_ACCENT,
                      font=("Segoe UI", 13, "bold")).pack(side="left")
             if info_text:
                 info_icon = InfoIcon(header_row, info_text)
-                info_icon.configure(bg=FRONT_CARD_BG)
+                info_icon.configure(bg=FRONT_BG)
                 info_icon.pack(side="left", padx=(6, 0))
 
-            row = tk.Frame(body, bg=FRONT_CARD_BG)
+            row = tk.Frame(body, bg=FRONT_BG)
             row.pack(fill="x", pady=(0, 8))
-            tk.Label(row, text=source_label_text, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+            tk.Label(row, text=source_label_text, bg=FRONT_BG, fg=FRONT_TEXT,
                      font=("Segoe UI", 11)).pack(side="left")
             self.source_var = tk.StringVar()
-            self.source_combo = LightDropdown(row, self.source_var, width=25, page_bg=FRONT_CARD_BG)
+            self.source_combo = LightDropdown(row, self.source_var, width=25, page_bg=FRONT_BG)
             self.source_combo.pack(side="left", padx=(10, 0))
             self.diff_map = {}
 
-            tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
-                     font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 4))
-            # nested=True — this section already sits inside its own outer
-            # RoundedCard (self._card, above), so the diff list doesn't
-            # need its own separate nested card too. See DiffCheckList's
-            # own docstring for why that mattered here specifically.
-            self.diff_list = DiffCheckList(body, owner.app, light=True, label_inside=False, nested=True)
+            self.diff_list = DiffCheckList(body, owner.app, light=True)
             self.diff_list.pack(fill="both", expand=True, pady=(0, 8))
 
-            btn_row = tk.Frame(body, bg=FRONT_CARD_BG)
+            btn_row = tk.Frame(body, bg=FRONT_BG)
             btn_row.pack(fill="x")
             _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
         else:
@@ -3094,23 +3104,19 @@ class CopySection(ttk.Frame):
 
 
 # =============================================================================
-class VolumeKiaiCopierFrame(BaseToolFrame):
+class KiaiEditorFrame(BaseToolFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
         _style_light_body(self)
 
-        self.volume_section = CopySection(
-            self.body, self, "Volume Copier", "Copy volume from:", logic.copy_volumes, "Volume",
-            info_text="Copy the volume changes of a difficulty and apply them "
-                       "to any difficulties in the set.",
-            light=True)
-        self.volume_section.pack(fill="both", expand=True, padx=24, pady=(10, 4))
+        tk.Label(self.body, text="Kiai Editor", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=("Segoe UI", 20, "bold")).pack(anchor="w", padx=24, pady=(20, 4))
         self.kiai_section = CopySection(
-            self.body, self, "Kiai Copier", "Copy kiai from:", logic.copy_kiai, "Kiai",
+            self.body, self, "Copy Kiai", "Copy kiai from:", logic.copy_kiai, "Kiai",
             info_text="Copy the kiai portions of a difficulty and apply them "
                        "to any difficulties in the set.",
             light=True)
-        self.kiai_section.pack(fill="both", expand=True, padx=24, pady=(4, 10))
+        self.kiai_section.pack(fill="x", padx=24, pady=(10, 16))
 
     def on_shown(self):
         self.refresh()
@@ -3119,7 +3125,6 @@ class VolumeKiaiCopierFrame(BaseToolFrame):
         self.refresh()
 
     def refresh(self):
-        self.volume_section.refresh()
         self.kiai_section.refresh()
 
 
@@ -3144,7 +3149,7 @@ class MapCleanerFrame(BaseToolFrame):
         tk.Label(diff_row, text="Selected diff:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).pack(side="left")
         self.diff_var = tk.StringVar()
-        self.diff_combo = LightDropdown(diff_row, self.diff_var, width=25)
+        self.diff_combo = LightDropdown(diff_row, self.diff_var, width=25, page_bg=FRONT_BG)
         self.diff_combo.pack(side="left", padx=(10, 0))
         self.diff_map = {}
 
@@ -3170,30 +3175,30 @@ class MapCleanerFrame(BaseToolFrame):
         vcmd_float = (self.register(self._validate_float), "%P")
         vcmd_time = (self.register(_validate_partial_time), "%P")
 
-        card = RoundedCard(self.body)
-        card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        card = RoundedCard(self.body, flat=True)
+        card.pack(fill="x", padx=24, pady=(0, 16))
         opts = card.body
 
         def info(parent, text, **kw):
             icon = InfoIcon(parent, text, **kw)
-            icon.configure(bg=FRONT_CARD_BG)
+            icon.configure(bg=FRONT_BG)
             return icon
 
         def row(indent=0, pady=6):
-            r = tk.Frame(opts, bg=FRONT_CARD_BG)
+            r = tk.Frame(opts, bg=FRONT_BG)
             r.pack(fill="x", anchor="w", padx=(indent, 0), pady=pady)
             return r
 
         def label(parent, text, **kw):
-            defaults = dict(bg=FRONT_CARD_BG, fg=FRONT_TEXT, font=("Segoe UI", 11))
+            defaults = dict(bg=FRONT_BG, fg=FRONT_TEXT, font=("Segoe UI", 11))
             defaults.update(kw)
             return tk.Label(parent, text=text, **defaults)
 
         r1 = row()
         LightCheckbox(r1, "Resnap all notes", self.resnap_notes_var,
-                      command=self._sync_resnap_notes_state).pack(side="left")
+                      command=self._sync_resnap_notes_state, bg=FRONT_BG).pack(side="left")
         self.divisor_combo = LightDropdown(r1, self.snap_divisor_var, values=DIVISORS,
-                                            width=8, page_bg=FRONT_CARD_BG)
+                                            width=8, page_bg=FRONT_BG)
         self.divisor_combo.pack(side="left", padx=8)
         info(r1, "- 1/12 = 1/4 + 1/6\n- 1/24 = 1/8 + 1/12\n- 1/36 = 1/4 + 1/6 + 1/9\n"
                  "- 1/48 = 1/12 + 1/16").pack(side="left")
@@ -3202,7 +3207,7 @@ class MapCleanerFrame(BaseToolFrame):
         r1_section = row(indent=24)
         self.resnap_section_only_cb = LightCheckbox(
             r1_section, "Apply to this section only", self.resnap_section_only_var,
-            command=self._sync_resnap_section_state)
+            command=self._sync_resnap_section_state, bg=FRONT_BG)
         self.resnap_section_only_cb.pack(side="left")
         self.resnap_section_only_cb.set_enabled(False)
 
@@ -3211,38 +3216,38 @@ class MapCleanerFrame(BaseToolFrame):
         self.resnap_from_label.pack(side="left")
         self.resnap_from_entry = _make_light_entry(
             r1_section_fields, textvariable=self.resnap_from_var, width=15,
-            validate="key", validatecommand=vcmd_time, state="disabled")
+            validate="key", validatecommand=vcmd_time, state="disabled", bg=FRONT_BG)
         self.resnap_from_entry.pack(side="left", padx=5, ipady=4)
         self.resnap_from_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.resnap_from_var))
         self.resnap_to_label = label(r1_section_fields, "to", fg=FRONT_TEXT_MUTED)
         self.resnap_to_label.pack(side="left")
         self.resnap_to_entry = _make_light_entry(
             r1_section_fields, textvariable=self.resnap_to_var, width=15,
-            validate="key", validatecommand=vcmd_time, state="disabled")
+            validate="key", validatecommand=vcmd_time, state="disabled", bg=FRONT_BG)
         self.resnap_to_entry.pack(side="left", padx=5, ipady=4)
         self.resnap_to_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.resnap_to_var))
 
         r2 = row()
-        LightCheckbox(r2, "Remove unused green lines", self.remove_unused_green_var).pack(side="left")
+        LightCheckbox(r2, "Remove unused green lines", self.remove_unused_green_var, bg=FRONT_BG).pack(side="left")
         info(r2, "Remove all redundant lines that have no meaningful "
                  "effect on the map.").pack(side="left", padx=(6, 0))
 
         r3 = row()
-        LightCheckbox(r3, "Snap Kiai Toggles", self.resnap_important_green_var).pack(side="left")
+        LightCheckbox(r3, "Snap Kiai Toggles", self.resnap_important_green_var, bg=FRONT_BG).pack(side="left")
         info(r3, "Resolve the occasional kiai unsnaps.").pack(side="left", padx=(6, 0))
 
         r4 = row()
-        LightCheckbox(r4, "Turn all Kat's whistle to clap", self.kat_var).pack(side="left")
+        LightCheckbox(r4, "Turn all Kat's whistle to clap", self.kat_var, bg=FRONT_BG).pack(side="left")
         info(r4, "Remove all whistle hitsounds and replace them with claps.").pack(side="left", padx=(6, 0))
 
         r5 = row()
-        LightCheckbox(r5, "Set all green/red lines to Normal Sampleset", self.sampleset_var).pack(side="left")
+        LightCheckbox(r5, "Set all green/red lines to Normal Sampleset", self.sampleset_var, bg=FRONT_BG).pack(side="left")
         info(r5, "Make sure the entire map is in Normal Sampleset so it "
                  "won't play funny hitsounds for some skins. Be careful "
                  "when using custom hitsounds.").pack(side="left", padx=(6, 0))
 
         r6 = row()
-        LightCheckbox(r6, "Resolve red/green line conflicts", self.conflicts_var).pack(side="left")
+        LightCheckbox(r6, "Resolve red/green line conflicts", self.conflicts_var, bg=FRONT_BG).pack(side="left")
         info(r6, "Resolve the mismatched kiai and volume setting between "
                  "green line and red line on the same timestamp. Green "
                  "line takes priority over red line.").pack(side="left", padx=(6, 0))
@@ -3250,20 +3255,20 @@ class MapCleanerFrame(BaseToolFrame):
         # Base SV Option
         r_base_sv = row()
         self.set_base_sv_cb = LightCheckbox(r_base_sv, "Set base SV setting to 1.4", self.set_base_sv_var,
-                                             command=self._sync_base_sv_state)
+                                             command=self._sync_base_sv_state, bg=FRONT_BG)
         self.set_base_sv_cb.pack(side="left")
         info(r_base_sv, "Use this tool if your map's base SV got rounding error.").pack(side="left", padx=(6, 10))
 
         # Base SV Child Option: Other
         r_base_sv_other = row(indent=24)
         self.base_sv_other_cb = LightCheckbox(r_base_sv_other, "Other", self.base_sv_other_var,
-                                               command=self._sync_base_sv_state)
+                                               command=self._sync_base_sv_state, bg=FRONT_BG)
         self.base_sv_other_cb.pack(side="left", padx=(0, 5))
         self.base_sv_other_cb.set_enabled(False)
 
         self.base_sv_spinbox = LightSpinner(
             r_base_sv_other, self.base_sv_val_var, from_=0.4, to=3.6, increment=0.1,
-            width=5, fmt="%.1f", validate=("key", vcmd_float))
+            width=5, fmt="%.1f", validate=("key", vcmd_float), bg=FRONT_BG)
         self.base_sv_spinbox.pack(side="left")
         self.base_sv_spinbox.set_enabled(False)
         self.base_sv_spinbox.entry.bind("<FocusOut>", self._on_base_sv_focus_out, add="+")
@@ -3271,11 +3276,11 @@ class MapCleanerFrame(BaseToolFrame):
         # Push Green Option
         r_push_green = row()
         self.push_green_cb = LightCheckbox(r_push_green, "Push all green lines by ", self.push_green_var,
-                                            command=self._sync_push_green_state)
+                                            command=self._sync_push_green_state, bg=FRONT_BG)
         self.push_green_cb.pack(side="left")
         self.push_green_spinbox = LightSpinner(
             r_push_green, self.push_green_ms_var, from_=5, to=20, increment=1,
-            width=4, fmt="%d", validate=("key", vcmd_int))
+            width=4, fmt="%d", validate=("key", vcmd_int), bg=FRONT_BG)
         self.push_green_spinbox.pack(side="left", padx=2)
         self.push_green_spinbox.set_enabled(False)
         self.push_green_spinbox.entry.bind("<FocusOut>", self._on_push_green_focus_out, add="+")
@@ -3285,14 +3290,14 @@ class MapCleanerFrame(BaseToolFrame):
 
         r7 = row(pady=(14, 6))
         LightCheckbox(r7, "Reposition all notes in playfield", self.center_notes_var,
-                      command=self._sync_center_children_state).pack(side="left")
+                      command=self._sync_center_children_state, bg=FRONT_BG).pack(side="left")
 
         self.note_position_mode_var = tk.StringVar(value="default")
 
         r_center = row(indent=24, pady=3)
         self.center_radio = LightRadiobutton(
             r_center, "All notes in center", self.note_position_mode_var, "default",
-            command=self._sync_coord_buttons_state)
+            command=self._sync_coord_buttons_state, bg=FRONT_BG)
         self.center_radio.pack(side="left")
         self.center_radio.set_enabled(False)
         info(r_center, "Move all the notes scattered around the screen to the "
@@ -3301,7 +3306,7 @@ class MapCleanerFrame(BaseToolFrame):
         r8 = row(indent=24, pady=3)
         self.separate_finishers_radio = LightRadiobutton(
             r8, "Separate finishers", self.note_position_mode_var, "separate_finishers",
-            command=self._sync_coord_buttons_state)
+            command=self._sync_coord_buttons_state, bg=FRONT_BG)
         self.separate_finishers_radio.pack(side="left")
         self.separate_finishers_radio.set_enabled(False)
         info(r8, "Finisher notes will be placed at their own position "
@@ -3313,7 +3318,7 @@ class MapCleanerFrame(BaseToolFrame):
         r9 = row(indent=24, pady=3)
         self.separate_note_types_radio = LightRadiobutton(
             r9, "Separate note types", self.note_position_mode_var, "separate_note_types",
-            command=self._sync_coord_buttons_state)
+            command=self._sync_coord_buttons_state, bg=FRONT_BG)
         self.separate_note_types_radio.pack(side="left")
         self.separate_note_types_radio.set_enabled(False)
         info(r9, "Don, Kat, Don Finisher, and Kat Finisher notes will "
@@ -3531,41 +3536,41 @@ class OffsetShifterFrame(BaseToolFrame):
 
         def info(parent, text, **kw):
             icon = InfoIcon(parent, text, **kw)
-            icon.configure(bg=FRONT_CARD_BG)
+            icon.configure(bg=FRONT_BG)
             return icon
 
         # ---- Section 1: Audio/Offset Settings ------------------------------
-        self.card1 = RoundedCard(self.body)
-        self.card1.pack(fill="both", expand=True, padx=24, pady=(20, 12))
+        self.card1 = RoundedCard(self.body, flat=True)
+        self.card1.pack(fill="x", padx=24, pady=(20, 12))
         body1 = self.card1.body
 
-        header1 = tk.Frame(body1, bg=FRONT_CARD_BG)
+        header1 = tk.Frame(body1, bg=FRONT_BG)
         header1.pack(fill="x", pady=(0, 14))
-        tk.Label(header1, text="Audio/Offset Settings", bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
+        tk.Label(header1, text="Audio/Offset Settings", bg=FRONT_BG, fg=LIGHT_ACCENT,
                  font=("Segoe UI", 13, "bold")).pack(side="left")
         info(header1, "Change offset and resnap all notes and preview point "
                        "for all difficulties.").pack(side="left", padx=(6, 0))
 
-        form = tk.Frame(body1, bg=FRONT_CARD_BG)
+        form = tk.Frame(body1, bg=FRONT_BG)
         form.pack(fill="x", pady=(0, 12))
-        tk.Label(form, text="Current offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+        tk.Label(form, text="Current offset:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", pady=6)
-        self.current_entry = _make_light_entry(form, width=15, state="readonly")
+        self.current_entry = _make_light_entry(form, width=15, state="readonly", bg=FRONT_BG)
         self.current_entry.grid(row=0, column=1, sticky="w", pady=6, padx=(10, 0), ipady=4, ipadx=6)
 
-        tk.Label(form, text="New offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+        tk.Label(form, text="New offset:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).grid(row=1, column=0, sticky="w", pady=6)
         self.new_var = tk.StringVar()
         self.new_entry = LightSpinner(form, self.new_var, from_=-10_000_000, to=10_000_000,
-                                       increment=1, width=13)
+                                       increment=1, width=13, bg=FRONT_BG)
         self.new_entry.grid(row=1, column=1, sticky="w", pady=6, padx=(10, 0))
         self.new_var.trace_add("write", self._on_new_changed)
 
-        tk.Label(form, text="Change:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+        tk.Label(form, text="Change:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).grid(row=2, column=0, sticky="w", pady=6)
         self.change_var = tk.StringVar(value="0")
         self.change_entry = LightSpinner(form, self.change_var, from_=-10_000_000, to=10_000_000,
-                                          increment=1, width=13)
+                                          increment=1, width=13, bg=FRONT_BG)
         self.change_entry.grid(row=2, column=1, sticky="w", pady=6, padx=(10, 0))
         self.change_var.trace_add("write", self._on_change_changed)
 
@@ -3573,61 +3578,59 @@ class OffsetShifterFrame(BaseToolFrame):
         self.base_offset = 0
 
         self.add_silence_var = tk.BooleanVar(value=False)
-        r_silence = tk.Frame(body1, bg=FRONT_CARD_BG)
+        r_silence = tk.Frame(body1, bg=FRONT_BG)
         r_silence.pack(fill="x", anchor="w", pady=(0, 12))
-        LightCheckbox(r_silence, "Add silence", self.add_silence_var).pack(side="left")
+        LightCheckbox(r_silence, "Add silence", self.add_silence_var, bg=FRONT_BG).pack(side="left")
         info(r_silence, "Add 1000ms of silence to the beginning of the "
                          "song to avoid first-note lag.").pack(side="left", padx=(6, 0))
 
-        tk.Label(body1, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-        self.diff_list = DiffCheckList(body1, app, light=True, label_inside=False)
+        self.diff_list = DiffCheckList(body1, app, light=True)
         self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
 
-        btn_row1 = tk.Frame(body1, bg=FRONT_CARD_BG)
+        btn_row1 = tk.Frame(body1, bg=FRONT_BG)
         btn_row1.pack(fill="x")
         _make_accent_button(btn_row1, "Apply", self.apply).pack(side="right")
 
         # ---- Section 2: Audio Re-encode ------------------------------------
-        card2 = RoundedCard(self.body)
-        card2.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        card2 = RoundedCard(self.body, flat=True)
+        card2.pack(fill="x", padx=24, pady=(0, 20))
         body2 = card2.body
 
-        header2 = tk.Frame(body2, bg=FRONT_CARD_BG)
+        header2 = tk.Frame(body2, bg=FRONT_BG)
         header2.pack(fill="x", pady=(0, 14))
-        tk.Label(header2, text="Audio Re-encode", bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
+        tk.Label(header2, text="Audio Re-encode", bg=FRONT_BG, fg=LIGHT_ACCENT,
                  font=("Segoe UI", 13, "bold")).pack(side="left")
         info(header2, "Re-encode audio down to a lower bitrate to reduce file size."
              ).pack(side="left", padx=(6, 0))
 
         self.reencode_source_var = tk.StringVar(value="map")
-        r_src_map = tk.Frame(body2, bg=FRONT_CARD_BG)
+        r_src_map = tk.Frame(body2, bg=FRONT_BG)
         r_src_map.pack(fill="x", anchor="w", pady=(0, 6))
         LightRadiobutton(r_src_map, "Use audio from the currently selected song",
                           self.reencode_source_var, "map",
-                          command=self._sync_reencode_source_state).pack(side="left")
+                          command=self._sync_reencode_source_state, bg=FRONT_BG).pack(side="left")
 
-        r_src_other = tk.Frame(body2, bg=FRONT_CARD_BG)
+        r_src_other = tk.Frame(body2, bg=FRONT_BG)
         r_src_other.pack(fill="x", anchor="w", pady=(0, 12))
         LightRadiobutton(r_src_other, "Use other audio file", self.reencode_source_var, "other",
-                          command=self._sync_reencode_source_state).pack(side="left")
+                          command=self._sync_reencode_source_state, bg=FRONT_BG).pack(side="left")
         self.reencode_browse_btn = _make_ghost_button(r_src_other, "Browse...", self._browse_reencode_audio)
         self.reencode_browse_btn.pack(side="left", padx=(10, 8))
         self.reencode_other_path = None
         self.reencode_other_name_var = tk.StringVar(value="")
-        tk.Label(r_src_other, textvariable=self.reencode_other_name_var, bg=FRONT_CARD_BG,
+        tk.Label(r_src_other, textvariable=self.reencode_other_name_var, bg=FRONT_BG,
                  fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10)).pack(side="left")
 
         self.reencode_bitrate_var = tk.StringVar(value="192")
-        r_bitrate = tk.Frame(body2, bg=FRONT_CARD_BG)
+        r_bitrate = tk.Frame(body2, bg=FRONT_BG)
         r_bitrate.pack(fill="x", anchor="w", padx=(24, 0), pady=(0, 16))
         for blabel, value in (("208kbps", "208"), ("192kbps", "192"),
                                ("160kbps", "160"), ("128kbps", "128")):
             LightRadiobutton(r_bitrate, blabel, self.reencode_bitrate_var, value
-                              ).pack(side="left", padx=(0, 16))
+                              , bg=FRONT_BG).pack(side="left", padx=(0, 16))
         self._sync_reencode_source_state()
 
-        btn_row2 = tk.Frame(body2, bg=FRONT_CARD_BG)
+        btn_row2 = tk.Frame(body2, bg=FRONT_BG)
         btn_row2.pack(fill="x")
         _make_accent_button(btn_row2, "Apply", self.apply_reencode).pack(side="right")
 
@@ -3875,7 +3878,7 @@ class TimingEditorFrame(BaseToolFrame):
     """"Timing Editor" sidebar tool — a per-red-line timing editor with a
     scrollable/zoomable timeline and a song waveform strip underneath.
 
-    Table: one row per red line — a Sel checkbox (for the Delete action),
+    Table: one row per red line — a selection checkbox (bulk edit / Delete),
     read-only Old offset / BPM, editable Change (Δoffset ±1ms, ΔBPM ±0.1)
     and New Offset / New BPM columns kept in sync two ways (edit either
     side), plus BL (omit first barline) and Time sig. Tick some Sel boxes
@@ -3902,6 +3905,7 @@ class TimingEditorFrame(BaseToolFrame):
     # snapping is a whole bar. Otherwise the value is the beat subdivision.
     DIVISOR_OPTIONS = ["None", "1/1", "1/2", "1/3", "1/4", "1/6", "1/8", "1/12"]
     DIVISOR_DENOMS = {"1/1": 1, "1/2": 2, "1/3": 3, "1/4": 4, "1/6": 6, "1/8": 8, "1/12": 12}
+    PLAYBACK_RATE_OPTIONS = ("25%", "50%", "75%", "100%")
 
     TIMELINE_H = 120
     WAVE_H = 66
@@ -3910,22 +3914,11 @@ class TimingEditorFrame(BaseToolFrame):
     TABLE_COLS = 9
     CURSOR_FRAC = 0.30           # the fixed "current time" line sits this far from the left
     # Tk/canvas work at 240fps saturated the event loop and made the apparent
-    # scroll rate uneven. The metronome is now a separate waveOut PCM stream, so
-    # visual rendering can use a stable 60fps cadence without affecting clicks.
+    # scroll rate uneven. BASS schedules song and clicks together, so visual
+    # rendering can use a stable 60fps cadence without affecting click timing.
     PLAY_TICK_MS = 16
-    # Playhead-vs-libVLC low-pass time constant (seconds). The correction that
-    # trims the free-running monotonic estimate toward libVLC's get_time() is
-    # `1 - exp(-dt/TAU)` per frame, not a fixed percentage. This keeps the
-    # correction stable if the actual Tk frame cadence varies under load.
-    # A larger TAU leans more on the (real-time-accurate) monotonic free-run
-    # and less on get_time()'s chunky ~100ms-stale reporting, so the playhead
-    # jitters less and lags less between get_time() updates.
-    PLAYHEAD_SMOOTH_TAU = 0.35
-    # libVLC's get_time() reads well behind the audio actually reaching the
-    # speakers (output buffer + Windows audio stack, ~100ms typical); nudge
-    # the visual playhead this many ms ahead of it so the timeline and waveform
-    # line up with what's heard. The metronome uses its own native PCM stream.
-    PLAYBACK_LATENCY_COMP_MS = 110.0
+    # Framerate-independent smoothing toward the native output position.
+    PLAYHEAD_SMOOTH_TAU = 0.75
 
     # osu!lazer shifts its editor waveform visual by +20ms
     # (Editor.WAVEFORM_VISUAL_OFFSET, Editor.cs) — "osu! beatmaps have an
@@ -3974,30 +3967,27 @@ class TimingEditorFrame(BaseToolFrame):
         self._wave_mode = "amplitude"   # or "onset" — toggled by double-clicking the waveform
         self._onsets = None             # cached onset bucket indices (lazy)
 
-        # audio playback (VLC) — the timeline scrolls with the playhead
-        self._vlc = None
-        self._vlc_instance = None
+        # BASS audio playback — the timeline follows the shared output clock.
         self._player = None
         self._playing = False
         self._play_after = None
-        # playhead interpolation: est = _play_anchor_ms + (now - _play_anchor_wall)*1000,
-        # gently corrected toward libVLC's own (coarse, laggy) get_time().
+        # Interpolate between output-clock samples at the selected media rate.
         self._play_anchor_ms = 0.0
         self._play_anchor_wall = 0.0
         self._play_last_frame_wall = 0.0
         self._play_aux_ui_wall = 0.0
         self._play_floor_ms = 0.0     # last explicit seek target — est never dips below it
-        self._seek_guard_until = 0.0  # window after a seek where libVLC's time is untrusted
         self._seek_job = None         # debounce: pending after() id for a coalesced seek
         self._pending_seek_ms = None
-        self._play_volume = 40        # song only; metronome PCM bypasses VLC gain
-        self._priming_audio = False
-        # The metronome is rendered to a continuous WAV and played by a second
-        # VLC player. It therefore shares the song's audio-clock operations and
-        # never depends on Tk/canvas frames arriving on time.
+        self._play_volume = 40        # song gain only, before the shared mixer
+        self._playback_rate = 1.0
+        self._rate_audio_cache = PreparedAudioCache()
+        self._rate_prepare_token = None
+        self.bind("<Destroy>", self._on_playback_destroy, add="+")
+        self.playback_rate_var = tk.StringVar(value="100%")
+        self.playback_rate_var.trace_add("write", self._on_playback_rate_changed)
+        # Stretch only the song, then mix rate-spaced, original-sounding clicks.
         self.metronome_var = tk.BooleanVar(value=True)
-        self._metro_stream = None
-        self._metro_resume_ms = 0
         self._metro_track_path = None
         self._metro_track_signature = None
         self._tick1_path, self._tick2_path = self._resolve_metro_sounds()
@@ -4057,27 +4047,35 @@ class TimingEditorFrame(BaseToolFrame):
         tbl_wrap.grid_columnconfigure(0, weight=1)
         tbl_wrap.grid_rowconfigure(2, weight=1)
 
-        self.hdr_canvas = tk.Canvas(tbl_wrap, bg=FRONT_CARD_BG, highlightthickness=0, height=26)
+        self.hdr_canvas = tk.Canvas(tbl_wrap, bg=FRONT_BG, highlightthickness=0, height=26)
         self.hdr_canvas.grid(row=0, column=0, sticky="ew")
-        self.hdr_frame = tk.Frame(self.hdr_canvas, bg=FRONT_CARD_BG)
+        self.hdr_frame = tk.Frame(self.hdr_canvas, bg=FRONT_BG)
         self.hdr_canvas.create_window((0, 0), window=self.hdr_frame, anchor="nw")
         headers = ["Sel", "Old Offset", "BPM", "Δ Offset", "Δ BPM", "Omit BL",
                    "New Offset", "New BPM", "Time sig"]
         for col, txt in enumerate(headers):
-            tk.Label(self.hdr_frame, text=txt, bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED,
+            if col == 0:
+                self.select_all_var = tk.BooleanVar(value=False)
+                self.select_all_chk = LightCheckbox(
+                    self.hdr_frame, "", self.select_all_var, bg=FRONT_BG,
+                    command=self._toggle_select_all)
+                self.select_all_chk.grid(row=0, column=0, padx=6, pady=(6, 4))
+                _add_hover_tooltip(self.select_all_chk.icon, "Select / deselect all timing points")
+                continue
+            tk.Label(self.hdr_frame, text=txt, bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
                      font=("Segoe UI", 9, "bold")).grid(row=0, column=col, padx=6, pady=(6, 4))
         self.hdr_frame.bind("<Configure>", lambda _e: self._sync_scrollregions())
         tk.Frame(tbl_wrap, bg=FRONT_BORDER, height=1).grid(row=1, column=0, sticky="ew")
 
-        self.table_canvas = tk.Canvas(tbl_wrap, bg=FRONT_CARD_BG, highlightthickness=0, height=180,
+        self.table_canvas = tk.Canvas(tbl_wrap, bg=FRONT_BG, highlightthickness=0, height=180,
                                       yscrollincrement=1)
         self.table_canvas.grid(row=2, column=0, sticky="nsew")
-        tbl_scroll = ttk.Scrollbar(tbl_wrap, orient="vertical", command=self._table_yview)
+        tbl_scroll = AutoHideScrollbar(tbl_wrap, command=self._table_yview, target=self.table_canvas)
         tbl_scroll.grid(row=0, column=1, rowspan=3, sticky="ns")
-        x_scroll = ttk.Scrollbar(tbl_wrap, orient="horizontal", command=self._table_xview)
+        x_scroll = AutoHideScrollbar(tbl_wrap, orient="horizontal", command=self._table_xview, target=self.table_canvas)
         x_scroll.grid(row=3, column=0, sticky="ew")
         self.table_canvas.configure(yscrollcommand=tbl_scroll.set, xscrollcommand=x_scroll.set)
-        self.table_inner = tk.Frame(self.table_canvas, bg=FRONT_CARD_BG)
+        self.table_inner = tk.Frame(self.table_canvas, bg=FRONT_BG)
         self.table_canvas.create_window((0, 0), window=self.table_inner, anchor="nw")
         self.table_inner.bind("<Configure>", lambda _e: self._sync_scrollregions())
         self._bind_table_wheel(tbl_wrap)
@@ -4087,7 +4085,7 @@ class TimingEditorFrame(BaseToolFrame):
         self._bind_table_wheel(self.hdr_frame)
 
         self.empty_lbl = tk.Label(self.table_inner, text="No map loaded.",
-                                   bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10))
+                                   bg=FRONT_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10))
         self.empty_lbl.grid(row=0, column=0, padx=10, pady=10, sticky="w")
 
         self.add_row = add_row = tk.Frame(body, bg=FRONT_BG)
@@ -4105,6 +4103,8 @@ class TimingEditorFrame(BaseToolFrame):
         self.del_sel_btn = _make_ghost_button(add_row, "Delete selected", self._delete_selected)
         self.del_sel_btn.configure(fg="#d32f2f", activeforeground="#b71c1c",
                                     bg="#fdecec", activebackground="#fbdcdc")
+
+        self._sync_delete_button()
 
         # ---- timeline nav + divisor selector ----
         div_row = tk.Frame(body, bg=FRONT_BG)
@@ -4127,7 +4127,17 @@ class TimingEditorFrame(BaseToolFrame):
                             padx=8, pady=3).pack(side="right")
         tk.Label(div_row, text="Snap:", bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
                  font=("Segoe UI", 9)).pack(side="right", padx=(0, 4))
-        # audio playback volume — sits just left of the snap controls
+        rate_row = tk.Frame(div_row, bg=FRONT_BG)
+        rate_row.pack(side="right", padx=(0, 12))
+        tk.Label(rate_row, text="Rate:", bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        _make_ghost_button(rate_row, "‹", lambda: self._step_playback_rate(-1),
+                           width=2, padx=8, pady=3).pack(side="left")
+        LightDropdown(rate_row, self.playback_rate_var, values=self.PLAYBACK_RATE_OPTIONS,
+                      width=5, page_bg=FRONT_BG).pack(side="left", padx=4)
+        _make_ghost_button(rate_row, "›", lambda: self._step_playback_rate(1),
+                           width=2, padx=8, pady=3).pack(side="left")
+        # audio playback volume — sits just left of the rate controls
         ttk.Style().configure("Light.Horizontal.TScale", background=FRONT_BG,
                                troughcolor=FRONT_BORDER)
         self.play_volume_scale = ttk.Scale(div_row, from_=0, to=100, orient="horizontal",
@@ -4145,15 +4155,15 @@ class TimingEditorFrame(BaseToolFrame):
         # highlightcolor pinned to highlightbackground so the 1px border
         # doesn't switch to a black/blue focus ring when the panel is clicked
         # (the timeline still needs takefocus=1 for its arrow-key handling).
-        self.timeline = tk.Canvas(body, height=self.TIMELINE_H, bg="white",
+        # One drawing surface gives the grid and waveform a single repaint.
+        # Separate native canvas windows can present different playback frames.
+        self.timeline = tk.Canvas(body, height=self.TIMELINE_H + self.WAVE_H, bg="white",
                                    highlightthickness=1, highlightbackground=FRONT_BORDER,
                                    highlightcolor=FRONT_BORDER)
-        self.timeline.pack(fill="x", padx=24, pady=(2, 0))
-        self.wave = tk.Canvas(body, height=self.WAVE_H, bg="#faf9fe",
-                               highlightthickness=1, highlightbackground=FRONT_BORDER,
-                               highlightcolor=FRONT_BORDER, takefocus=0)
-        self.wave.pack(fill="x", padx=24, pady=(0, 2))
-        self.seek_scroll = ttk.Scrollbar(body, orient="horizontal", command=self._seek_scroll)
+        self.timeline.pack(fill="x", padx=24, pady=(2, 2))
+        self.wave = self.timeline
+        self._drag_in_wave = False
+        self.seek_scroll = AutoHideScrollbar(body, orient="horizontal", command=self._seek_scroll, target=self.timeline, bg=FRONT_BG)
         self.seek_scroll.pack(fill="x", padx=24, pady=(0, 4))
         self.seek_scroll.set(0.0, 1.0)
         wf_opts = tk.Frame(body, bg=FRONT_BG)
@@ -4168,13 +4178,13 @@ class TimingEditorFrame(BaseToolFrame):
                        font=("Segoe UI", 9),
                        command=self._on_metronome_toggle).pack(side="left", expand=True)
 
-        # Both canvases share the same time transform. Wheel + press + drag are
-        # identical on either (a drag on the waveform scrolls the current-time
-        # line just like a drag on the timeline). They differ on release: a
+        # Both bands share one canvas and time transform. Wheel + press + drag
+        # work in either band (waveform drags also scroll the current-time
+        # line). Route release by the band where the press began: a
         # plain click on the *timeline* seeks to that point, a plain click on
         # the *waveform* does nothing (only a drag seeks there) — double-click
         # the waveform to toggle amplitude/onset view instead.
-        for c in (self.timeline, self.wave):
+        for c in (self.timeline,):
             c.bind("<Configure>", lambda _e: self._redraw_timeline())
             c.bind("<MouseWheel>", self._tl_wheel)
             c.bind("<Alt-MouseWheel>", self._tl_wheel_alt)
@@ -4183,18 +4193,16 @@ class TimingEditorFrame(BaseToolFrame):
             c.bind("<Button-5>", lambda e: self._tl_wheel_like(e, -1))
             c.bind("<Button-1>", self._tl_press)
             c.bind("<B1-Motion>", self._tl_motion)
-        self.timeline.bind("<ButtonRelease-1>", self._tl_release)
-        self.wave.bind("<ButtonRelease-1>", self._wave_release)
+        self.timeline.bind("<ButtonRelease-1>",
+                           lambda e: self._wave_release(e) if self._drag_in_wave else self._tl_release(e))
         self.timeline.configure(takefocus=1)
-        self.timeline.bind("<Double-Button-1>", self._tl_double)
+        self.timeline.bind("<Double-Button-1>",
+                           lambda e: self._toggle_wave_mode(e) if e.y >= self.TIMELINE_H else self._tl_double(e))
         self.timeline.bind("<Left>", lambda _e: self._step_cursor(-1))
         self.timeline.bind("<Right>", lambda _e: self._step_cursor(1))
-        self.wave.bind("<Double-Button-1>", self._toggle_wave_mode)
 
         # ---- Apply to + footer ----
-        tk.Label(body, text="Apply to:", bg=FRONT_BG, fg=FRONT_TEXT,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=24, pady=(2, 6))
-        self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
+        self.diff_list = DiffCheckList(body, app, light=True)
         self.diff_list.pack(fill="x", padx=24, pady=(0, 12))
 
         resnap_row = tk.Frame(body, bg=FRONT_BG)
@@ -4306,6 +4314,7 @@ class TimingEditorFrame(BaseToolFrame):
             self.diff_list.refresh()
             return
         self._stop_audio()
+        self._rate_audio_cache.clear()
         self._loaded_src = key
         # fresh undo history per map load (can't undo past the map's own state)
         self._committed_state = None
@@ -4321,6 +4330,7 @@ class TimingEditorFrame(BaseToolFrame):
         for r in self.rows:
             r["frame"].destroy()   # destroys all 9 child widgets with it
         self.rows = []
+        self._sync_delete_button()
         self.divisor_var.set("1/1")
 
         reds = []
@@ -4397,12 +4407,12 @@ class TimingEditorFrame(BaseToolFrame):
         row["doff_var"] = tk.StringVar(value="0")
         row["dbpm_var"] = tk.StringVar(value="0")
         row["bl_var"] = tk.BooleanVar(value=bool(effects & 8))
-        row["sel_var"] = tk.BooleanVar(value=False)   # "Sel" checkbox — for the Delete action
+        row["sel_var"] = tk.BooleanVar(value=False)   # bulk edit / Delete
         row["noff_var"] = tk.StringVar(value=_fmt_ms_timestamp(old_time))
         row["nbpm_var"] = tk.StringVar(value=self._fmt_bpm(old_bpm))
         row["ts_var"] = tk.StringVar(value=str(int(meter) if meter else 4))
 
-        cbg = FRONT_CARD_BG
+        cbg = FRONT_BG
         # Each row lives in its own Frame — hiding a row (delete / undo)
         # then only reflows N frames instead of 9·N nested widgets, and the
         # widgets inside a hidden frame get no <Configure> at all. That's
@@ -4415,36 +4425,36 @@ class TimingEditorFrame(BaseToolFrame):
         row["sel_chk"].grid(row=0, column=0, padx=6, pady=3)
 
         old_lbl = _fmt_ms_timestamp(old_time)
-        oe = _make_light_entry(rf, width=11, state="readonly")
+        oe = _make_light_entry(rf, width=11, state="readonly", bg=FRONT_BG)
         oe.configure(state="normal"); oe.insert(0, old_lbl); oe.configure(state="readonly")
         oe.grid(row=0, column=1, padx=6, pady=3)
         row["oe"] = oe
-        be = _make_light_entry(rf, width=8, state="readonly")
+        be = _make_light_entry(rf, width=8, state="readonly", bg=FRONT_BG)
         be.configure(state="normal"); be.insert(0, self._fmt_bpm(old_bpm)); be.configure(state="readonly")
         be.grid(row=0, column=2, padx=6, pady=3)
         row["be"] = be
 
         row["doff_spin"] = LightSpinner(rf, row["doff_var"], from_=-10_000_000,
                                          to=10_000_000, increment=1, width=6, fmt="%d",
-                                         validate=("key", self._vc_sint))
+                                         validate=("key", self._vc_sint), bg=FRONT_BG)
         row["doff_spin"].grid(row=0, column=3, padx=6, pady=3)
         row["dbpm_spin"] = LightSpinner(rf, row["dbpm_var"], from_=-100000, to=100000,
                                          increment=0.1, width=6, fmt="%.1f",
-                                         validate=("key", self._vc_snum))
+                                         validate=("key", self._vc_snum), bg=FRONT_BG)
         row["dbpm_spin"].grid(row=0, column=4, padx=6, pady=3)
         row["bl_chk"] = LightCheckbox(rf, "", row["bl_var"], bg=cbg)
         row["bl_chk"].grid(row=0, column=5, padx=6, pady=3)
         row["noff_spin"] = LightSpinner(rf, row["noff_var"], from_=-10_000_000,
                                          to=10_000_000, increment=1, width=10,
                                          fmt=_fmt_ms_timestamp, parse=_parse_ms_timestamp,
-                                         validate=("key", self._vc_offset))
+                                         validate=("key", self._vc_offset), bg=FRONT_BG)
         row["noff_spin"].grid(row=0, column=6, padx=6, pady=3)
         row["nbpm_spin"] = LightSpinner(rf, row["nbpm_var"], from_=1, to=100000,
                                          increment=0.1, width=7,
-                                         validate=("key", self._vc_snum))
+                                         validate=("key", self._vc_snum), bg=FRONT_BG)
         row["nbpm_spin"].grid(row=0, column=7, padx=6, pady=3)
         row["ts_spin"] = LightSpinner(rf, row["ts_var"], from_=2, to=10, increment=1,
-                                       width=4, fmt="%d", validate=("key", self._vc_uint))
+                                       width=4, fmt="%d", validate=("key", self._vc_uint), bg=FRONT_BG)
         row["ts_spin"].grid(row=0, column=8, padx=6, pady=3)
 
         row["noff_spin"].entry.bind("<FocusOut>", lambda _e, rr=row: self._normalize_offset(rr), add="+")
@@ -4458,12 +4468,12 @@ class TimingEditorFrame(BaseToolFrame):
             ent = getattr(w, "entry", None) or w
             ent.bind("<Double-Button-1>", lambda _e, rr=row: self._jump_to_row(rr), add="+")
 
-        row["doff_var"].trace_add("write", lambda *_a, rr=row: self._on_delta_changed(rr))
-        row["dbpm_var"].trace_add("write", lambda *_a, rr=row: self._on_delta_changed(rr))
-        row["noff_var"].trace_add("write", lambda *_a, rr=row: self._on_new_changed(rr))
-        row["nbpm_var"].trace_add("write", lambda *_a, rr=row: self._on_new_changed(rr))
+        row["doff_var"].trace_add("write", lambda *_a, rr=row: self._on_delta_changed(rr, "doff_var"))
+        row["dbpm_var"].trace_add("write", lambda *_a, rr=row: self._on_delta_changed(rr, "dbpm_var"))
+        row["noff_var"].trace_add("write", lambda *_a, rr=row: self._on_new_changed(rr, "noff_var"))
+        row["nbpm_var"].trace_add("write", lambda *_a, rr=row: self._on_new_changed(rr, "nbpm_var"))
         row["bl_var"].trace_add("write", lambda *_a: self._on_toggle_var())
-        row["ts_var"].trace_add("write", lambda *_a: self._on_toggle_var())
+        row["ts_var"].trace_add("write", lambda *_a, rr=row: self._on_time_sig_changed(rr))
 
         self._bind_table_wheel(rf)   # recurses into every child widget
         row["_hover"] = False
@@ -4742,22 +4752,52 @@ class TimingEditorFrame(BaseToolFrame):
             d = nb - row["base_bpm"]
             row["dbpm_var"].set(f"{d:.1f}" if abs(d - round(d, 1)) < 1e-9 else self._fmt_bpm(d))
 
-    def _on_delta_changed(self, row):
+    def _propagate_selected_field(self, row, field):
+        """Mirror the edited column only; each row keeps its own delta base.
+
+        Called under _updating so peer traces cannot recurse. Incomplete
+        typing stays in the source field until it becomes a valid value.
+        """
+        if not row["sel_var"].get() or row["_deleted"]:
+            return
+        value = self._f_off(row[field]) if field == "noff_var" else self._f(row[field])
+        if value is None or not math.isfinite(value):
+            return
+        if field == "ts_var" and (not value.is_integer() or not 1 <= value <= 100):
+            return
+        if field == "nbpm_var" and not 1 <= value <= 100000:
+            return
+        for other in self._selected_rows():
+            if other is row:
+                continue
+            other[field].set(row[field].get())
+            if field == "doff_var":
+                other["noff_var"].set(_fmt_ms_timestamp(other["base_time"] + value))
+            elif field == "dbpm_var":
+                other["nbpm_var"].set(self._fmt_bpm(other["base_bpm"] + value))
+            elif field == "noff_var":
+                other["doff_var"].set(str(osu_parser.stable_round(value - other["base_time"])))
+            elif field == "nbpm_var":
+                other["dbpm_var"].set(self._fmt_bpm(value - other["base_bpm"]))
+
+    def _on_delta_changed(self, row, field):
         if self._updating:
             return
         self._updating = True
         try:
             self._sync_new_from_delta(row)
+            self._propagate_selected_field(row, field)
         finally:
             self._updating = False
         self._after_row_edit(row)
 
-    def _on_new_changed(self, row):
+    def _on_new_changed(self, row, field):
         if self._updating:
             return
         self._updating = True
         try:
             self._sync_delta_from_new(row)
+            self._propagate_selected_field(row, field)
         finally:
             self._updating = False
         self._after_row_edit(row)
@@ -4775,7 +4815,23 @@ class TimingEditorFrame(BaseToolFrame):
         self._redraw_timeline()
         self._schedule_commit()
 
-    # ---- selection (the "Sel" checkboxes → Delete) --------------------
+    def _on_time_sig_changed(self, row):
+        if self._updating:
+            return
+        self._updating = True
+        try:
+            self._propagate_selected_field(row, "ts_var")
+        finally:
+            self._updating = False
+        self._after_row_edit(row)
+
+    # ---- selection / bulk editing ------------------------------------
+    def _toggle_select_all(self):
+        selected = self.select_all_var.get()
+        for row in self._visible_rows():
+            row["sel_var"].set(selected)
+        self._on_selection_changed()
+
     def _selected_rows(self):
         return [r for r in self.rows if not r["_deleted"] and r["sel_var"].get()]
 
@@ -4798,7 +4854,7 @@ class TimingEditorFrame(BaseToolFrame):
             self._paint_row(r)
 
     # ---- per-row hover / selection tint ------------------------------
-    ROW_BG_NORMAL = FRONT_CARD_BG
+    ROW_BG_NORMAL = FRONT_BG
     ROW_BG_HOVER = "#f4f6fe"
     ROW_BG_SEL = LIGHT_ACCENT_SOFT          # lavender
     ROW_BG_SEL_HOVER = "#e3e7fb"
@@ -4880,6 +4936,9 @@ class TimingEditorFrame(BaseToolFrame):
         if btn is None:
             return
         n = len(self._selected_rows())
+        visible = self._visible_rows()
+        self.select_all_var.set(bool(visible) and n == len(visible))
+        self.select_all_chk.set_enabled(bool(visible))
         if n:
             btn.configure(text=f"Delete selected ({n})")
             if not btn.winfo_ismapped():
@@ -5193,8 +5252,8 @@ class TimingEditorFrame(BaseToolFrame):
             unit = gov["bl"] / denom
         if unit <= 0:
             return t
-        k = round((t - gov["t"]) / unit)
-        return gov["t"] + k * unit
+        k = osu_parser.stable_round((t - gov["t"]) / unit)
+        return math.trunc(math.trunc(gov["t"]) + k * unit)
 
     def _tick_style(self, k, denom):
         if denom <= 1 or k % denom == 0:
@@ -5223,8 +5282,8 @@ class TimingEditorFrame(BaseToolFrame):
         self._panned_cursor = self.cursor_ms
 
         for i, r in enumerate(reds):
-            seg_start = r["t"] if i > 0 else -1e18
-            seg_end = reds[i + 1]["t"] if i + 1 < len(reds) else 1e18
+            seg_start = math.trunc(r["t"]) if i > 0 else -1e18
+            seg_end = math.trunc(reds[i + 1]["t"]) if i + 1 < len(reds) else 1e18
             bl = r["bl"]
             if bl <= 0:
                 continue
@@ -5242,7 +5301,7 @@ class TimingEditorFrame(BaseToolFrame):
                 b1 = math.ceil((hi - r["t"]) / bar_len) + 1
                 if b1 - b0 <= 8000:
                     for b in range(b0, b1 + 1):
-                        t = r["t"] + b * bar_len
+                        t = math.trunc(math.trunc(r["t"]) + b * bar_len)
                         if t < seg_start - 1e-6 or t > seg_end + 1e-6 or t < draw0 or t > draw1:
                             continue
                         x = self._t_to_x(t)
@@ -5272,7 +5331,7 @@ class TimingEditorFrame(BaseToolFrame):
             if k1 - k0 > 10000:
                 continue
             for k in range(k0, k1 + 1):
-                t = r["t"] + k * step
+                t = math.trunc(math.trunc(r["t"]) + k * step)
                 if t < seg_start - 1e-6 or t > seg_end + 1e-6 or t < draw0 or t > draw1:
                     continue
                 beat_no = k // d
@@ -5373,8 +5432,8 @@ class TimingEditorFrame(BaseToolFrame):
         untouched). An omitted first barline is skipped. Used by the optional
         "Display barlines in waveform view" overlay."""
         for i, r in enumerate(reds):
-            seg_start = r["t"] if i > 0 else -1e18
-            seg_end = reds[i + 1]["t"] if i + 1 < len(reds) else 1e18
+            seg_start = math.trunc(r["t"]) if i > 0 else -1e18
+            seg_end = math.trunc(reds[i + 1]["t"]) if i + 1 < len(reds) else 1e18
             bl = r["bl"]
             if bl <= 0:
                 continue
@@ -5394,7 +5453,7 @@ class TimingEditorFrame(BaseToolFrame):
             for b in range(b0, b1 + 1):
                 if omit_bar and b == 0:
                     continue
-                t = r["t"] + b * bar_len
+                t = math.trunc(math.trunc(r["t"]) + b * bar_len)
                 if t < seg_start - 1e-6 or t > seg_end + 1e-6 or t < draw0 or t > draw1:
                     continue
                 yield self._t_to_x(t)
@@ -5403,10 +5462,14 @@ class TimingEditorFrame(BaseToolFrame):
         c = getattr(self, "wave", None)
         if c is None:
             return
-        c.delete("all")
+        c.delete("wave")
         W = c.winfo_width() or 1000
         H = self.WAVE_H
-        mid = H / 2
+        y0 = self.TIMELINE_H
+        mid = y0 + H / 2
+        c.create_rectangle(-100000, y0, 100000, y0 + H,
+                           fill="#faf9fe", outline="", tags="wave")
+        scroll_tags = ("scroll", "wave")
         if draw0 is None:
             vis_ms = self._visible_ms()
             draw0 = self._view_start() - vis_ms * 0.85
@@ -5415,7 +5478,7 @@ class TimingEditorFrame(BaseToolFrame):
 
         if not self._peaks:
             c.create_text(W / 2, mid, text=self._wave_msg, fill=FRONT_TEXT_MUTED,
-                           font=("Segoe UI", 9))
+                           font=("Segoe UI", 9), tags="wave")
         else:
             peaks = self._peaks
             n = len(peaks)
@@ -5430,7 +5493,7 @@ class TimingEditorFrame(BaseToolFrame):
                     # (matches osu!lazer's WAVEFORM_VISUAL_OFFSET, see class const)
                     t = self._x_to_t(x) + off
                     bi = int(t / bm) if t >= 0 else -1
-                    a = peaks[bi] * (mid - 1) if 0 <= bi < n else 0.0
+                    a = peaks[bi] * (H / 2 - 1) if 0 <= bi < n else 0.0
                     top.append(x); top.append(mid - a)
                     bot.append(x); bot.append(mid + a)
             if onset_mode:
@@ -5442,8 +5505,8 @@ class TimingEditorFrame(BaseToolFrame):
                 # reads as its own discrete mark.
                 if self._onsets is None:
                     self._onsets = self._compute_onsets()
-                c.create_line(xa, mid, xb, mid, fill="#e4e0ef", tags="scroll")
-                amp = mid - 3
+                c.create_line(xa, mid, xb, mid, fill="#e4e0ef", tags=scroll_tags)
+                amp = H / 2 - 3
                 for idx, st in self._onsets:
                     x = self._t_to_x(idx * bm - off)   # onset file->grid time
                     if x < xa - 20 or x > xb + 20:
@@ -5451,29 +5514,31 @@ class TimingEditorFrame(BaseToolFrame):
                     h = max(0.25, st) * amp
                     w = 3 + 2 * st
                     c.create_polygon(x - w, mid, x, mid - h, x + w, mid, x, mid + h,
-                                      fill="#8fd0c4", outline="", tags="scroll")
-                    c.create_line(x, mid - h, x, mid + h, fill="#2f9d8c", tags="scroll")
+                                      fill="#8fd0c4", outline="", tags=scroll_tags)
+                    c.create_line(x, mid - h, x, mid + h, fill="#2f9d8c", tags=scroll_tags)
             elif len(top) >= 4:
                 # one filled polygon (top envelope + reversed bottom) instead
                 # of ~W separate create_line calls — the per-item overhead was
                 # what made playback scroll stutter.
                 poly = top + [v for i in range(len(bot) - 2, -1, -2) for v in (bot[i], bot[i + 1])]
-                c.create_polygon(poly, fill="#c9b8ea", outline="", tags="scroll")
+                c.create_polygon(poly, fill="#c9b8ea", outline="", tags=scroll_tags)
 
         reds = self._new_redlines()
         if self.wave_barlines_var.get():
             for x in self._iter_barline_x(reds, draw0, draw1):
-                c.create_line(x, 0, x, H, fill="#000000", width=1, tags="scroll")
+                c.create_line(x, y0, x, y0 + H, fill="#000000", width=1, tags=scroll_tags)
 
         for r in reds:
             if r["t"] < draw0 or r["t"] > draw1:
                 continue
             x = self._t_to_x(r["t"])
             dash = () if not r["row"]["bl_var"].get() else (4, 3)
-            c.create_line(x, 0, x, H, fill="#e8462e", width=1, dash=dash, tags="scroll")
-        c.create_line(self._cursor_x(), 0, self._cursor_x(), H, fill="#5b5b5b", width=1,
-                       tags="cursor")
-        c.create_text(W - 4, 2, anchor="ne", fill=FRONT_TEXT_MUTED, font=("Segoe UI", 8),
+            c.create_line(x, y0, x, y0 + H, fill="#e8462e", width=1, dash=dash, tags=scroll_tags)
+        c.create_line(self._cursor_x(), y0, self._cursor_x(), y0 + H, fill="#5b5b5b", width=1,
+                       tags=("cursor", "wave"))
+        c.create_line(0, y0, W, y0, fill=FRONT_BORDER, tags="wave")
+        c.create_text(W - 4, y0 + 2, anchor="ne", fill=FRONT_TEXT_MUTED, font=("Segoe UI", 8),
+                       tags="wave",
                        text=("onsets — dbl-click for wave" if onset_mode
                               else "wave — dbl-click for onsets"))
 
@@ -5490,7 +5555,8 @@ class TimingEditorFrame(BaseToolFrame):
         if d:
             dx = -d * self.px_per_ms
             c1.move("scroll", dx, 0)
-            c2.move("scroll", dx, 0)
+            if c2 is not c1:
+                c2.move("scroll", dx, 0)
             self._panned_cursor = new_cursor
         self.cursor_ms = new_cursor
         # Text layout and ttk scrollbar updates are comparatively expensive.
@@ -5559,8 +5625,7 @@ class TimingEditorFrame(BaseToolFrame):
                     samples, channels = mono, 1
                 # The supplied click assets peak around 17-21% of full-scale,
                 # so an unmodified stream still sounds quiet. Normalize each
-                # click here; waveOut then emits full-level metronome PCM that
-                # is independent of the song player's 40% VLC gain.
+                # click here; its mixer gain is independent of song volume.
                 peak = max((abs(sample) for sample in samples), default=0)
                 if peak:
                     gain = 30000.0 / peak
@@ -5574,13 +5639,13 @@ class TimingEditorFrame(BaseToolFrame):
         reds = self._new_redlines()
         grid = tuple((round(r["t"], 6), round(r["bl"], 6),
                       max(1, self._row_meter(r["row"]))) for r in reds)
-        return round(duration_ms), grid
+        return round(duration_ms), grid, self._playback_rate
 
     def _build_metro_track(self, duration_ms):
         """Render the current 1/1 grid to one continuous PCM audio stream.
 
         tick1 is overlaid at every barline and tick2 at every other beat.
-        Because VLC plays this stream beside the song, canvas stalls cannot
+        Because BASS mixes this stream with the song, canvas stalls cannot
         change when a click reaches the audio device.
         """
         bar_tick = self._read_metro_wav(self._tick1_path)
@@ -5593,11 +5658,12 @@ class TimingEditorFrame(BaseToolFrame):
             return None
 
         duration_ms = max(1000.0, float(duration_ms) + 500.0)
-        frame_count = int(math.ceil(duration_ms * rate / 1000.0))
+        # Change beat spacing, never the samples making up an individual click.
+        frame_count = int(math.ceil(duration_ms * rate / (1000.0 * self._playback_rate)))
         mixed = array("h", [0]) * (frame_count * channels)
         for beat_ms, is_barline in self._iter_grid_beats(duration_ms):
             tick = bar_samples if is_barline else beat_samples
-            dst = int(round(beat_ms * rate / 1000.0)) * channels
+            dst = int(round(beat_ms * rate / (1000.0 * self._playback_rate))) * channels
             if dst < 0:
                 continue
             limit = min(len(tick), len(mixed) - dst)
@@ -5623,16 +5689,7 @@ class TimingEditorFrame(BaseToolFrame):
                 pass
             return None
 
-    def _release_metro_stream(self):
-        try:
-            if self._metro_stream is not None:
-                self._metro_stream.close()
-        except Exception:
-            pass
-        self._metro_stream = None
-
     def _remove_metro_track(self):
-        self._release_metro_stream()
         path = self._metro_track_path
         self._metro_track_path = None
         self._metro_track_signature = None
@@ -5642,32 +5699,22 @@ class TimingEditorFrame(BaseToolFrame):
             except OSError:
                 pass
 
-    def _prepare_metro_stream(self, duration_ms):
+    def _prepare_metro_track(self, duration_ms, rate=None):
         signature = self._metro_signature_for(duration_ms)
         if signature != self._metro_track_signature or not self._metro_track_path:
             self._remove_metro_track()
             self._metro_track_path = self._build_metro_track(duration_ms)
             self._metro_track_signature = signature if self._metro_track_path else None
         if not self._metro_track_path:
-            return
-        self._release_metro_stream()
-        try:
-            self._metro_stream = _WaveMetronomeStream(self._metro_track_path)
-        except Exception:
-            self._metro_stream = None
+            raise RuntimeError("Could not prepare metronome audio. Check that tick1.wav and tick2.wav are installed.")
+        return self._metro_track_path
 
     def _on_metronome_toggle(self):
-        if self._metro_stream is None:
-            return
-        try:
-            if not self.metronome_var.get() or not self._playing:
-                self._metro_stream.stop()
-            else:
-                song_ms = self._player.get_time() if self._player is not None else -1
-                start_ms = song_ms if song_ms is not None and song_ms >= 0 else self.cursor_ms
-                self._metro_stream.play_from(start_ms)
-        except Exception:
-            pass
+        if self._player is not None:
+            try:
+                self._player.set_metronome(self.metronome_var.get())
+            except Exception as error:
+                _show_alert(self, "Playback error", str(error))
 
     def _iter_grid_beats(self, duration_ms):
         """Yield (time_ms, is_barline) over the current New-value grid."""
@@ -5677,18 +5724,19 @@ class TimingEditorFrame(BaseToolFrame):
             if bl <= 0:
                 continue
             meter = max(1, self._row_meter(r["row"]))
-            seg_start = r["t"] if i > 0 else -1e18
-            seg_end = reds[i + 1]["t"] if i + 1 < len(reds) else duration_ms
+            seg_start = math.trunc(r["t"]) if i > 0 else -1e18
+            seg_end = math.trunc(reds[i + 1]["t"]) if i + 1 < len(reds) else duration_ms
             lo, hi = max(0.0, seg_start), min(duration_ms, seg_end)
-            k = math.ceil((lo - r["t"]) / bl - 1e-9)
-            while r["t"] + k * bl < hi - 1e-6:
-                t = r["t"] + k * bl
-                yield t, k % meter == 0
+            k = math.ceil((lo - math.trunc(r["t"])) / bl - 1e-9)
+            while True:
+                t = math.trunc(math.trunc(r["t"]) + k * bl)
+                if t >= hi - 1e-6:
+                    break
+                if t >= lo:
+                    yield t, k % meter == 0
                 k += 1
 
-    # ------------------------------------------------------------------
-    # Audio playback (VLC) — the timeline scrolls with the playhead
-    # ------------------------------------------------------------------
+    # Song and clicks share one BASS output mixer; only the song is stretched.
     def _toggle_play(self):
         if self._playing:
             self._pause_audio()
@@ -5699,131 +5747,166 @@ class TimingEditorFrame(BaseToolFrame):
         if not self.rows:
             _show_alert(self, "No map", "Load a map with timing first.")
             return
-        if logic.vlc_available():
+        if logic.bass_available():
             self._start_audio()
             return
-        if _ask_vlc_required_choice(self) == "cancel":
+        if _ask_choice_dialog(self, "BASS required",
+                "Timing Editor playback needs the BASS audio libraries.",
+                [("Install automatically", "install"), ("Cancel", "cancel")]) != "install":
             return
-
-        def work(_cancel):
-            logic.install_vlc_bundled()
-
         self.app.run_cancellable_job(
-            "Installing VLC (may take a few minutes)... Please wait...", work,
-            on_success=lambda _r: (self.notify_done("VLC installed."), self._start_audio()),
-            on_error=lambda m: _show_alert(self, "Error", m),
-            cancelled_toast="Installation Cancelled!")
+            "Installing BASS audio libraries...",
+            lambda _cancel: logic.install_bass_bundled(),
+            on_success=lambda _result: (self.notify_done("BASS installed."), self._start_audio()),
+            on_error=lambda message: _show_alert(self, "Playback error", message),
+            cancelled_toast="Installation cancelled.")
 
     def _audio_path(self):
         folder, _ = self.app.get_diff_files()
-        a = logic.get_audio_filename(folder)
-        p = os.path.join(folder, a) if a else None
-        return p if p and os.path.exists(p) else None
+        audio = logic.get_audio_filename(folder)
+        path = os.path.join(folder, audio) if audio else None
+        return path if path and os.path.isfile(path) else None
 
     def _start_audio(self):
         path = self._audio_path()
         if not path:
             _show_alert(self, "No audio", "Couldn't find this map's audio file.")
             return
+        prepared = self._rate_audio_cache.get(path, self._playback_rate)
+        if prepared is None:
+            self._prepare_rate_audio(path)
+            return
         try:
-            import vlc
-            self._vlc = vlc
-            if self._vlc_instance is None:
-                self._vlc_instance = (vlc.Instance() if os.name == "nt"
-                                       else vlc.Instance("--no-xlib"))
-            self._player = self._vlc_instance.media_player_new()
-            media = self._vlc_instance.media_new(path)
-            self._player.set_media(media)
-            duration_ms = self._audio_duration_ms
-            if duration_ms <= 0:
-                try:
-                    media.parse()
-                    duration_ms = max(0.0, float(media.get_duration()))
-                except Exception:
-                    duration_ms = 0.0
-            duration_ms = max(duration_ms, self._total_ms())
-            self._prepare_metro_stream(duration_ms)
-            # Start muted while both decoders warm up; _safe_set_time then
-            # aligns them and _resume_after_seek restores their volumes.
-            self._player.audio_set_mute(True)
-            self._player.audio_set_volume(0)
-            self._priming_audio = True
+            self._player = BassPlayer(prepared, self._prepare_metro_track, self._playback_rate,
+                                      prepared_song=self._playback_rate != 1)
+            self._audio_duration_ms = self._player.duration_ms
+            self._player.set_volume(self._play_volume)
+            self._player.set_metronome(self.metronome_var.get())
+            start = max(0.0, self.cursor_ms)
+            self._player.seek(start)
             self._player.play()
-        except Exception as e:
-            self._player = None
-            self._remove_metro_track()
-            _show_alert(self, "Playback error", str(e))
+        except Exception as error:
+            self._stop_audio()
+            _show_alert(self, "Playback error", str(error))
             return
         self._playing = True
         self.play_btn.configure(text="⏸")
-        start = int(max(0.0, self.cursor_ms))
-        self._reset_play_anchor(start, latency=0.15)
-        self._redraw_timeline()   # fresh render extent for the pan loop
-        # Prime both decoders, then pause/seek/resume them together. Doing this
-        # even at time zero removes the different MP3/OGG-vs-WAV startup delay
-        # that two back-to-back play() calls would otherwise expose.
-        self.after(150, lambda: self._safe_set_time(start))
+        self._reset_play_anchor(start)
+        self._redraw_timeline()
         self._tick_play()
 
     def _resume_audio(self):
-        try:
-            duration_ms = max(self._audio_duration_ms, self._total_ms())
-            signature = self._metro_signature_for(duration_ms)
-            if signature != self._metro_track_signature or self._metro_stream is None:
-                self._prepare_metro_stream(duration_ms)
-            self._player.set_pause(0)
-        except Exception:
-            self._player = None
+        if self._player is None:
             self._start_audio()
+            return
+        signature = self._metro_signature_for(self._player.duration_ms)
+        if signature != self._metro_track_signature:
+            self._stop_audio()
+            self._start_audio()
+            return
+        try:
+            self._player.set_rate(self._playback_rate)
+            self._player.set_volume(self._play_volume)
+            self._player.set_metronome(self.metronome_var.get())
+            self._player.seek(max(0.0, self.cursor_ms))
+            self._player.play()
+        except Exception as error:
+            self._stop_audio()
+            _show_alert(self, "Playback error", str(error))
             return
         self._playing = True
         self.play_btn.configure(text="⏸")
-        cur = int(max(0.0, self.cursor_ms))
-        self._reset_play_anchor(cur, latency=0.06)
-        self._safe_set_time(cur)
-        self._apply_play_volume()
+        self._reset_play_anchor(max(0.0, self.cursor_ms))
         self._tick_play()
 
-    def _apply_play_volume(self):
-        if self._player is None:
-            return
-        try:
-            self._player.audio_set_volume(int(self._play_volume))
-        except Exception:
-            pass
+    def _on_playback_destroy(self, event):
+        if event.widget is self:
+            self._stop_audio()
+            self._rate_audio_cache.clear()
 
-    def _apply_play_volume_soon(self):
-        """libVLC only creates the player's audio output once it reaches
-        Playing, so audio_set_volume() right after play() can be dropped —
-        reapply a few times over the next second to close that race (same
-        reasoning as VideoPreviewWindow._apply_volume_soon)."""
-        self._apply_play_volume()
-        for delay in (100, 300, 600, 1000):
-            self.after(delay, self._apply_play_volume)
+    def _prepare_rate_audio(self, path):
+        if self._rate_prepare_token is not None:
+            return
+        if not logic.ffmpeg_available():
+            _show_alert(self, "Playback rate", "Install FFmpeg through Settings for high-quality pitch-preserving slow playback.")
+            return
+        token = object()
+        self._rate_prepare_token = token
+        rate, loaded_src = self._playback_rate, self._loaded_src
+        ffmpeg = logic._resolve_binary("ffmpeg")
+
+        def reset():
+            if self._rate_prepare_token is token:
+                self._rate_prepare_token = None
+
+        def ready(_path):
+            reset()
+            if (self.winfo_exists() and self._is_current() and self._loaded_src == loaded_src
+                    and self._playback_rate == rate):
+                self._start_audio()
+
+        def failed(message):
+            reset()
+            _show_alert(self, "Playback rate", message)
+
+        self.app.run_cancellable_job(
+            f"Preparing high-quality {int(rate * 100)}% playback...",
+            lambda cancel: self._rate_audio_cache.prepare(path, rate, ffmpeg, cancel),
+            on_success=ready, on_error=failed, on_cancel=reset,
+            cancelled_toast="Playback preparation cancelled.")
+
+    def _apply_play_volume(self):
+        if self._player is not None:
+            try:
+                self._player.set_volume(self._play_volume)
+            except Exception as error:
+                _show_alert(self, "Playback error", str(error))
 
     def _on_play_volume_change(self, _value):
         self._play_volume = int(float(self.play_volume_scale.get()))
         self._apply_play_volume()
 
     def _on_play_volume_click(self, event):
-        # jump exactly to the clicked position rather than ttk.Scale's tiny step
         self.play_volume_scale.set(_scale_value_at_x(self.play_volume_scale, event.x))
         return "break"
 
-    def _reset_play_anchor(self, ms, latency=0.0):
-        t = time.monotonic()
+    def _step_playback_rate(self, direction):
+        i = self.PLAYBACK_RATE_OPTIONS.index(self.playback_rate_var.get())
+        i = max(0, min(len(self.PLAYBACK_RATE_OPTIONS) - 1, i + direction))
+        self.playback_rate_var.set(self.PLAYBACK_RATE_OPTIONS[i])
+
+    def _on_playback_rate_changed(self, *_args):
+        label = self.playback_rate_var.get()
+        if label not in self.PLAYBACK_RATE_OPTIONS:
+            return
+        rate = float(label.rstrip("%")) / 100.0
+        if rate == self._playback_rate:
+            return
+        was_playing = self._playing
+        if was_playing:
+            self._pause_audio()
+        self._playback_rate = rate
+        # Resume with matching song audio and clean, rate-spaced clicks.
+        # Paused/stopped changes are applied lazily by the next Play action.
+        if was_playing:
+            self._resume_audio()
+
+    def _reset_play_anchor(self, ms):
+        now = time.monotonic()
         self._play_anchor_ms = float(ms)
-        self._play_anchor_wall = t + latency   # audio won't actually reach `ms` until ~now+latency
-        self._play_last_frame_wall = t
+        self._play_anchor_wall = now
+        self._play_last_frame_wall = now
         self._play_aux_ui_wall = 0.0
         self._play_floor_ms = float(ms)
-        self._seek_guard_until = t + latency + 0.2
 
     def _pause_audio(self):
         self._playing = False
-        self.play_btn.configure(text="▶")
+        try:
+            self.play_btn.configure(text="▶")
+        except tk.TclError:
+            pass
         for attr in ("_play_after", "_seek_job"):
-            job = getattr(self, attr)
+            job = getattr(self, attr, None)
             if job is not None:
                 try:
                     self.after_cancel(job)
@@ -5831,130 +5914,77 @@ class TimingEditorFrame(BaseToolFrame):
                     pass
                 setattr(self, attr, None)
         self._pending_seek_ms = None
-        try:
-            if self._player is not None:
-                self._player.set_pause(1)   # explicit, not pause() which toggles
-            if self._metro_stream is not None:
-                self._metro_stream.pause()
-        except Exception:
-            pass
+        if self._player is not None:
+            self._player.pause()
 
     def _stop_audio(self):
-        self._pause_audio()
         try:
+            self._pause_audio()
+        finally:
             if self._player is not None:
-                self._player.stop()
-                self._player.release()
-        except Exception:
-            pass
-        self._player = None
-        self._priming_audio = False
-        self._remove_metro_track()
+                self._player.close()
+            self._player = None
+            self._remove_metro_track()
 
     def _safe_set_time(self, ms):
+        if self._player is None:
+            return
         try:
-            if self._player is None:
-                return
-            ms = int(max(0, ms))
-            # Pause across the jump, then resume a moment later: a set_time()
-            # on a Playing player lets libVLC's audio clock run fast to
-            # "catch up" to the new position — that's the pitch-up
-            # ("chipmunk") artifact. Making it a discrete paused jump costs
-            # a ~40ms gap instead.
-            if self._playing:
-                try:
-                    self._player.set_pause(1)
-                    if self._metro_stream is not None:
-                        self._metro_stream.stop()
-                except Exception:
-                    pass
-            self._player.set_time(ms)
-            self._metro_resume_ms = ms
-            # The players resume 40ms below, so the visual clock should begin
-            # advancing at that same point instead of waiting an extra 80ms.
-            self._reset_play_anchor(ms, latency=0.04)
-            if self._playing:
-                self.after(40, self._resume_after_seek)
-        except Exception:
-            pass
-
-    def _resume_after_seek(self):
-        try:
-            if self._playing and self._player is not None:
-                self._player.set_pause(0)
-                if self._metro_stream is not None:
-                    if self.metronome_var.get():
-                        self._metro_stream.play_from(self._metro_resume_ms)
-                    else:
-                        self._metro_stream.stop()
-                if self._priming_audio:
-                    self._priming_audio = False
-                    self._player.audio_set_mute(False)
-                    self._apply_play_volume_soon()
-        except Exception:
-            pass
+            ms = max(0.0, min(float(ms), self._player.duration_ms))
+            self._player.seek(ms)
+            self._reset_play_anchor(ms)
+            self._pan_timeline(ms)
+        except Exception as error:
+            self._stop_audio()
+            _show_alert(self, "Playback error", str(error))
 
     def _tick_play(self):
         if not self._playing or self._player is None:
             return
         try:
-            state = self._player.get_state()
-            vt = self._player.get_time()
-        except Exception:
+            if self._player.ended():
+                self._pan_timeline(self._player.duration_ms)
+                self._stop_audio()
+                return
+            position = self._player.get_time()
+        except Exception as error:
             self._stop_audio()
+            _show_alert(self, "Playback error", str(error))
             return
-        V = self._vlc
-        if V is not None and state in (V.State.Ended, V.State.Error, V.State.Stopped):
-            self._stop_audio()
+        # Input owns the cursor while a coalesced manual seek is pending.
+        if self._pending_seek_ms is not None:
+            self._play_after = self.after(self.PLAY_TICK_MS, self._tick_play)
             return
-
         now = time.monotonic()
-        frame_dt = max(0.001, min(0.1, now - self._play_last_frame_wall))
+        frame_dt = max(0.001, now - self._play_last_frame_wall)
         self._play_last_frame_wall = now
-        # free-running estimate from the anchor (this is what makes the
-        # scroll advance every frame instead of once per libVLC update, and
-        # is what carries the true real-time *rate*)
-        est = self._play_anchor_ms + (now - self._play_anchor_wall) * 1000.0
-        if now >= self._seek_guard_until and vt is not None and vt >= 0:
-            target = float(vt) + self.PLAYBACK_LATENCY_COMP_MS
-            drift = target - est
-            if abs(drift) > 200.0:          # discontinuity (user seeked, buffer skip) — hard resync
-                self._play_anchor_ms = target
-                self._play_anchor_wall = now
-                est = target
-            else:                            # framerate-independent low-pass toward libVLC time
-                alpha = 1.0 - math.exp(-frame_dt / self.PLAYHEAD_SMOOTH_TAU)
-                corr = drift * alpha
-                self._play_anchor_ms += corr
-                est += corr
-        # never scroll backward during continuous playback / before the seek target
-        est = max(est, self._play_floor_ms, self._panned_cursor - 0.5)
+        est = self._play_anchor_ms + (now - self._play_anchor_wall) * 1000 * self._playback_rate
+        # The native output clock already accounts for buffering. Keep visual
+        # motion smooth with a bounded correction; no device-latency guesses.
+        alpha = 1.0 - math.exp(-frame_dt / self.PLAYHEAD_SMOOTH_TAU)
+        limit = frame_dt * 40 * self._playback_rate
+        correction = max(-limit, min(limit, (position - est) * alpha))
+        self._play_anchor_ms += correction
+        est = max(est + correction, self._play_floor_ms, self._panned_cursor)
         self._pan_timeline(est)
-        self._play_after = self.after(self.PLAY_TICK_MS, self._tick_play)
+        work_ms = (time.monotonic() - now) * 1000
+        self._play_after = self.after(max(1, round(self.PLAY_TICK_MS - work_ms)), self._tick_play)
 
     def _audio_seek_to_cursor(self):
-        """Keep the audio playhead in step with a manual scroll/seek while
-        playing (no-op when paused). **Debounced** — a drag / spun wheel /
-        held arrow fires this dozens of times a second, and hammering
-        libVLC's set_time() that fast makes its audio engine play catch-up
-        bursts that sound pitched-up ("chipmunk"). Instead we only issue
-        one real seek ~110ms after the motion settles; the audio keeps
-        playing from where it was until then."""
+        """Coalesce drag/wheel events without fighting the playback cursor."""
         if not self._playing:
             return
         self._pending_seek_ms = max(0.0, self.cursor_ms)
         if self._seek_job is not None:
-            try:
-                self.after_cancel(self._seek_job)
-            except Exception:
-                pass
+            self.after_cancel(self._seek_job)
         self._seek_job = self.after(110, self._flush_pending_seek)
 
     def _flush_pending_seek(self):
         self._seek_job = None
-        if self._playing and self._pending_seek_ms is not None:
-            self._safe_set_time(int(self._pending_seek_ms))
+        target = self._pending_seek_ms
         self._pending_seek_ms = None
+        if self._playing and target is not None:
+            self._safe_set_time(target)
 
     # ---- timeline input ----
     #
@@ -5968,6 +5998,9 @@ class TimingEditorFrame(BaseToolFrame):
         self._drag_cursor0 = self.cursor_ms
         self._drag_moved = False
         self._drag_red = None
+        self._drag_in_wave = e.y >= self.TIMELINE_H
+        if self._drag_in_wave:
+            return  # waveform drags seek; they never grab timing markers
         if self.timeline_locked_var.get():
             return   # locked: mouse can only seek, never grab a red line
         for r in self._new_redlines():
@@ -6054,8 +6087,8 @@ class TimingEditorFrame(BaseToolFrame):
         if base is None or unit <= 0:
             self.cursor_ms += direction * 500.0
         else:
-            k = round((self.cursor_ms - base) / unit)
-            self.cursor_ms = base + (k + direction) * unit
+            k = osu_parser.stable_round((self.cursor_ms - base) / unit)
+            self.cursor_ms = math.trunc(math.trunc(base) + (k + direction) * unit)
         self._clamp_cursor()
         self._redraw_timeline()
         self._audio_seek_to_cursor()
@@ -6193,7 +6226,7 @@ class BgOffsetShifterFrame(BaseToolFrame):
 
         header_row = tk.Frame(self.body, bg=FRONT_BG)
         header_row.pack(fill="x", padx=24, pady=(20, 4))
-        tk.Label(header_row, text="BG Settings", bg=FRONT_BG, fg=FRONT_TEXT,
+        tk.Label(header_row, text="Background Settings", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 20, "bold")).pack(side="left")
         header_info = InfoIcon(header_row,
                                 "Preview and set BG offset without having to manually "
@@ -6206,58 +6239,56 @@ class BgOffsetShifterFrame(BaseToolFrame):
         tk.Label(bg_row, text="BG File:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).pack(side="left")
         self.bg_var = tk.StringVar()
-        self.bg_combo = LightDropdown(bg_row, self.bg_var, width=30)
+        self.bg_combo = LightDropdown(bg_row, self.bg_var, width=30, page_bg=FRONT_BG)
         self.bg_combo.pack(side="left", padx=(10, 0))
         self.bg_combo.bind("<<ComboboxSelected>>", self._on_bg_selected)
         _make_ghost_button(bg_row, "Browse...", self.browse_bg).pack(side="left", padx=(10, 0))
 
-        self.card = RoundedCard(self.body)
-        self.card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        self.card = RoundedCard(self.body, flat=True)
+        self.card.pack(fill="x", padx=24, pady=(0, 16))
         body = self.card.body
 
-        row2 = tk.Frame(body, bg=FRONT_CARD_BG)
+        row2 = tk.Frame(body, bg=FRONT_BG)
         row2.pack(fill="x", pady=(0, 12))
-        tk.Label(row2, text="New Offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+        tk.Label(row2, text="New Offset:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).pack(side="left")
         self.offset_var = tk.StringVar(value="0")
         LightSpinner(row2, self.offset_var, from_=-10_000, to=10_000, increment=1,
-                     width=8, fmt="%d").pack(side="left", padx=(10, 10))
+                     width=8, fmt="%d", bg=FRONT_BG).pack(side="left", padx=(10, 10))
         _make_ghost_button(row2, "Preview", self.open_preview).pack(side="left")
 
         self.convert_jpg_var = tk.BooleanVar(value=False)
-        LightCheckbox(body, "Convert to .jpg", self.convert_jpg_var).pack(anchor="w", pady=(0, 12))
+        LightCheckbox(body, "Convert to .jpg", self.convert_jpg_var, bg=FRONT_BG).pack(anchor="w", pady=(0, 12))
 
-        upscale_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        upscale_row = tk.Frame(body, bg=FRONT_BG)
         upscale_row.pack(fill="x", pady=(0, 8))
         self.upscale_bg_var = tk.BooleanVar(value=False)
         LightCheckbox(upscale_row, "Upscale BG", self.upscale_bg_var,
-                      command=self._on_upscale_toggled).pack(side="left")
+                      command=self._on_upscale_toggled, bg=FRONT_BG).pack(side="left")
         _upscale_info = InfoIcon(upscale_row, "Upscale the BG using waifu2x")
-        _upscale_info.configure(bg=FRONT_CARD_BG)
+        _upscale_info.configure(bg=FRONT_BG)
         _upscale_info.pack(side="left", padx=(4, 0))
         self.upscale_config_btn = _make_ghost_button(upscale_row, "Configure",
                                                       self.open_upscale_config)
         self.upscale_config_btn.pack(side="left", padx=(10, 0))
 
-        downscale_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        downscale_row = tk.Frame(body, bg=FRONT_BG)
         downscale_row.pack(fill="x", pady=(0, 12))
         self.downscale_bg_var = tk.BooleanVar(value=False)
         LightCheckbox(downscale_row, "Downscale BG", self.downscale_bg_var,
-                      command=self._on_downscale_toggled).pack(side="left")
+                      command=self._on_downscale_toggled, bg=FRONT_BG).pack(side="left")
         _downscale_info = InfoIcon(
             downscale_row,
             "Make the oversized BG image fit RC dimension",
         )
-        _downscale_info.configure(bg=FRONT_CARD_BG)
+        _downscale_info.configure(bg=FRONT_BG)
         _downscale_info.pack(side="left", padx=(4, 0))
         self._sync_upscale_state()
 
-        tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-        self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
+        self.diff_list = DiffCheckList(body, app, light=True)
         self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
 
-        btn_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        btn_row = tk.Frame(body, bg=FRONT_BG)
         btn_row.pack(fill="x")
         _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
 
@@ -7123,17 +7154,17 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         tk.Label(video_row, text="Video file:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).pack(side="left")
         self.video_var = tk.StringVar()
-        self.video_combo = LightDropdown(video_row, self.video_var, width=30)
+        self.video_combo = LightDropdown(video_row, self.video_var, width=30, page_bg=FRONT_BG)
         self.video_combo.pack(side="left", padx=(10, 0))
         _make_ghost_button(video_row, "Browse...", self.browse_video).pack(side="left", padx=(10, 0))
 
-        self.card = RoundedCard(self.body)
-        self.card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        self.card = RoundedCard(self.body, flat=True)
+        self.card.pack(fill="x", padx=24, pady=(0, 16))
         body = self.card.body
 
         def info(parent, text, **kw):
             icon = InfoIcon(parent, text, **kw)
-            icon.configure(bg=FRONT_CARD_BG)
+            icon.configure(bg=FRONT_BG)
             return icon
 
         # "Current Offset:"/"New Offset:" are independently packed rows,
@@ -7143,34 +7174,34 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         # MetadataManagerFrame's Preview Point misalignment (see CLAUDE.md).
         LABEL_W = len("Current Offset:")
 
-        row2 = tk.Frame(body, bg=FRONT_CARD_BG)
+        row2 = tk.Frame(body, bg=FRONT_BG)
         row2.pack(fill="x", pady=(0, 10))
-        tk.Label(row2, text="Current Offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+        tk.Label(row2, text="Current Offset:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11), width=LABEL_W, anchor="w").pack(side="left")
-        self.current_entry = _make_light_entry(row2, width=10, state="readonly")
+        self.current_entry = _make_light_entry(row2, width=10, state="readonly", bg=FRONT_BG)
         self.current_entry.pack(side="left", padx=(10, 0), ipady=4, ipadx=6)
 
-        row3 = tk.Frame(body, bg=FRONT_CARD_BG)
+        row3 = tk.Frame(body, bg=FRONT_BG)
         row3.pack(fill="x", pady=(0, 12))
-        tk.Label(row3, text="New Offset:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+        tk.Label(row3, text="New Offset:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11), width=LABEL_W, anchor="w").pack(side="left")
         self.offset_var = tk.StringVar(value="0")
-        _make_light_entry(row3, textvariable=self.offset_var, width=10).pack(
+        _make_light_entry(row3, textvariable=self.offset_var, width=10, bg=FRONT_BG).pack(
             side="left", padx=(10, 10), ipady=4, ipadx=6)
         _make_ghost_button(row3, "Preview", self.open_preview).pack(side="left")
 
         self.resizer_var = tk.BooleanVar(value=False)
         self.blur_var = tk.BooleanVar(value=True)
-        resizer_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        resizer_row = tk.Frame(body, bg=FRONT_BG)
         resizer_row.pack(fill="x", anchor="w", pady=(0, 6))
         LightCheckbox(resizer_row, "Taiko Video Resizer", self.resizer_var,
-                      command=lambda: self._sync_video_option_state("resizer")).pack(side="left")
+                      command=lambda: self._sync_video_option_state("resizer"), bg=FRONT_BG).pack(side="left")
         info(resizer_row, "Resize the full size video to fit under the "
                            "taiko playfield.").pack(side="left", padx=(6, 0))
 
-        blur_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        blur_row = tk.Frame(body, bg=FRONT_BG)
         blur_row.pack(fill="x", anchor="w", padx=(24, 0), pady=(0, 10))
-        self.blur_check = LightCheckbox(blur_row, "Blur", self.blur_var)
+        self.blur_check = LightCheckbox(blur_row, "Blur", self.blur_var, bg=FRONT_BG)
         self.blur_check.pack(side="left")
         self.blur_check.set_enabled(False)
         info(blur_row, "Aesthetic blur for video.").pack(side="left", padx=(6, 0))
@@ -7183,18 +7214,16 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         # calibrating video positioning) — Apply computes and writes the
         # SB code directly, see apply().
         self.sb_var = tk.BooleanVar(value=False)
-        sb_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        sb_row = tk.Frame(body, bg=FRONT_BG)
         sb_row.pack(fill="x", anchor="w", pady=(0, 12))
         LightCheckbox(sb_row, "Taiko Video SB Code", self.sb_var,
-                      command=lambda: self._sync_video_option_state("sb")).pack(side="left")
+                      command=lambda: self._sync_video_option_state("sb"), bg=FRONT_BG).pack(side="left")
         info(sb_row, "Commonly used in hybrid mapsets.").pack(side="left", padx=(6, 0))
 
-        tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-        self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
+        self.diff_list = DiffCheckList(body, app, light=True)
         self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
 
-        btn_row = tk.Frame(body, bg=FRONT_CARD_BG)
+        btn_row = tk.Frame(body, bg=FRONT_BG)
         btn_row.pack(fill="x")
         _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
 
@@ -8927,7 +8956,7 @@ class PatternGalleryFrame(BaseToolFrame):
         header_info.pack(side="left", padx=(6, 0))
 
         # ---- Library card: name/capture controls + the card gallery -------
-        self.card1 = RoundedCard(self.body)
+        self.card1 = RoundedCard(self.body, flat=True)
         self.card1.pack(fill="x", padx=24, pady=(0, 12))
         body1 = self.card1.body
 
@@ -8940,26 +8969,26 @@ class PatternGalleryFrame(BaseToolFrame):
         # — no need for fill/expand to guarantee that here, so the field
         # can stay a normal, un-stretched size instead of ballooning to
         # fill whatever room a wide window leaves over.
-        name_row = tk.Frame(body1, bg=FRONT_CARD_BG)
+        name_row = tk.Frame(body1, bg=FRONT_BG)
         name_row.pack(fill="x", pady=(0, 12))
-        tk.Label(name_row, text="Pattern name:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+        tk.Label(name_row, text="Pattern name:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).pack(side="left")
         self.name_var = tk.StringVar()
-        self.name_entry = _make_light_entry(name_row, textvariable=self.name_var, width=20)
+        self.name_entry = _make_light_entry(name_row, textvariable=self.name_var, width=20, bg=FRONT_BG)
         self.name_entry.pack(side="left", padx=(10, 0), ipady=4, ipadx=6)
 
-        capture_row = tk.Frame(body1, bg=FRONT_CARD_BG)
+        capture_row = tk.Frame(body1, bg=FRONT_BG)
         capture_row.pack(fill="x", pady=(0, 16))
         _make_ghost_button(capture_row, "Capture from osu!", self.capture).pack(side="left")
         capture_info = InfoIcon(capture_row, "To capture pattern from osu!, copy it and "
                                               "save the map. Then click the button to "
                                               "import pattern to your gallery")
-        capture_info.configure(bg=FRONT_CARD_BG)
+        capture_info.configure(bg=FRONT_BG)
         capture_info.pack(side="left", padx=(8, 0))
         _make_ghost_button(capture_row, "Manually Add Pattern",
                             self.open_manual_pattern_editor).pack(side="left", padx=(15, 0))
 
-        gallery_frame = tk.Frame(body1, bg=FRONT_CARD_BG)
+        gallery_frame = tk.Frame(body1, bg=FRONT_BG)
         gallery_frame.pack(fill="x")
         # takefocus=0 + explicit highlightcolor: a plain click anywhere in
         # this canvas (even on an embedded PatternCard) gives it keyboard
@@ -8972,11 +9001,11 @@ class PatternGalleryFrame(BaseToolFrame):
         # highlightcolor to highlightbackground makes focused/unfocused
         # render identically; takefocus=0 additionally stops this canvas
         # from taking focus at all, since it has no keyboard interaction.
-        self.gallery_canvas = tk.Canvas(gallery_frame, height=140, bg=FRONT_CARD_BG,
+        self.gallery_canvas = tk.Canvas(gallery_frame, height=140, bg=FRONT_BG,
                                          highlightthickness=1, highlightbackground=FRONT_BORDER,
                                          highlightcolor=FRONT_BORDER, takefocus=0)
         self.gallery_canvas.pack(side="top", fill="x")
-        gallery_scroll = ttk.Scrollbar(gallery_frame, orient="horizontal", command=self.gallery_canvas.xview)
+        gallery_scroll = AutoHideScrollbar(gallery_frame, orient="horizontal", command=self.gallery_canvas.xview, target=self.gallery_canvas)
         gallery_scroll.pack(side="top", fill="x")
         self.gallery_canvas.configure(xscrollcommand=gallery_scroll.set)
         self.gallery_canvas.bind("<MouseWheel>", self._on_gallery_scroll)
@@ -8987,7 +9016,7 @@ class PatternGalleryFrame(BaseToolFrame):
         # bare background can be under the press.
         self.gallery_canvas.bind("<Button-1>", self.begin_bg_drag)
 
-        self.gallery_inner = tk.Frame(self.gallery_canvas, bg=FRONT_CARD_BG)
+        self.gallery_inner = tk.Frame(self.gallery_canvas, bg=FRONT_BG)
         self.gallery_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
         self.gallery_inner.bind(
             "<Configure>",
@@ -9024,7 +9053,7 @@ class PatternGalleryFrame(BaseToolFrame):
         # A red multi-delete button that only appears once 2+ cards are
         # selected (see _update_bulk_delete_button) — deleting a single
         # card instead uses the little badge in its own top-right corner.
-        self.bulk_delete_row = tk.Frame(body1, bg=FRONT_CARD_BG)
+        self.bulk_delete_row = tk.Frame(body1, bg=FRONT_BG)
         self.bulk_delete_row.pack(fill="x", pady=(8, 0))
         self.bulk_delete_btn = tk.Button(
             self.bulk_delete_row, bg="#d32f2f", fg="white", relief="flat",
@@ -9039,39 +9068,37 @@ class PatternGalleryFrame(BaseToolFrame):
         self.body.bind("<Button-1>", lambda _e: self.deselect_all())
 
         # ---- Insert-into-map card ------------------------------------------
-        self.card2 = RoundedCard(self.body)
-        self.card2.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        self.card2 = RoundedCard(self.body, flat=True)
+        self.card2.pack(fill="x", padx=24, pady=(0, 20))
         body2 = self.card2.body
 
-        insert_header = tk.Frame(body2, bg=FRONT_CARD_BG)
+        insert_header = tk.Frame(body2, bg=FRONT_BG)
         insert_header.pack(fill="x", pady=(0, 14))
-        tk.Label(insert_header, text="Insert into map", bg=FRONT_CARD_BG, fg=LIGHT_ACCENT,
+        tk.Label(insert_header, text="Insert into map", bg=FRONT_BG, fg=LIGHT_ACCENT,
                  font=("Segoe UI", 13, "bold")).pack(side="left")
         insert_info = InfoIcon(insert_header, "Append your pattern in your gallery to a map.")
-        insert_info.configure(bg=FRONT_CARD_BG)
+        insert_info.configure(bg=FRONT_BG)
         insert_info.pack(side="left", padx=(6, 0))
 
-        target_row = tk.Frame(body2, bg=FRONT_CARD_BG)
+        target_row = tk.Frame(body2, bg=FRONT_BG)
         target_row.pack(fill="x", anchor="w", pady=(0, 10))
-        tk.Label(target_row, text="Target time:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+        tk.Label(target_row, text="Target time:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).pack(side="left")
         vcmd_time = (self.register(_validate_partial_time), "%P")
         self.target_time_var = tk.StringVar()
         self.target_time_entry = _make_light_entry(
             target_row, textvariable=self.target_time_var, width=15,
-            validate="key", validatecommand=vcmd_time)
+            validate="key", validatecommand=vcmd_time, bg=FRONT_BG)
         self.target_time_entry.pack(side="left", padx=(10, 0), ipady=4, ipadx=6)
         self.target_time_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.target_time_var))
         target_info = InfoIcon(target_row, "This field is auto-filled after copying a timestamp.")
-        target_info.configure(bg=FRONT_CARD_BG)
+        target_info.configure(bg=FRONT_BG)
         target_info.pack(side="left", padx=(6, 0))
 
-        tk.Label(body2, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-        self.diff_list = DiffRadioList(body2, app, light=True, label_inside=False)
+        self.diff_list = DiffRadioList(body2, app, light=True)
         self.diff_list.pack(fill="both", expand=False, pady=(0, 16))
 
-        btn_row = tk.Frame(body2, bg=FRONT_CARD_BG)
+        btn_row = tk.Frame(body2, bg=FRONT_BG)
         btn_row.pack(fill="x")
         _make_accent_button(btn_row, "Insert Selected Pattern", self.insert_selected).pack(side="right")
 
@@ -9787,7 +9814,7 @@ class FileNameCheckerFrame(BaseToolFrame):
 
         header_row = tk.Frame(self.body, bg=FRONT_BG)
         header_row.pack(fill="x", padx=24, pady=(20, 4))
-        tk.Label(header_row, text="File Name Checker", bg=FRONT_BG, fg=FRONT_TEXT,
+        tk.Label(header_row, text="Filename Checker", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 20, "bold")).pack(side="left")
         header_info = InfoIcon(header_row,
                                 "Check and rename the mismatched capitalisation in file "
@@ -9800,28 +9827,26 @@ class FileNameCheckerFrame(BaseToolFrame):
                  bg=FRONT_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 11),
                  justify="left").pack(anchor="w", padx=24, pady=(4, 16))
 
-        self.card = RoundedCard(self.body)
-        self.card.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        self.card = RoundedCard(self.body, flat=True)
+        self.card.pack(fill="x", padx=24, pady=(0, 20))
         body = self.card.body
 
-        tk.Label(body, text="Apply to:", bg=FRONT_CARD_BG, fg=FRONT_TEXT,
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
-        self.diff_list = DiffCheckList(body, app, light=True, label_inside=False)
+        self.diff_list = DiffCheckList(body, app, light=True)
         self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
 
         # "word" wrap can't break a single unbroken "word" — and a file
         # name here often has no spaces (underscores instead), so a long
         # one would just run past the widget's right edge instead of
         # wrapping. "char" guarantees a wrap point regardless.
-        result_frame = tk.Frame(body, bg=FRONT_CARD_BG, highlightthickness=1,
+        result_frame = tk.Frame(body, bg=FRONT_BG, highlightthickness=1,
                                  highlightbackground=FRONT_BORDER, highlightcolor=FRONT_BORDER)
         result_frame.pack(fill="both", expand=False, pady=(0, 16))
         self.result_text = tk.Text(result_frame, height=10, wrap="char", font=("Segoe UI", 11),
-                                    relief="flat", bd=0, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+                                    relief="flat", bd=0, bg=FRONT_BG, fg=FRONT_TEXT,
                                     insertbackground=FRONT_TEXT, padx=10, pady=8)
         self.result_text.pack(fill="both", expand=True)
 
-        btns = tk.Frame(body, bg=FRONT_CARD_BG)
+        btns = tk.Frame(body, bg=FRONT_BG)
         btns.pack(fill="x")
         _make_accent_button(btns, "Rename", self.apply).pack(side="right")
         _make_ghost_button(btns, "Check", self.check).pack(side="right", padx=(0, 8))
@@ -9865,14 +9890,25 @@ class FileNameCheckerFrame(BaseToolFrame):
 
 # =============================================================================
 class EarlyVolumeSettingFrame(BaseToolFrame):
-    def __init__(self, master, app):
+    def __init__(self, master, app, *, include_copy=False):
         super().__init__(master, app)
         _style_light_body(self)
+
+        self.volume_section = None
+        if include_copy:
+            tk.Label(self.body, text="Volume Editor", bg=FRONT_BG, fg=FRONT_TEXT,
+                     font=("Segoe UI", 20, "bold")).pack(anchor="w", padx=24, pady=(20, 4))
+            self.volume_section = CopySection(
+                self.body, self, "Copy Volume", "Copy volume from:", logic.copy_volumes, "Volume",
+                info_text="Copy the volume changes of a difficulty and apply them "
+                           "to any difficulties in the set.",
+                light=True)
+            self.volume_section.pack(fill="x", padx=24, pady=(10, 4))
 
         header_row = tk.Frame(self.body, bg=FRONT_BG)
         header_row.pack(fill="x", padx=24, pady=(20, 4))
         tk.Label(header_row, text="Early Volume Settings", bg=FRONT_BG, fg=FRONT_TEXT,
-                 font=("Segoe UI", 20, "bold")).pack(side="left")
+                 font=("Segoe UI", 13 if include_copy else 20, "bold")).pack(side="left")
         header_info = InfoIcon(header_row,
                                 "Shift the volume lines backward to keep hitsounds "
                                 "synchronized when players hit notes too early.")
@@ -9886,7 +9922,7 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         tk.Label(diff_row, text="Selected diff:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).pack(side="left")
         self.diff_var = tk.StringVar()
-        self.diff_combo = LightDropdown(diff_row, self.diff_var, width=25)
+        self.diff_combo = LightDropdown(diff_row, self.diff_var, width=25, page_bg=FRONT_BG)
         self.diff_combo.pack(side="left", padx=(10, 0))
         self.diff_map = {}
 
@@ -9904,22 +9940,22 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
                     self.section_only_var, self.from_var, self.to_var):
             var.trace_add("write", self._persist_settings)
 
-        card = RoundedCard(self.body)
-        card.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        card = RoundedCard(self.body, flat=True)
+        card.pack(fill="x", padx=24, pady=(0, 16))
         opts = card.body
 
         def info(parent, text, **kw):
             icon = InfoIcon(parent, text, **kw)
-            icon.configure(bg=FRONT_CARD_BG)
+            icon.configure(bg=FRONT_BG)
             return icon
 
         def row(indent=0, pady=6):
-            r = tk.Frame(opts, bg=FRONT_CARD_BG)
+            r = tk.Frame(opts, bg=FRONT_BG)
             r.pack(fill="x", anchor="w", padx=(indent, 0), pady=pady)
             return r
 
         def label(parent, text, **kw):
-            defaults = dict(bg=FRONT_CARD_BG, fg=FRONT_TEXT, font=("Segoe UI", 11))
+            defaults = dict(bg=FRONT_BG, fg=FRONT_TEXT, font=("Segoe UI", 11))
             defaults.update(kw)
             return tk.Label(parent, text=text, **defaults)
 
@@ -9933,21 +9969,21 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         r1 = row()
         label(r1, "Volume change threshold", width=THRESHOLD_LABEL_W, anchor="w").pack(side="left")
         LightDropdown(r1, self.volume_threshold_var, values=logic.VOLUME_THRESHOLD_CHOICES,
-                      width=6, page_bg=FRONT_CARD_BG).pack(side="left", padx=8)
+                      width=6, page_bg=FRONT_BG).pack(side="left", padx=8)
         info(r1, "Sets the minimum volume change required to move a "
                  "volume line backward.").pack(side="left")
 
         r2 = row()
         label(r2, "Early volume threshold", width=THRESHOLD_LABEL_W, anchor="w").pack(side="left")
         LightDropdown(r2, self.early_threshold_var, values=logic.EARLY_THRESHOLD_CHOICES,
-                      width=6, page_bg=FRONT_CARD_BG).pack(side="left", padx=8)
+                      width=6, page_bg=FRONT_BG).pack(side="left", padx=8)
         info(r2, "Sets how far a volume line is shifted backward "
                  "relative to the note.").pack(side="left")
 
         r3 = row(pady=(14, 6))
         self.section_only_cb = LightCheckbox(
             r3, "Apply to this section only", self.section_only_var,
-            command=self._sync_section_state)
+            command=self._sync_section_state, bg=FRONT_BG)
         self.section_only_cb.pack(side="left")
 
         r4 = row(indent=24)
@@ -9955,18 +9991,18 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         self.from_label.pack(side="left")
         self.from_entry = _make_light_entry(
             r4, textvariable=self.from_var, width=15,
-            validate="key", validatecommand=vcmd_time, state="disabled")
+            validate="key", validatecommand=vcmd_time, state="disabled", bg=FRONT_BG)
         self.from_entry.pack(side="left", padx=5, ipady=4)
         self.from_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.from_var))
         self.to_label = label(r4, "to", fg=FRONT_TEXT_MUTED)
         self.to_label.pack(side="left")
         self.to_entry = _make_light_entry(
             r4, textvariable=self.to_var, width=15,
-            validate="key", validatecommand=vcmd_time, state="disabled")
+            validate="key", validatecommand=vcmd_time, state="disabled", bg=FRONT_BG)
         self.to_entry.pack(side="left", padx=5, ipady=4)
         self.to_entry.bind("<<Paste>>", lambda e: _paste_time_field(self, self.to_var))
 
-        btn_row = tk.Frame(opts, bg=FRONT_CARD_BG)
+        btn_row = tk.Frame(opts, bg=FRONT_BG)
         btn_row.pack(fill="x", pady=(8, 0))
         _make_accent_button(btn_row, "Apply", self.apply).pack(side="right")
 
@@ -9983,6 +10019,8 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
         self.refresh(sync_to_current=True)
 
     def refresh(self, sync_to_current=False):
+        if self.volume_section is not None:
+            self.volume_section.refresh()
         folder, diffs = self.app.get_diff_files()
         self.diff_map = osu_parser.get_diff_display_map(folder, diffs) if folder else {}
         labels = sorted(self.diff_map.keys(), key=osu_parser.taiko_diff_sort_key)
@@ -10048,3 +10086,10 @@ class EarlyVolumeSettingFrame(BaseToolFrame):
 
         logic.apply_early_volume_setting(folder, targets, volume_threshold, early_threshold, section)
         self.notify_done("Early volume setting applied.")
+
+
+class VolumeEditorFrame(EarlyVolumeSettingFrame):
+    """Volume copying and early-volume adjustments in one scrollable tool."""
+
+    def __init__(self, master, app):
+        super().__init__(master, app, include_copy=True)

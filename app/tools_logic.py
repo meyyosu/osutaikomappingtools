@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from contextlib import contextmanager
 import uuid
 import urllib.error
 import urllib.request
@@ -34,9 +36,73 @@ from osu_parser import (
 _SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+_job_progress = threading.local()
+
+
+@contextmanager
+def progress_reporting(callback):
+    """Route measurable stage progress to this worker's UI-independent sink."""
+    previous = getattr(_job_progress, "callback", None)
+    _job_progress.callback = callback
+    try:
+        yield
+    finally:
+        _job_progress.callback = previous
+
+
+def report_job_progress(fraction):
+    """Report a stage's fraction, or None while its progress is unknown."""
+    callback = getattr(_job_progress, "callback", None)
+    if callback is not None:
+        callback(None if fraction is None else max(0.0, min(0.99, fraction)))
+
+
 def _run_ffmpeg(cmd: List[str], timeout: int = 600):
-    subprocess.run(cmd, check=True, capture_output=True, timeout=timeout,
-                    creationflags=_SUBPROCESS_FLAGS)
+    if getattr(_job_progress, "callback", None) is None:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=timeout,
+                       creationflags=_SUBPROCESS_FLAGS)
+        return
+    duration = None
+    if "-t" in cmd:
+        try:
+            duration = float(cmd[cmd.index("-t") + 1])
+        except ValueError:
+            pass
+    elif "-i" in cmd:
+        source = cmd[cmd.index("-i") + 1]
+        if os.path.isfile(source) and "concat" not in cmd:
+            duration = probe_media_duration_seconds(source)
+    report_job_progress(0.0 if duration else None)
+    progress_cmd = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
+    # Keep diagnostics off the progress pipe, without risking a full stderr
+    # pipe blocking the encoder. The timer preserves the existing timeout.
+    with tempfile.TemporaryFile() as errors:
+        with subprocess.Popen(progress_cmd, stdout=subprocess.PIPE, stderr=errors,
+                              creationflags=_SUBPROCESS_FLAGS) as proc:
+            expired = threading.Event()
+            def kill_on_timeout():
+                expired.set()
+                proc.kill()
+            timer = threading.Timer(timeout, kill_on_timeout)
+            timer.daemon = True
+            timer.start()
+            try:
+                for line in proc.stdout:
+                    if duration and line.startswith(b"out_time_us="):
+                        try:
+                            report_job_progress(int(line.split(b"=", 1)[1]) / (duration * 1_000_000))
+                        except ValueError:
+                            pass
+                proc.wait()
+            finally:
+                timer.cancel()
+                report_job_progress(None)
+            errors.seek(0)
+            detail = errors.read()
+            if expired.is_set():
+                raise subprocess.TimeoutExpired(cmd, timeout, stderr=detail)
+            if proc.returncode:
+                raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=detail)
 
 
 # =============================================================================
@@ -65,6 +131,47 @@ def _resolve_binary(name: str) -> str:
     exe_name = f"{name}.exe" if os.name == "nt" else name
     local = os.path.join(_bundled_dir(), exe_name)
     return local if os.path.isfile(local) else name
+
+
+def bass_available() -> bool:
+    from bass_audio import available
+    return available()
+
+
+def install_bass_bundled() -> str:
+    """Install matching-architecture BASS libraries and their original notices."""
+    import struct
+    if os.name != "nt":
+        raise RuntimeError("BASS playback is currently supported on Windows")
+    if bass_available():
+        from bass_audio import library_directory
+        return str(library_directory())
+    dest = os.path.join(_bundled_dir(), "bass")
+    os.makedirs(dest, exist_ok=True)
+    prefix = "x64/" if struct.calcsize("P") == 8 else ""
+    for name, url in (
+        ("bass", "https://www.un4seen.com/files/bass24.zip"),
+        ("bassmix", "https://www.un4seen.com/files/bassmix24.zip"),
+        ("bass_fx", "https://www.un4seen.com/files/z/0/bass_fx24.zip"),
+    ):
+        fd, archive_path = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        try:
+            _download_to_file(url, archive_path, timeout=60)
+            with zipfile.ZipFile(archive_path) as archive:
+                entries = {entry.lower(): entry for entry in archive.namelist()}
+                for entry, output in ((prefix + name + ".dll", name + ".dll"),
+                                      (name + ".txt", name + ".txt")):
+                    if entry not in entries:
+                        raise RuntimeError(f"Official BASS package is missing {entry}")
+                    # Only these explicit filenames are extracted, never ZIP paths.
+                    with open(os.path.join(dest, output), "wb") as target:
+                        target.write(archive.read(entries[entry]))
+        finally:
+            os.unlink(archive_path)
+    if not bass_available():
+        raise RuntimeError("BASS was downloaded but its audio libraries could not be loaded")
+    return dest
 
 
 def _binary_available(name: str) -> bool:
@@ -149,7 +256,18 @@ def _download_to_file(url: str, dest_path: str, timeout: int = 60, max_hops: int
                 continue
             with open(dest_path, "wb") as f:
                 f.write(first)
-                shutil.copyfileobj(resp, f)
+                try:
+                    total = int(resp.headers.get("Content-Length", "0"))
+                except (TypeError, ValueError):
+                    total = 0
+                downloaded = len(first)
+                report_job_progress(downloaded / total if total > 0 else None)
+                while chunk := resp.read(1 << 16):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        report_job_progress(downloaded / total)
+            report_job_progress(None)
             return
     raise RuntimeError(f"Too many redirect hops downloading {url}.")
 
@@ -284,18 +402,9 @@ def install_ffmpeg_suite_bundled(need_ffmpeg: bool = True, need_ffprobe: bool = 
 # =============================================================================
 # VLC (video offset live preview)
 #
-# python-vlc's own find_lib() (see the installed vlc.py) resolves libvlc
-# purely at `import vlc` time, via — in order — the PYTHON_VLC_LIB_PATH /
-# PYTHON_VLC_MODULE_PATH env vars, PATH, the `Software\VideoLAN\VLC`
-# registry key (which is why a normal *system* VLC install just works
-# with zero effort from this app — no copying needed, unlike ffmpeg),
-# and a couple of hardcoded Program Files paths. Crucially, unlike
-# ffmpeg's simple "resolve an absolute path per subprocess call", it
-# never looks next to this app's own exe — so bundling a copy there only
-# actually gets used if PYTHON_VLC_LIB_PATH/PYTHON_VLC_MODULE_PATH are
-# pointed at it *before* `import vlc` ever runs anywhere in the process
-# (`configure_bundled_vlc_env`, confirmed working end-to-end against a
-# real downloaded+extracted portable build during development).
+# Resolve Windows DLLs explicitly before importing python-vlc. Its registry
+# fallback changes cwd and relies on the process DLL search path, which is
+# unreliable in frozen builds and with newer Python versions.
 # =============================================================================
 VLC_MANUAL_DOWNLOAD_URL = "https://www.videolan.org/vlc/"
 
@@ -373,42 +482,97 @@ def _download_and_extract_vlc_zip(dest_dir: str):
             os.remove(tmp_zip)
 
 
+# Keep DLL directory cookies and loaded libraries alive for delayed plugin loads.
+_vlc_dll_handles = {}
+
+
+def _vlc_install_dirs():
+    """Bundled, registered (both registry views), standard and PATH installs."""
+    yield _bundled_dir()
+    if getattr(sys, "_MEIPASS", None):
+        yield sys._MEIPASS
+    try:
+        import winreg
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(hive, r"Software\VideoLAN\VLC", 0,
+                                        winreg.KEY_READ | view) as key:
+                        yield winreg.QueryValueEx(key, "InstallDir")[0]
+                except OSError:
+                    pass
+    except ImportError:
+        pass
+    for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(name)
+        if base:
+            yield os.path.join(base, "VideoLAN", "VLC")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        yield os.path.join(local, "Programs", "VideoLAN", "VLC")
+    for name in ("vlc.exe", "libvlc.dll"):
+        path = shutil.which(name)
+        if path:
+            yield os.path.dirname(path)
+
+
 def configure_bundled_vlc_env():
-    """If a bundled libvlc.dll is sitting next to this app (see
-    `_bundled_dir` / `install_vlc_bundled`), points python-vlc's own
-    env-var override (PYTHON_VLC_LIB_PATH / PYTHON_VLC_MODULE_PATH) at it
-    so the *next* `import vlc` anywhere in the process picks it up
-    instead of depending on a system-wide install. Must run before that
-    first import — python-vlc's find_lib() only reads these vars at
-    import time, and Python only ever executes a module's top-level code
-    once. `setdefault` so an explicitly user-set env var (the whole point
-    of python-vlc providing this override in the first place) always
-    wins over this. No-op if nothing's bundled — safe to call
-    unconditionally on every check."""
+    """Prepare a usable Windows VLC installation before python-vlc imports.
+
+    Explicit PYTHON_VLC_* overrides take precedence. Try the next installation
+    if a bundled copy is incomplete or has the wrong architecture. Never change
+    cwd: background jobs may be using relative paths at the same time.
+    """
     if os.name != "nt":
         return
-    d = _bundled_dir()
-    dll = os.path.join(d, "libvlc.dll")
-    plugins = os.path.join(d, "plugins")
-    if os.path.isfile(dll):
+    import ctypes
+
+    explicit = os.environ.get("PYTHON_VLC_LIB_PATH")
+    candidates = (os.path.dirname(os.path.abspath(explicit)),) if explicit else _vlc_install_dirs()
+    seen = set()
+    for directory in candidates:
+        directory = os.path.abspath(directory)
+        if os.path.normcase(directory) in seen:
+            continue
+        seen.add(os.path.normcase(directory))
+        dll = explicit or os.path.join(directory, "libvlc.dll")
+        plugins = os.path.join(directory, "plugins")
+        if not os.path.isfile(dll):
+            continue
+        if not explicit and not os.path.isdir(plugins):
+            continue
+        if directory not in _vlc_dll_handles:
+            cookie = None
+            try:
+                if hasattr(os, "add_dll_directory"):
+                    cookie = os.add_dll_directory(directory)
+                # libvlc depends on libvlccore, which must be resolvable even
+                # when PyInstaller has installed its own DLL search directory.
+                core = ctypes.CDLL(os.path.join(directory, "libvlccore.dll"))
+                library = ctypes.CDLL(dll)
+            except OSError:
+                if cookie is not None:
+                    cookie.close()
+                continue
+            _vlc_dll_handles[directory] = (cookie, core, library)
         os.environ.setdefault("PYTHON_VLC_LIB_PATH", dll)
         if os.path.isdir(plugins):
             os.environ.setdefault("PYTHON_VLC_MODULE_PATH", plugins)
+        return
 
 
 def vlc_available() -> bool:
-    """Best-effort check for whether the video preview's VLC backend can
-    actually be loaded: a bundled copy next to the app, or whatever
-    python-vlc's own find_lib() can locate on its own (PATH / registry /
-    standard install paths). This performs the actual `import vlc` as
-    part of checking (there's no cheaper way to ask python-vlc "would
-    this work" without it) — safe to call repeatedly; Python only
-    re-executes the module's top-level code (and thus find_lib()) again
-    if a prior attempt failed, since a failed import isn't cached."""
-    configure_bundled_vlc_env()
+    """Check the binding, native DLLs and plugins needed by both playback UIs."""
     try:
-        import vlc  # noqa: F401
-    except Exception:
+        configure_bundled_vlc_env()
+        import vlc
+        instance = vlc.Instance() if os.name == "nt" else vlc.Instance("--no-xlib")
+        if instance is None:
+            return False
+        instance.release()
+    except (Exception, SystemExit):
+        # python-vlc calls sys.exit() for invalid explicit DLL/plugin overrides.
+        # An optional playback dependency must never terminate the whole app.
         return False
     return True
 
@@ -3467,7 +3631,7 @@ def capture_pattern_from_osu_selection(name: str, clipboard_text: str, songs_fol
     if reader is None:
         raise ValueError(
             "Couldn't connect to a running osu! stable client. Make sure osu! "
-            "is open (Windows only, and the pymem package must be installed)."
+            "stable is open and accessible (Windows only)."
         )
     try:
         result = osu_memory.resolve_folder_and_filename(reader)

@@ -4,8 +4,8 @@
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('icon.png', '.'), ('tick1.wav', '.'), ('tick2.wav', '.')],
+    binaries=[('bass\\bass.dll', 'bass'), ('bass\\bassmix.dll', 'bass'), ('bass\\bass_fx.dll', 'bass')],
+    datas=[('icon.png', '.'), ('tick1.wav', '.'), ('tick2.wav', '.'), ('bass\\bass.txt', 'bass'), ('bass\\bassmix.txt', 'bass'), ('bass\\bass_fx.txt', 'bass')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

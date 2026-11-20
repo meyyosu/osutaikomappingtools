@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog
@@ -23,6 +24,7 @@ from tkinter import font as tkfont
 
 import osu_parser
 import tools_logic as logic
+from scrollbars import AutoHideScrollbar as _SidebarScrollbar
 
 
 def _relaunch_process():
@@ -59,7 +61,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.17"
+APP_VERSION = "1.18"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -157,6 +159,12 @@ def _download_update_asset(url: str, dest_path: str, cancel_event, timeout: int 
 
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        try:
+            total = int(resp.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            total = 0
+        downloaded = 0
+        logic.report_job_progress(0.0 if total > 0 else None)
         with open(dest_path, "wb") as f:
             while True:
                 if cancel_event is not None and cancel_event.is_set():
@@ -165,6 +173,10 @@ def _download_update_asset(url: str, dest_path: str, cancel_event, timeout: int 
                 if not chunk:
                     break
                 f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    logic.report_job_progress(downloaded / total)
+        logic.report_job_progress(None)
 
 
 def download_and_apply_update(asset_url: str, expected_size=None, timeout: int = 300,
@@ -425,18 +437,14 @@ def _add_tooltip(widget, text, align: str = "left"):
     widget.bind("<Destroy>", hide)
 
 
-SIDEBAR_ITEMS = [
-    "Metadata Manager",
-    "Volume/Kiai Copier",
-    "Map Cleaner",
-    "Audio/Offset Settings",
-    "Timing Editor",
-    "BG Settings",
-    "Video Settings",
-    "Early Volume Settings",
-    "Pattern Gallery",
-    "File Name Checker",
+SIDEBAR_CATEGORIES = [
+    ("Mapset", ("Metadata Manager", "Filename Checker", "Map Cleaner")),
+    ("Timing & Effects", ("Timing Editor", "Kiai Editor", "Volume Editor",
+                          "Audio/Offset Settings")),
+    ("Objects", ("Pattern Gallery",)),
+    ("Assets", ("Background Settings", "Video Settings")),
 ]
+SIDEBAR_ITEMS = [item for _, items in SIDEBAR_CATEGORIES for item in items]
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_config.txt")
 SONG_INDEX_MODE_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".osu_taiko_helper_indexmode.txt")
@@ -989,7 +997,7 @@ class App(tk.Tk):
         state (e.g. re-enabling a button that was disabled/relabeled
         "Installing..." for the duration)."""
         cancel_event = threading.Event()
-        state = {"cancelled": False}
+        state = {"cancelled": False, "progress": None}
 
         def handle_cancel_click():
             if state["cancelled"]:
@@ -1003,18 +1011,30 @@ class App(tk.Tk):
                 on_cancel()
 
         self.set_busy(True, busy_msg, on_cancel=handle_cancel_click)
+        progress_win = self._busy_win
+        if self._busy_depth == 1 and progress_win is not None:
+            progress_win._busy_progress_state = state
+
+        def report_progress(fraction):
+            if not state["cancelled"]:
+                state["progress"] = fraction
 
         def worker():
             result = None
             err_msg = None
             try:
-                result = work_fn(cancel_event)
+                with logic.progress_reporting(report_progress):
+                    result = work_fn(cancel_event)
             except Exception as e:
                 err_msg = str(e)
 
             def finish():
                 if state["cancelled"]:
                     return
+                if (err_msg is None and self._busy_depth == 1 and
+                        self._busy_win is progress_win and progress_win is not None):
+                    state["progress"] = 1.0
+                    progress_win._busy_render_progress()
                 self.set_busy(False)
                 if err_msg is not None:
                     if on_error is not None:
@@ -1027,20 +1047,94 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_busy_overlay(self, message: str, on_cancel=None):
+        from screens import FRONT_BG, _draw_rounded_rect, _notification_icon_image
+        from PIL import ImageTk
+
         existing = self._busy_win
         if existing is not None and existing.winfo_exists():
-            return
+            if not getattr(existing, "_busy_hiding", False):
+                return
+            existing.destroy()
         win = tk.Toplevel(self)
+        win.withdraw()
         win.overrideredirect(True)
         win.attributes("-alpha", 0.0)
-        bg = "#ffc107"
-        win.configure(bg=bg)
-        row = tk.Frame(win, bg=bg)
-        row.pack(fill="x")
-        tk.Label(row, text=message, bg=bg, fg="#000000",
-                 font=("Segoe UI", 14, "bold")).pack(side="left", expand=True, pady=8, padx=(12, 0))
+        transparent = "#ff00ff" if sys.platform == "win32" else FRONT_BG
+        win.configure(bg=transparent)
+        if sys.platform == "win32":
+            win.attributes("-transparentcolor", transparent)
+        bg, border, fg = "#fff8e6", "#ead496", "#44351a"
+        self.update_idletasks()
+        win._busy_font = font = tkfont.Font(win, family="Segoe UI", size=11)
+        action_width = 82 if on_cancel is not None else 0
+        width = min(max(280, font.measure(message) + 72 + action_width),
+                    max(180, min(760, self.winfo_width() - 32)))
+        canvas = tk.Canvas(win, width=width, height=46, bg=transparent,
+                           highlightthickness=0, bd=0)
+        canvas.pack()
+        text = canvas.create_text(54, 23, text=message, anchor="w", fill=fg,
+                                  font=font, width=width - 72 - action_width, justify="left")
+        bbox = canvas.bbox(text)
+        height = max(46, bbox[3] - bbox[1] + 24)
+        canvas.configure(height=height)
+        canvas.coords(text, 54, height / 2)
+        card = _draw_rounded_rect(canvas, 1, 1, width - 1, height - 1, 12,
+                                  fill=bg, outline=border, width=1)
+        canvas.tag_lower(card)
+        cy = height / 2
+        spinner = canvas.create_image(30, cy)
         if on_cancel is not None:
-            ttk.Button(row, text="Cancel", command=on_cancel).pack(side="right", padx=12, pady=6)
+            button = _draw_rounded_rect(canvas, width - 80, cy - 14, width - 12, cy + 14, 8,
+                                        fill="#f5eaca", outline="", tags="cancel")
+            canvas.create_text(width - 46, cy, text="Cancel", fill=fg,
+                               font=("Segoe UI", 10), tags="cancel")
+            def hover_cancel(hover):
+                canvas.itemconfigure(button, fill="#eee0b4" if hover else "#f5eaca")
+                canvas.configure(cursor="hand2" if hover else "")
+            canvas.tag_bind("cancel", "<Enter>", lambda _e: hover_cancel(True))
+            canvas.tag_bind("cancel", "<Leave>", lambda _e: hover_cancel(False))
+            canvas.tag_bind("cancel", "<Button-1>", lambda _e: on_cancel())
+
+        win._busy_slide = 8
+        win._busy_hiding = False
+        win._busy_fade_job = None
+        win._busy_spin_job = None
+        win._busy_progress_state = {"progress": None}
+        win._busy_icon_key = None
+
+        def spin(angle=90):
+            progress = win._busy_progress_state["progress"]
+            if self._busy_depth > 1:
+                progress = None
+            key = (progress, angle if progress is None else None)
+            if key != win._busy_icon_key:
+                win._busy_icon_image = ImageTk.PhotoImage(
+                    _notification_icon_image(bg, "#bd8b20", "progress", progress, angle), master=win)
+                canvas.itemconfigure(spinner, image=win._busy_icon_image)
+                win._busy_icon_key = key
+        win._busy_render_progress = spin
+
+        def tick(angle=90):
+            spin(angle)
+            win._busy_spin_job = win.after(40, lambda: tick((angle - 16) % 360))
+
+        def cleanup(event):
+            if event.widget is not win:
+                return
+            for job in (win._busy_fade_job, win._busy_spin_job):
+                if job is not None:
+                    win.after_cancel(job)
+            if self._busy_win is win:
+                for event_name, attr in (("<Configure>", "_busy_configure_binding"),
+                                         ("<Button-1>", "_busy_click_binding"),
+                                         ("<FocusIn>", "_busy_focusin_binding")):
+                    binding = getattr(self, attr)
+                    if binding is not None:
+                        self.unbind(event_name, binding)
+                        setattr(self, attr, None)
+                self._busy_win = None
+
+        win.bind("<Destroy>", cleanup)
         self._busy_win = win
         self._position_busy_overlay()
         self._busy_configure_binding = self.bind(
@@ -1059,9 +1153,11 @@ class App(tk.Tk):
         # needing `-topmost` (still scoped to just this app, so it can't
         # float above some other app the user has since switched to).
         win.transient(self)
+        win.deiconify()
         win.lift()
         self._busy_click_binding = self.bind("<Button-1>", lambda e: win.lift(), add="+")
         self._busy_focusin_binding = self.bind("<FocusIn>", lambda e: win.lift(), add="+")
+        tick()
         self._fade_busy_overlay(0, 15, reverse=False)
 
     def _position_busy_overlay(self):
@@ -1069,36 +1165,41 @@ class App(tk.Tk):
         if win is None or not win.winfo_exists():
             return
         self.update_idletasks()
-        px, py, pw = self.winfo_x(), self.winfo_y(), self.winfo_width()
+        px, py, pw = self.winfo_rootx(), self.winfo_rooty(), self.winfo_width()
         win.update_idletasks()
-        wh = win.winfo_reqheight()
-        win.geometry(f"{pw}x{wh}+{px}+{py}")
+        ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = px + max(0, (pw - ww) // 2)
+        y = py + 40 + win._busy_slide
+        win.geometry(f"{ww}x{wh}+{x}+{y}")
 
     def _fade_busy_overlay(self, step: int, steps: int, reverse: bool):
         win = self._busy_win
         if win is None or not win.winfo_exists():
             return
-        alpha = (steps - step) / steps if reverse else step / steps
+        if win._busy_fade_job is not None:
+            win.after_cancel(win._busy_fade_job)
+            win._busy_fade_job = None
+        if step == 0:
+            win._busy_fade_start = float(win.attributes("-alpha"))
+        eased = 1 - (1 - step / steps) ** 3
+        alpha = win._busy_fade_start * (1 - eased) if reverse else eased
         win.attributes("-alpha", alpha)
+        if not reverse:
+            win._busy_slide = int(8 * (1 - eased))
+            self._position_busy_overlay()
         if step < steps:
-            win.after(max(1, 250 // steps), lambda: self._fade_busy_overlay(step + 1, steps, reverse))
+            win._busy_fade_job = win.after(
+                max(1, 250 // steps), lambda: self._fade_busy_overlay(step + 1, steps, reverse))
         elif reverse:
-            if self._busy_configure_binding is not None:
-                self.unbind("<Configure>", self._busy_configure_binding)
-                self._busy_configure_binding = None
-            if self._busy_click_binding is not None:
-                self.unbind("<Button-1>", self._busy_click_binding)
-                self._busy_click_binding = None
-            if self._busy_focusin_binding is not None:
-                self.unbind("<FocusIn>", self._busy_focusin_binding)
-                self._busy_focusin_binding = None
             win.destroy()
-            self._busy_win = None
 
     def _hide_busy_overlay(self):
         win = self._busy_win
         if win is None or not win.winfo_exists():
             return
+        if win._busy_hiding:
+            return
+        win._busy_hiding = True
         self._fade_busy_overlay(0, 15, reverse=True)
 
     def update_finisher_coords(self, coords: dict):
@@ -1428,6 +1529,7 @@ class App(tk.Tk):
         never needed this, since a StringVar-bound label re-wraps its new
         text automatically, but a manually truncated one doesn't."""
         def _apply():
+            self._now_selecting_layout_job = None
             if not self.winfo_exists():
                 return
             siblings = [w for w in self._titlebar.winfo_children()
@@ -1441,7 +1543,8 @@ class App(tk.Tk):
             full_text = self.now_selecting_var.get()
             self._now_selecting_label.configure(
                 text=_truncate_to_width(full_text, self._now_selecting_font, available))
-        self.after_idle(_apply)
+        if getattr(self, "_now_selecting_layout_job", None) is None:
+            self._now_selecting_layout_job = self.after_idle(_apply)
 
     def open_settings(self):
         if getattr(self, "_settings_win", None) is not None and self._settings_win.winfo_exists():
@@ -1452,7 +1555,7 @@ class App(tk.Tk):
                               LightCheckbox, LightRadiobutton, _make_light_entry,
                               _make_accent_button, _make_ghost_button,
                               _show_alert, _ask_yesno, _ask_yesnocancel,
-                              FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
+                              FRONT_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
         # Stay hidden until every section is built and the window is
@@ -1489,18 +1592,18 @@ class App(tk.Tk):
                  font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(0, 16))
 
         def section_card():
-            card = RoundedCard(body)
+            card = RoundedCard(body, flat=True)
             card.pack(fill="x", pady=(0, 16))
             return card
 
         def section_heading(parent, text, info_text=None):
-            row = tk.Frame(parent, bg=FRONT_CARD_BG)
+            row = tk.Frame(parent, bg=FRONT_BG)
             row.pack(fill="x", anchor="w", pady=(0, 10))
-            tk.Label(row, text=text, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+            tk.Label(row, text=text, bg=FRONT_BG, fg=FRONT_TEXT,
                      font=("Segoe UI", 14, "bold")).pack(side="left")
             if info_text:
                 icon = InfoIcon(row, info_text)
-                icon.configure(bg=FRONT_CARD_BG)
+                icon.configure(bg=FRONT_BG)
                 icon.pack(side="left", padx=(6, 0))
 
         # ------------------------------------------------------------------
@@ -1510,7 +1613,7 @@ class App(tk.Tk):
         section_heading(folder_card.body, "1. osu! Song Folder")
 
         status_var = tk.StringVar()
-        status_label = tk.Label(folder_card.body, textvariable=status_var, bg=FRONT_CARD_BG,
+        status_label = tk.Label(folder_card.body, textvariable=status_var, bg=FRONT_BG,
                                  wraplength=490, justify="left", font=("Segoe UI", 10))
         status_label.pack(anchor="w", pady=(0, 10))
 
@@ -1523,10 +1626,10 @@ class App(tk.Tk):
                 status_label.configure(fg="#d9455f")
             folder_card.redraw()
 
-        folder_row = tk.Frame(folder_card.body, bg=FRONT_CARD_BG)
+        folder_row = tk.Frame(folder_card.body, bg=FRONT_BG)
         folder_row.pack(fill="x")
         folder_var = tk.StringVar(value=pending["folder"])
-        folder_entry = _make_light_entry(folder_row, textvariable=folder_var)
+        folder_entry = _make_light_entry(folder_row, textvariable=folder_var, bg=FRONT_BG)
         folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
 
         set_btn = _make_accent_button(folder_row, "Set", lambda: None)
@@ -1579,9 +1682,9 @@ class App(tk.Tk):
             pending["metadata_display"] = meta_display_var.get()
 
         LightRadiobutton(meta_display_card.body, "Unicode", meta_display_var, "unicode",
-                          command=on_meta_display_change).pack(anchor="w", pady=3)
+                          command=on_meta_display_change, bg=FRONT_BG).pack(anchor="w", pady=3)
         LightRadiobutton(meta_display_card.body, "Romanised", meta_display_var, "romanised",
-                          command=on_meta_display_change).pack(anchor="w", pady=3)
+                          command=on_meta_display_change, bg=FRONT_BG).pack(anchor="w", pady=3)
 
         # ------------------------------------------------------------------
         # 3. Live-sync song select
@@ -1595,9 +1698,9 @@ class App(tk.Tk):
             pending["live_sync"] = (live_sync_var.get() == "auto")
 
         LightRadiobutton(sync_card.body, "Automatically detect selected song in osu!",
-                          live_sync_var, "auto", command=on_live_sync_change).pack(anchor="w", pady=3)
+                          live_sync_var, "auto", command=on_live_sync_change, bg=FRONT_BG).pack(anchor="w", pady=3)
         LightRadiobutton(sync_card.body, "Load song manually",
-                          live_sync_var, "manual", command=on_live_sync_change).pack(anchor="w", pady=3)
+                          live_sync_var, "manual", command=on_live_sync_change, bg=FRONT_BG).pack(anchor="w", pady=3)
 
         # ------------------------------------------------------------------
         # 4. Song Index on Startup
@@ -1615,7 +1718,7 @@ class App(tk.Tk):
 
         for value, label in SONG_INDEX_MODE_OPTIONS:
             LightRadiobutton(index_card.body, label, index_mode_var, value,
-                              command=on_index_mode_change).pack(anchor="w", pady=3)
+                              command=on_index_mode_change, bg=FRONT_BG).pack(anchor="w", pady=3)
 
         # ------------------------------------------------------------------
         # 5. Confirm Gallery Pattern Deletion
@@ -1629,7 +1732,7 @@ class App(tk.Tk):
             pending["confirm_pattern_delete"] = not disable_warning_var.get()
 
         LightCheckbox(confirm_card.body, "Disable warning when deleting patterns in gallery.",
-                      disable_warning_var, command=on_disable_warning_change).pack(anchor="w")
+                      disable_warning_var, command=on_disable_warning_change, bg=FRONT_BG).pack(anchor="w")
 
         # ------------------------------------------------------------------
         # 6. Download resources
@@ -1638,11 +1741,12 @@ class App(tk.Tk):
         section_heading(download_card.body, "6. Download Resources",
                          "Including\n\n"
                          "- ffmpeg + ffprobe\n"
+                         "- BASS audio engine\n"
                          "- VLC Player\n"
                          "- waifu2x")
 
         tk.Label(download_card.body, text="They are required to use certain tools.",
-                 bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
+                 bg=FRONT_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
 
         download_btn = _make_ghost_button(download_card.body, "Install Automatically",
                                            lambda: do_install_resources())
@@ -1659,10 +1763,11 @@ class App(tk.Tk):
             need_ffmpeg_bin = not logic.ffmpeg_available()
             need_ffprobe_bin = not logic.ffprobe_available()
             need_vlc = not logic.vlc_available()
+            need_bass = not logic.bass_available()
             need_waifu2x = not logic.waifu2x_available()
-            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc and not need_waifu2x:
+            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc and not need_bass and not need_waifu2x:
                 _show_alert(win, "Download resources",
-                            "ffmpeg, ffprobe, VLC and waifu2x are already installed.")
+                            "ffmpeg, ffprobe, BASS, VLC and waifu2x are already installed.")
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
@@ -1678,6 +1783,12 @@ class App(tk.Tk):
                         installed.append(" + ".join(names))
                     except Exception as e:
                         errors.append(f"FFmpeg: {e}")
+                if need_bass and not cancel_event.is_set():
+                    try:
+                        logic.install_bass_bundled()
+                        installed.append("BASS")
+                    except Exception as e:
+                        errors.append(f"BASS: {e}")
                 if need_vlc and not cancel_event.is_set():
                     try:
                         logic.install_vlc_bundled()
@@ -1712,7 +1823,7 @@ class App(tk.Tk):
                     _show_alert(win, "Download resources", err_msg)
 
             self.run_cancellable_job(
-                "Installing ffmpeg + ffprobe, VLC and waifu2x (may take a few minutes)... Please wait...",
+                "Installing ffmpeg + ffprobe, BASS, VLC and waifu2x (may take a few minutes)... Please wait...",
                 work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
                 cancelled_toast="Installation Cancelled!",
             )
@@ -1757,7 +1868,7 @@ class App(tk.Tk):
 
         def apply_and_notify():
             do_apply()
-            show_toast(win, "Settings Applied", display_ms=1000)
+            show_toast(win, "Settings Applied")
 
         def do_restart():
             if not _ask_yesno(win,
@@ -1859,7 +1970,7 @@ class App(tk.Tk):
             return
         from screens import (make_scrollable_toplevel_body, InfoIcon, show_toast, RoundedCard,
                               LightRadiobutton, _make_light_entry, _make_accent_button, _make_ghost_button,
-                              _show_alert, FRONT_BG, FRONT_CARD_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
+                              _show_alert, FRONT_BG, FRONT_TEXT, FRONT_TEXT_MUTED)
 
         win = tk.Toplevel(self)
         # Stay hidden until every section is built and the window is
@@ -1881,18 +1992,18 @@ class App(tk.Tk):
                  font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(0, 16))
 
         def section_card():
-            card = RoundedCard(body)
+            card = RoundedCard(body, flat=True)
             card.pack(fill="x", pady=(0, 16))
             return card
 
         def section_heading(parent, text, info_text=None):
-            row = tk.Frame(parent, bg=FRONT_CARD_BG)
+            row = tk.Frame(parent, bg=FRONT_BG)
             row.pack(fill="x", anchor="w", pady=(0, 10))
-            tk.Label(row, text=text, bg=FRONT_CARD_BG, fg=FRONT_TEXT,
+            tk.Label(row, text=text, bg=FRONT_BG, fg=FRONT_TEXT,
                      font=("Segoe UI", 14, "bold")).pack(side="left")
             if info_text:
                 icon = InfoIcon(row, info_text)
-                icon.configure(bg=FRONT_CARD_BG)
+                icon.configure(bg=FRONT_BG)
                 icon.pack(side="left", padx=(6, 0))
 
         # ------------------------------------------------------------------
@@ -1901,17 +2012,17 @@ class App(tk.Tk):
         folder_card = section_card()
         section_heading(folder_card.body, "1. Choose your osu! Songs folder")
 
-        folder_row = tk.Frame(folder_card.body, bg=FRONT_CARD_BG)
+        folder_row = tk.Frame(folder_card.body, bg=FRONT_BG)
         folder_row.pack(fill="x")
         folder_var = tk.StringVar(value=pending["folder"])
-        folder_entry = _make_light_entry(folder_row, textvariable=folder_var)
+        folder_entry = _make_light_entry(folder_row, textvariable=folder_var, bg=FRONT_BG)
         folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
 
         set_btn = _make_accent_button(folder_row, "Set", lambda: None)
         set_btn.configure(state="disabled")
 
         status_var = tk.StringVar()
-        status_label = tk.Label(folder_card.body, textvariable=status_var, bg=FRONT_CARD_BG,
+        status_label = tk.Label(folder_card.body, textvariable=status_var, bg=FRONT_BG,
                                  fg=FRONT_TEXT_MUTED, wraplength=490, justify="left",
                                  font=("Segoe UI", 10))
 
@@ -1971,9 +2082,9 @@ class App(tk.Tk):
             pending["metadata_display"] = meta_display_var.get()
 
         LightRadiobutton(meta_display_card.body, "Unicode", meta_display_var, "unicode",
-                          command=on_meta_display_change).pack(anchor="w", pady=3)
+                          command=on_meta_display_change, bg=FRONT_BG).pack(anchor="w", pady=3)
         LightRadiobutton(meta_display_card.body, "Romanised", meta_display_var, "romanised",
-                          command=on_meta_display_change).pack(anchor="w", pady=3)
+                          command=on_meta_display_change, bg=FRONT_BG).pack(anchor="w", pady=3)
 
         # ------------------------------------------------------------------
         # 3. Download extra resources
@@ -1982,12 +2093,13 @@ class App(tk.Tk):
         section_heading(download_card.body, "3. Download Extra Resources",
                          "Including:\n\n"
                          "- ffmpeg + ffprobe\n"
+                         "- BASS audio engine\n"
                          "- VLC Player\n"
                          "- waifu2x")
 
         tk.Label(download_card.body, text="These are required to run certain features in this tool. "
                                            "You can install them now or later in Settings.",
-                 bg=FRONT_CARD_BG, fg=FRONT_TEXT_MUTED, wraplength=490, justify="left",
+                 bg=FRONT_BG, fg=FRONT_TEXT_MUTED, wraplength=490, justify="left",
                  font=("Segoe UI", 10)).pack(anchor="w", pady=(0, 10))
 
         download_btn = _make_ghost_button(download_card.body, "Install Automatically",
@@ -2005,10 +2117,11 @@ class App(tk.Tk):
             need_ffmpeg_bin = not logic.ffmpeg_available()
             need_ffprobe_bin = not logic.ffprobe_available()
             need_vlc = not logic.vlc_available()
+            need_bass = not logic.bass_available()
             need_waifu2x = not logic.waifu2x_available()
-            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc and not need_waifu2x:
+            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc and not need_bass and not need_waifu2x:
                 _show_alert(win, "Download resources",
-                            "ffmpeg, ffprobe, VLC and waifu2x are already installed.")
+                            "ffmpeg, ffprobe, BASS, VLC and waifu2x are already installed.")
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
@@ -2024,6 +2137,12 @@ class App(tk.Tk):
                         installed.append(" + ".join(names))
                     except Exception as e:
                         errors.append(f"FFmpeg: {e}")
+                if need_bass and not cancel_event.is_set():
+                    try:
+                        logic.install_bass_bundled()
+                        installed.append("BASS")
+                    except Exception as e:
+                        errors.append(f"BASS: {e}")
                 if need_vlc and not cancel_event.is_set():
                     try:
                         logic.install_vlc_bundled()
@@ -2058,7 +2177,7 @@ class App(tk.Tk):
                     _show_alert(win, "Download resources", err_msg)
 
             self.run_cancellable_job(
-                "Installing ffmpeg + ffprobe, VLC and waifu2x (may take a few minutes)... Please wait...",
+                "Installing ffmpeg + ffprobe, BASS, VLC and waifu2x (may take a few minutes)... Please wait...",
                 work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
                 cancelled_toast="Installation Cancelled!",
             )
@@ -2694,60 +2813,204 @@ class App(tk.Tk):
         body = tk.Frame(self, bg=UI_BG)
         body.pack(side="top", fill="both", expand=True)
 
-        self.sidebar = tk.Frame(body, width=230, bg=UI_BG)
+        self.sidebar = tk.Frame(body, width=280, bg=UI_BG)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
         tk.Frame(body, width=1, bg=UI_BORDER).pack(side="left", fill="y")
 
         self.sidebar_buttons = {}
-        for item in SIDEBAR_ITEMS:
-            btn = tk.Button(self.sidebar, text=item, anchor="w", relief="flat", bd=0,
-                             bg=UI_BG, activebackground=UI_ACCENT_SOFT,
-                             fg=UI_TEXT, activeforeground=UI_ACCENT,
-                             font=("Segoe UI", 12), padx=16, pady=12,
-                             cursor="hand2",
-                             highlightthickness=0, takefocus=0,
-                             highlightbackground=UI_BG, highlightcolor=UI_BG,
-                             command=lambda i=item: self.show_frame(i))
-            btn.pack(side="top", fill="x", padx=10, pady=3)
-            btn.bind("<Enter>", lambda e, i=item: self._on_sidebar_hover(i, True))
-            btn.bind("<Leave>", lambda e, i=item: self._on_sidebar_hover(i, False))
-            # A mouse click still gives a tk.Button keyboard focus on Windows
-            # (takefocus=0 only blocks Tab traversal), and the focused button
-            # draws a dotted rectangle inside itself. Bounce focus straight
-            # back to the sidebar frame so that ring never appears.
-            btn.bind("<FocusIn>", lambda e: self.sidebar.focus_set())
-            self.sidebar_buttons[item] = btn
+        self.sidebar_categories = {}
+        self._sidebar_canvas = tk.Canvas(self.sidebar, bg=UI_BG, bd=0,
+                                         highlightthickness=0, yscrollincrement=16)
+        # A permanent slim hit area avoids resizing the content on reveal.
+        self._sidebar_scrollbar = _SidebarScrollbar(
+            self.sidebar, command=self._sidebar_canvas.yview)
+        self._sidebar_scrollbar.pack(side="right", fill="y")
+        self._sidebar_canvas.configure(yscrollcommand=self._sidebar_scrollbar.set)
+        self._sidebar_canvas.pack(side="left", fill="both", expand=True)
+        self.sidebar_categories = {
+            name: {"expanded": True, "openness": 1.0, "animation_job": None,
+                   "items": items}
+            for name, items in SIDEBAR_CATEGORIES
+        }
+        self.sidebar_buttons = dict.fromkeys(SIDEBAR_ITEMS)
+        self._sidebar_hover = None
+        self._sidebar_pressed = None
+        self._sidebar_hit_regions = []
+        self._sidebar_header_font = tkfont.Font(family="Segoe UI", size=14, weight="bold")
+        self._sidebar_item_font = tkfont.Font(family="Segoe UI", size=12)
+        self._sidebar_active_font = tkfont.Font(family="Segoe UI", size=12, weight="bold")
+        self._sidebar_canvas.bind("<Configure>", lambda _e: self._draw_sidebar())
+        self._sidebar_canvas.bind("<Motion>", self._sidebar_motion)
+        self._sidebar_canvas.bind("<Leave>", lambda _e: self._sidebar_motion(None))
+        self._sidebar_canvas.bind("<ButtonPress-1>", self._sidebar_press)
+        self._sidebar_canvas.bind("<ButtonRelease-1>", self._sidebar_release)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self._sidebar_canvas.bind(sequence, self._on_sidebar_wheel)
+            self._sidebar_scrollbar.bind(sequence, self._on_sidebar_wheel)
+        self._draw_sidebar()
 
         self.container = ttk.Frame(body)
         self.container.pack(side="left", fill="both", expand=True)
 
+    def _draw_sidebar(self):
+        # All navigation lives on ONE canvas. Moving native child windows in a
+        # canvas leaves clipped strips on Windows when an earlier group shrinks.
+        canvas = self._sidebar_canvas
+        canvas.delete("all")
+        self._sidebar_hit_regions = []
+        width = canvas.winfo_width()
+        header_height = self._sidebar_header_font.metrics("linespace") + 16
+        row_height = self._sidebar_item_font.metrics("linespace") + 20
+        y = 8
+        for category, state in self.sidebar_categories.items():
+            key = ("category", category)
+            hovered = self._sidebar_hover == key
+            canvas.create_rectangle(10, y, width - 10, y + header_height,
+                                    fill=UI_SOFT if hovered else UI_BG, outline="")
+            color = UI_ACCENT if hovered else UI_TEXT_MUTED
+            canvas.create_text(26, y + header_height / 2, anchor="w",
+                               text="▾" if state["expanded"] else "▸",
+                               font=("Segoe UI", 10), fill=color)
+            canvas.create_text(44, y + header_height / 2, anchor="w",
+                               text=category.upper(), font=self._sidebar_header_font,
+                               fill=color, tags=("category-label", category))
+            self._sidebar_hit_regions.append((10, y, width - 10, y + header_height, key))
+            y += header_height
+            full_height = row_height * len(state["items"])
+            openness = state["openness"]
+            height = round(full_height * min(1.0, openness / 0.55))
+            reveal = max(0.0, min(1.0, (openness - 0.55) / 0.45))
+            if reveal > 0:
+                background = canvas.winfo_rgb(UI_BG)
+
+                def faded(color):
+                    rgb = canvas.winfo_rgb(color)
+                    return "#" + "".join(
+                        f"{round((bg + (ch - bg) * reveal) / 257):02x}"
+                        for bg, ch in zip(background, rgb))
+
+                offset = round(10 * (1 - reveal))
+                for index, item in enumerate(state["items"]):
+                    top = y + index * row_height + 2
+                    active = item == getattr(self, "_current_frame_name", None)
+                    hovered = self._sidebar_hover == ("tool", item)
+                    bg = UI_ACCENT_SOFT if active else UI_SOFT if hovered else UI_BG
+                    fg = UI_ACCENT if active or hovered else UI_TEXT
+                    canvas.create_rectangle(10 + offset, top, width - 10 + offset,
+                                            top + row_height - 4,
+                                            fill=faded(bg), outline="")
+                    canvas.create_text(34 + offset, top + (row_height - 4) / 2,
+                                       anchor="w", text=item, fill=faded(fg),
+                                       font=self._sidebar_active_font if active else self._sidebar_item_font,
+                                       tags=("tool-label", category, item))
+                    if state["animation_job"] is None and state["expanded"]:
+                        self._sidebar_hit_regions.append(
+                            (10, top, width - 10, top + row_height - 4, ("tool", item)))
+            y += height + 8
+        canvas.configure(scrollregion=(0, 0, width, y))
+        self._update_sidebar_scroll()
+
+    def _sidebar_target(self, event):
+        if event is None:
+            return None
+        x = self._sidebar_canvas.canvasx(event.x)
+        y = self._sidebar_canvas.canvasy(event.y)
+        for left, top, right, bottom, key in self._sidebar_hit_regions:
+            if left <= x <= right and top <= y <= bottom:
+                return key
+        return None
+
+    def _sidebar_motion(self, event):
+        self._sidebar_scrollbar.set_edge_hover(
+            event is not None and event.x >= self._sidebar_canvas.winfo_width() - 18)
+        target = self._sidebar_target(event)
+        if target != self._sidebar_hover:
+            self._sidebar_hover = target
+            self._sidebar_canvas.configure(cursor="hand2" if target else "")
+            self._draw_sidebar()
+
+    def _sidebar_press(self, event):
+        self._sidebar_pressed = self._sidebar_target(event)
+
+    def _sidebar_release(self, event):
+        target = self._sidebar_target(event)
+        pressed = self._sidebar_pressed
+        self._sidebar_pressed = None
+        if target is None or target != pressed:
+            return
+        kind, name = target
+        if kind == "category":
+            self._toggle_sidebar_category(name)
+        else:
+            self.show_frame(name)
+
+    def _toggle_sidebar_category(self, category, expanded=None):
+        state = self.sidebar_categories[category]
+        expanded = not state["expanded"] if expanded is None else expanded
+        if expanded == state["expanded"]:
+            return
+        state["expanded"] = expanded
+        if state["animation_job"] is not None:
+            self._sidebar_canvas.after_cancel(state["animation_job"])
+        start = state["openness"]
+        target = 1.0 if expanded else 0.0
+        started = time.monotonic()
+        duration = max(0.08, 0.28 * abs(target - start))
+
+        def step():
+            progress = min(1.0, (time.monotonic() - started) / duration)
+            eased = progress * progress * (3 - 2 * progress)
+            state["openness"] = start + (target - start) * eased
+            state["animation_job"] = (self._sidebar_canvas.after(16, step)
+                                      if progress < 1 else None)
+            self._draw_sidebar()
+
+        step()
+
+    def _update_sidebar_scroll(self):
+        canvas = self._sidebar_canvas
+        region = canvas.cget("scrollregion")
+        bounds = tuple(map(float, canvas.tk.splitlist(region))) if region else ()
+        if not bounds or bounds[3] <= canvas.winfo_height():
+            canvas.yview_moveto(0)
+
+    def _on_sidebar_wheel(self, event):
+        self._update_sidebar_scroll()
+        if self._sidebar_scrollbar.can_scroll:
+            direction = -1 if (getattr(event, "num", None) == 4
+                               or getattr(event, "delta", 0) > 0) else 1
+            self._sidebar_canvas.yview_scroll(direction * 3, "units")
+            self._sidebar_scrollbar.reveal()
+        return "break"
+
     def _build_frames(self):
         from screens import (
-            FrontPage, MetadataManagerFrame, VolumeKiaiCopierFrame, MapCleanerFrame,
+            FrontPage, MetadataManagerFrame, KiaiEditorFrame, VolumeEditorFrame, MapCleanerFrame,
             OffsetShifterFrame, TimingEditorFrame, BgOffsetShifterFrame,
-            VideoOffsetShifterFrame, EarlyVolumeSettingFrame, PatternGalleryFrame,
+            VideoOffsetShifterFrame, PatternGalleryFrame,
             FileNameCheckerFrame,
         )
         tool_classes = [
             ("front", FrontPage),
             ("Metadata Manager", MetadataManagerFrame),
-            ("Volume/Kiai Copier", VolumeKiaiCopierFrame),
+            ("Kiai Editor", KiaiEditorFrame),
+            ("Volume Editor", VolumeEditorFrame),
             ("Map Cleaner", MapCleanerFrame),
             ("Audio/Offset Settings", OffsetShifterFrame),
             ("Timing Editor", TimingEditorFrame),
-            ("BG Settings", BgOffsetShifterFrame),
+            ("Background Settings", BgOffsetShifterFrame),
             ("Video Settings", VideoOffsetShifterFrame),
-            ("Early Volume Settings", EarlyVolumeSettingFrame),
             ("Pattern Gallery", PatternGalleryFrame),
-            ("File Name Checker", FileNameCheckerFrame),
+            ("Filename Checker", FileNameCheckerFrame),
         ]
 
         for name, cls in tool_classes:
             tool = cls(self.container, self)
             self.frames[name] = tool
-            tool.place(x=0, y=0, relwidth=1, relheight=1)
+            # Only the selected tool participates in window layout. Keeping
+            # all tools placed makes every resize reflow every hidden screen.
 
     def show_frame(self, name):
         frame = self.frames.get(name)
@@ -2756,28 +3019,21 @@ class App(tk.Tk):
         prev_name = getattr(self, "_current_frame_name", None)
         if prev_name and prev_name != name:
             prev_frame = self.frames.get(prev_name)
-            if prev_frame is not None and hasattr(prev_frame, "on_hidden"):
-                prev_frame.on_hidden()
+            if prev_frame is not None:
+                if hasattr(prev_frame, "on_hidden"):
+                    prev_frame.on_hidden()
+                prev_frame.place_forget()
         self._current_frame_name = name
+        frame.place(x=0, y=0, relwidth=1, relheight=1)
         frame.lift()
-        for key, btn in self.sidebar_buttons.items():
-            active = key == name
-            btn.configure(bg=UI_ACCENT_SOFT if active else UI_BG,
-                          fg=UI_ACCENT if active else UI_TEXT,
-                          font=("Segoe UI", 12, "bold" if active else "normal"))
+        for category, items in SIDEBAR_CATEGORIES:
+            if name in items:
+                self._toggle_sidebar_category(category, expanded=True)
+                break
+        if self.sidebar_buttons:
+            self._draw_sidebar()
         if hasattr(frame, "on_shown"):
             frame.on_shown()
-
-    def _on_sidebar_hover(self, item, entering):
-        """Hover state for sidebar buttons — skipped for the active tool,
-        which keeps its selected (soft-accent) styling."""
-        btn = self.sidebar_buttons.get(item)
-        if btn is None:
-            return
-        if item == getattr(self, "_current_frame_name", None):
-            return
-        btn.configure(bg=UI_SOFT if entering else UI_BG,
-                      fg=UI_ACCENT if entering else UI_TEXT)
 
     # ------------------------------------------------------------------
     def get_diff_files(self):
