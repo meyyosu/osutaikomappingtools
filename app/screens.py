@@ -41,7 +41,6 @@ LIGHT_ACCENT = "#4f46e5"
 LIGHT_ACCENT_HOVER = "#433bd0"
 LIGHT_ACCENT_SOFT = "#eef0fd"
 
-
 def _style_light_body(base_frame):
     """Overrides `base_frame`'s (a BaseToolFrame) scrolling canvas + body
     background to the light-card palette above, instead of the default
@@ -553,13 +552,13 @@ def _ask_ffmpeg_required_choice(parent, feature_name: str = "This feature") -> s
         [("Install automatically", "install"), ("Cancel", "cancel")])
 
 
-def _ask_vlc_required_choice(parent) -> str:
-    """Shown when the video offset live preview is opened but VLC isn't
-    resolvable (see `logic.vlc_available`). Returns "install" or
+def _ask_mpv_required_choice(parent) -> str:
+    """Shown when the video offset live preview is opened but mpv isn't
+    resolvable (see `logic.mpv_available`). Returns "install" or
     "cancel"."""
     return _ask_choice_dialog(
-        parent, "VLC required",
-        "The live video preview needs VLC, which wasn't found on this system.",
+        parent, "mpv required",
+        "The live video preview needs mpv, which wasn't found on this system.",
         [("Install automatically", "install"), ("Cancel", "cancel")])
 
 
@@ -1962,7 +1961,8 @@ class LightSpinner(tk.Frame):
         inner = tk.Frame(self.canvas, bg=bg)
 
         entry_kwargs = dict(textvariable=textvariable, width=width, relief="flat", bd=0,
-                             bg=bg, fg=fg, insertbackground=fg, font=font, highlightthickness=0)
+                             bg=bg, fg=fg, insertbackground=fg, font=font, highlightthickness=0,
+                             disabledbackground=bg, readonlybackground=bg)
         if validate is not None:
             entry_kwargs["validate"] = validate[0]
             entry_kwargs["validatecommand"] = validate[1]
@@ -2400,6 +2400,8 @@ class LightEntry(tk.Frame):
         self.bg = bg
         self.accent = accent
         self._border_color = FRONT_BORDER
+        self._focused = False
+        self._invalid = False
 
         self.canvas = tk.Canvas(self, height=self.BOX_H, highlightthickness=0, bg=bg)
 
@@ -2470,7 +2472,16 @@ class LightEntry(tk.Frame):
         self._redraw()
 
     def _set_focused(self, focused):
-        self._border_color = self.accent if focused else FRONT_BORDER
+        self._focused = focused
+        self._update_border()
+
+    def set_invalid(self, invalid):
+        self._invalid = invalid
+        self._update_border()
+
+    def _update_border(self):
+        self._border_color = ("#dc2626" if self._invalid else
+                              self.accent if self._focused else FRONT_BORDER)
         self._redraw()
 
     def _redraw(self):
@@ -2839,9 +2850,10 @@ class FrontPage(BaseToolFrame):
 
 # =============================================================================
 class MetadataManagerFrame(BaseToolFrame):
+    NAME_MAX_CHARS = 81
     # osu!'s own Tags field has no hard server-side cap this app is aware
-    # of — 1000 is a generous, deliberately round local limit so the field
-    # can't grow unboundedly, not a value mirrored from the game itself.
+    # of — 1000 is a local warning threshold, not an enforced cap or a
+    # value mirrored from the game itself.
     TAGS_MAX_CHARS = 1000
 
     def __init__(self, master, app):
@@ -2869,6 +2881,8 @@ class MetadataManagerFrame(BaseToolFrame):
         form = tk.Frame(self.body, bg=FRONT_BG)
         form.pack(fill="x", padx=24)
         self.fields = {}
+        self.name_vars = {}
+        self.name_counters = {}
         labels = [
             ("Artist", "Artist"),
             ("Romanised Artist", "RomanisedArtist"),
@@ -2883,6 +2897,16 @@ class MetadataManagerFrame(BaseToolFrame):
             e = _make_light_entry(form, width=60, bg=FRONT_BG)
             e.grid(row=i, column=1, sticky="we", pady=8, padx=(12, 0), ipadx=8, ipady=6)
             self.fields[key] = e
+            if key in ("Artist", "RomanisedArtist", "Title", "RomanisedTitle"):
+                var = tk.StringVar(master=self)
+                self.name_vars[key] = var
+                e.entry.configure(textvariable=var)
+                counter = tk.Label(form, text=f"0/{self.NAME_MAX_CHARS}",
+                                   bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
+                                   font=("Segoe UI", 9))
+                counter.grid(row=i, column=2, sticky="e", padx=(8, 0))
+                self.name_counters[key] = counter
+                var.trace_add("write", lambda *_args, key=key: self._update_name_count(key))
         form.columnconfigure(1, weight=1)
 
         # Tags gets its own multi-line box (room for ~5 lines of text)
@@ -2891,6 +2915,7 @@ class MetadataManagerFrame(BaseToolFrame):
                  font=("Segoe UI", 11)).grid(row=tags_row, column=0, sticky="nw", pady=8)
         tags_frame = tk.Frame(form, bg=FRONT_BG, highlightthickness=1,
                                highlightbackground=FRONT_BORDER, highlightcolor=LIGHT_ACCENT)
+        self.tags_frame = tags_frame
         tags_frame.grid(row=tags_row, column=1, sticky="we", pady=8, padx=(12, 0))
         self.tags_text = tk.Text(tags_frame, width=60, height=5, wrap="word", font=("Segoe UI", 11),
                                   relief="flat", bd=0, bg=FRONT_BG, fg=FRONT_TEXT,
@@ -2902,8 +2927,9 @@ class MetadataManagerFrame(BaseToolFrame):
         self.tags_text.bind("<<Modified>>", self._on_tags_modified)
 
         self.tags_count_var = tk.StringVar(value=f"0 / {self.TAGS_MAX_CHARS}")
-        tk.Label(form, textvariable=self.tags_count_var, bg=FRONT_BG, fg=FRONT_TEXT_MUTED,
-                 font=("Segoe UI", 9)).grid(row=tags_row + 1, column=1, sticky="e", pady=(2, 8))
+        self.tags_counter = tk.Label(form, textvariable=self.tags_count_var, bg=FRONT_BG,
+                                     fg=FRONT_TEXT_MUTED, font=("Segoe UI", 9))
+        self.tags_counter.grid(row=tags_row + 1, column=1, sticky="e", pady=(2, 8))
 
         # Preview Point shares the same grid/column as Artist/Title/etc.
         # (rather than its own separately-packed row) so its box's left
@@ -2924,22 +2950,26 @@ class MetadataManagerFrame(BaseToolFrame):
         apply_row.pack(fill="x", padx=24, pady=(4, 20))
         _make_accent_button(apply_row, "Apply", self.apply).pack(side="right")
 
+    def _update_name_count(self, key):
+        """Warn about long artist/title values without limiting edits or imports."""
+        count = len(self.name_vars[key].get())
+        over_limit = count > self.NAME_MAX_CHARS
+        self.name_counters[key].configure(
+            text=f"{count}/{self.NAME_MAX_CHARS}",
+            fg="#dc2626" if over_limit else FRONT_TEXT_MUTED)
+        self.fields[key].entry.configure(fg="#dc2626" if over_limit else FRONT_TEXT)
+        self.fields[key].set_invalid(over_limit)
+
     def _on_tags_modified(self, _event=None):
-        """Live character counter + hard cap for the Tags box — Text
-        widgets have no built-in maxlength/validate option the way Entry
-        does, so this reacts to <<Modified>> instead: over the cap, the
-        overflow is trimmed back off immediately. edit_modified(False) at
-        the end resets the flag so the next real edit fires this again
-        (Tk only re-fires <<Modified>> on a False->True transition, so the
-        delete/insert used to trim doesn't recursively re-trigger this
-        while it's already running)."""
+        """Update the counter and warning outline without trimming Tags."""
         if not self.tags_text.edit_modified():
             return
         text = self.tags_text.get("1.0", "end-1c")
-        if len(text) > self.TAGS_MAX_CHARS:
-            text = text[: self.TAGS_MAX_CHARS]
-            self.tags_text.delete("1.0", "end")
-            self.tags_text.insert("1.0", text)
+        over_limit = len(text) > self.TAGS_MAX_CHARS
+        self.tags_frame.configure(
+            highlightbackground="#dc2626" if over_limit else FRONT_BORDER,
+            highlightcolor="#dc2626" if over_limit else LIGHT_ACCENT)
+        self.tags_counter.configure(fg="#dc2626" if over_limit else FRONT_TEXT_MUTED)
         self.tags_count_var.set(f"{len(text)} / {self.TAGS_MAX_CHARS}")
         self.tags_text.edit_modified(False)
 
@@ -3529,29 +3559,57 @@ class MapCleanerFrame(BaseToolFrame):
 
 
 # =============================================================================
-class OffsetShifterFrame(BaseToolFrame):
-    def __init__(self, master, app):
-        super().__init__(master, app)
-        _style_light_body(self)
+class LightSwitch(tk.Canvas):
+    """Compact on/off switch with a keyboard-accessible focus target."""
+    def __init__(self, master, variable, command=None, bg=FRONT_BG):
+        super().__init__(master, width=34, height=20, bg=bg, bd=0,
+                         highlightthickness=1, highlightbackground=bg,
+                         highlightcolor=LIGHT_ACCENT, takefocus=True, cursor="hand2")
+        self.variable = variable
+        self.command = command
+        self._trace_id = variable.trace_add("write", lambda *_: self._redraw())
+        self.bind("<Button-1>", self._toggle)
+        self.bind("<space>", self._toggle)
+        self.bind("<Return>", self._toggle)
+        self.bind("<Destroy>", self._on_destroy)
+        self._redraw()
 
-        def info(parent, text, **kw):
-            icon = InfoIcon(parent, text, **kw)
-            icon.configure(bg=FRONT_BG)
-            return icon
+    def _toggle(self, _event=None):
+        self.focus_set()
+        self.variable.set(not self.variable.get())
+        if self.command:
+            self.command()
+        return "break"
 
-        # ---- Section 1: Audio/Offset Settings ------------------------------
-        self.card1 = RoundedCard(self.body, flat=True)
-        self.card1.pack(fill="x", padx=24, pady=(20, 12))
-        body1 = self.card1.body
+    def _redraw(self):
+        from PIL import Image, ImageDraw, ImageTk
+        scale = 8
+        # Composite onto the actual canvas background before downsampling:
+        # Tk's handling of translucent image edges can otherwise look jagged.
+        image = Image.new("RGB", (34 * scale, 20 * scale), self.cget("bg"))
+        draw = ImageDraw.Draw(image)
+        enabled = self.variable.get()
+        draw.rounded_rectangle((scale, scale, 33 * scale, 19 * scale), radius=9 * scale,
+                               fill=LIGHT_ACCENT if enabled else "#c9cbd6")
+        left = 16 if enabled else 2
+        draw.ellipse((left * scale, 2 * scale, (left + 16) * scale, 18 * scale), fill="white")
+        self._image = ImageTk.PhotoImage(
+            image.resize((34, 20), Image.Resampling.LANCZOS), master=self)
+        self.delete("all")
+        self.create_image(0, 0, anchor="nw", image=self._image)
 
-        header1 = tk.Frame(body1, bg=FRONT_BG)
-        header1.pack(fill="x", pady=(0, 14))
-        tk.Label(header1, text="Audio/Offset Settings", bg=FRONT_BG, fg=LIGHT_ACCENT,
-                 font=("Segoe UI", 13, "bold")).pack(side="left")
-        info(header1, "Change offset and resnap all notes and preview point "
-                       "for all difficulties.").pack(side="left", padx=(6, 0))
+    def _on_destroy(self, event):
+        if event.widget is self:
+            self.variable.trace_remove("write", self._trace_id)
 
-        form = tk.Frame(body1, bg=FRONT_BG)
+
+class TimingOffsetControls(tk.Frame):
+    """Uniform offset fields, independent of advanced redline edits."""
+    def __init__(self, master, app, on_change=None):
+        super().__init__(master, bg=FRONT_BG)
+        self.app = app
+        self.on_change = on_change
+        form = tk.Frame(self, bg=FRONT_BG)
         form.pack(fill="x", pady=(0, 12))
         tk.Label(form, text="Current offset:", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", pady=6)
@@ -3577,12 +3635,116 @@ class OffsetShifterFrame(BaseToolFrame):
         self._updating = False
         self.base_offset = 0
 
+    def refresh(self):
+        folder, diffs = self.app.get_diff_files()
+        if diffs:
+            bm = osu_parser.Beatmap(os.path.join(folder, diffs[0]))
+            tp = sorted(bm.timing_points, key=lambda t: t.time)
+            self.base_offset = int(tp[0].time) if tp else 0
+        else:
+            self.base_offset = 0
+        self.current_entry.configure(state="normal")
+        self.current_entry.delete(0, "end")
+        self.current_entry.insert(0, str(self.base_offset))
+        self.current_entry.configure(state="readonly")
+        self._updating = True
+        self.new_var.set(str(self.base_offset))
+        self.change_var.set("0")
+        self._updating = False
+
+    def _on_new_changed(self, *args):
+        if self._updating:
+            return
+        try:
+            new_val = int(float(self.new_var.get()))
+        except ValueError:
+            return
+        self._updating = True
+        self.change_var.set(str(new_val - self.base_offset))
+        self._updating = False
+        if self.on_change:
+            self.on_change()
+
+    def _on_change_changed(self, *args):
+        if self._updating:
+            return
+        try:
+            change = int(float(self.change_var.get()))
+        except ValueError:
+            return
+        self._updating = True
+        self.new_var.set(str(self.base_offset + change))
+        self._updating = False
+        if self.on_change:
+            self.on_change()
+
+
+class OffsetShifterFrame(BaseToolFrame):
+    def __init__(self, master, app):
+        super().__init__(master, app)
+        _style_light_body(self)
+        page_font = ("Segoe UI", 11)
+        bold_font = ("Segoe UI", 11, "bold")
+
+        def info(parent, text, **kw):
+            icon = InfoIcon(parent, text, **kw)
+            icon.configure(bg=FRONT_BG, font=bold_font)
+            return icon
+
+        # ---- Audio settings (packed after re-encoding below) --------------
+        self.card1 = RoundedCard(self.body, flat=True)
+        body1 = self.card1.body
+
+        header1 = tk.Frame(body1, bg=FRONT_BG)
+        header1.pack(fill="x", pady=(0, 14))
+        tk.Label(header1, text="Audio Settings", bg=FRONT_BG, fg=LIGHT_ACCENT,
+                 font=bold_font).pack(side="left")
+        info(header1, "Add a silent lead-in or change the shared song's volume. "
+                       "Timing shifts apply to the checked difficulties; audio changes affect the whole set."
+             ).pack(side="left", padx=(6, 0))
+
         self.add_silence_var = tk.BooleanVar(value=False)
         r_silence = tk.Frame(body1, bg=FRONT_BG)
         r_silence.pack(fill="x", anchor="w", pady=(0, 12))
-        LightCheckbox(r_silence, "Add silence", self.add_silence_var, bg=FRONT_BG).pack(side="left")
-        info(r_silence, "Add 1000ms of silence to the beginning of the "
-                         "song to avoid first-note lag.").pack(side="left", padx=(6, 0))
+        LightCheckbox(r_silence, "Add silence", self.add_silence_var, bg=FRONT_BG,
+                      command=self._sync_audio_state).pack(side="left")
+        info(r_silence, "Add 1000ms of silence to avoid first-note lag, or enable a custom "
+                         "duration from 100 to 2000ms. Selected difficulties shift by the same amount."
+             ).pack(side="left", padx=(6, 0))
+
+        self.custom_silence_var = tk.BooleanVar(value=False)
+        self.silence_duration_var = tk.StringVar(value="1000")
+        duration_row = tk.Frame(body1, bg=FRONT_BG)
+        duration_row.pack(fill="x", padx=(32, 0), pady=(0, 10))
+        self.custom_silence_check = LightCheckbox(
+            duration_row, "Custom duration:", self.custom_silence_var, bg=FRONT_BG,
+            command=self._sync_audio_state)
+        self.custom_silence_check.pack(side="left")
+        self.silence_spinner = LightSpinner(duration_row, self.silence_duration_var,
+            from_=100, to=2000, increment=100, width=5, fmt="%.0f", bg=FRONT_BG,
+            validate=("key", (self.register(lambda p: p == "" or (p.isascii() and p.isdigit())), "%P")))
+        self.silence_spinner.pack(side="left", padx=(6, 4))
+        self.silence_spinner.entry.bind("<FocusOut>", self._clamp_audio_values)
+        tk.Label(duration_row, text="ms", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=page_font).pack(side="left")
+
+        self.volume_enabled_var = tk.BooleanVar(value=False)
+        self.gain_db_var = tk.StringVar(value="0")
+        volume_row = tk.Frame(body1, bg=FRONT_BG)
+        volume_row.pack(fill="x", pady=(0, 18))
+        LightCheckbox(volume_row, "Audio Volume Settings", self.volume_enabled_var,
+            bg=FRONT_BG, command=self._sync_audio_state).pack(side="left")
+        self.gain_spinner = LightSpinner(volume_row, self.gain_db_var,
+            from_=-15, to=15, increment=1, width=4, fmt="%.1f", bg=FRONT_BG,
+            validate=("key", (self.register(lambda p: bool(re.fullmatch(r"-?\d*(?:\.\d*)?", p))), "%P")))
+        self.gain_spinner.pack(side="left", padx=(8, 4))
+        self.gain_spinner.entry.bind("<FocusOut>", self._clamp_audio_values)
+        tk.Label(volume_row, text="dB", bg=FRONT_BG, fg=FRONT_TEXT,
+                 font=page_font).pack(side="left")
+        self.volume_preview_btn = _make_ghost_button(volume_row, "Preview", self.open_volume_preview,
+                                                      font=bold_font)
+        self.volume_preview_btn.pack(side="left", padx=(18, 0))
+        self._sync_audio_state()
 
         self.diff_list = DiffCheckList(body1, app, light=True)
         self.diff_list.pack(fill="both", expand=True, pady=(0, 16))
@@ -3593,13 +3755,13 @@ class OffsetShifterFrame(BaseToolFrame):
 
         # ---- Section 2: Audio Re-encode ------------------------------------
         card2 = RoundedCard(self.body, flat=True)
-        card2.pack(fill="x", padx=24, pady=(0, 20))
+        card2.pack(fill="x", padx=24, pady=(20, 0))
         body2 = card2.body
 
         header2 = tk.Frame(body2, bg=FRONT_BG)
         header2.pack(fill="x", pady=(0, 14))
         tk.Label(header2, text="Audio Re-encode", bg=FRONT_BG, fg=LIGHT_ACCENT,
-                 font=("Segoe UI", 13, "bold")).pack(side="left")
+                 font=bold_font).pack(side="left")
         info(header2, "Re-encode audio down to a lower bitrate to reduce file size."
              ).pack(side="left", padx=(6, 0))
 
@@ -3614,12 +3776,13 @@ class OffsetShifterFrame(BaseToolFrame):
         r_src_other.pack(fill="x", anchor="w", pady=(0, 12))
         LightRadiobutton(r_src_other, "Use other audio file", self.reencode_source_var, "other",
                           command=self._sync_reencode_source_state, bg=FRONT_BG).pack(side="left")
-        self.reencode_browse_btn = _make_ghost_button(r_src_other, "Browse...", self._browse_reencode_audio)
+        self.reencode_browse_btn = _make_ghost_button(r_src_other, "Browse...", self._browse_reencode_audio,
+                                                       font=bold_font)
         self.reencode_browse_btn.pack(side="left", padx=(10, 8))
         self.reencode_other_path = None
         self.reencode_other_name_var = tk.StringVar(value="")
         tk.Label(r_src_other, textvariable=self.reencode_other_name_var, bg=FRONT_BG,
-                 fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10)).pack(side="left")
+                 fg=FRONT_TEXT_MUTED, font=page_font).pack(side="left")
 
         self.reencode_bitrate_var = tk.StringVar(value="192")
         r_bitrate = tk.Frame(body2, bg=FRONT_BG)
@@ -3633,11 +3796,78 @@ class OffsetShifterFrame(BaseToolFrame):
         btn_row2 = tk.Frame(body2, bg=FRONT_BG)
         btn_row2.pack(fill="x")
         _make_accent_button(btn_row2, "Apply", self.apply_reencode).pack(side="right")
+        self.card1.pack(fill="x", padx=24, pady=(0, 20))
+
+    def _clamp_audio_values(self, _event=None):
+        for var, lo, hi, default in ((self.silence_duration_var, 100, 2000, 1000),
+                                     (self.gain_db_var, -15, 15, 0)):
+            try:
+                value = float(var.get())
+                if not math.isfinite(value):
+                    value = default
+            except ValueError:
+                value = default
+            value = max(lo, min(hi, value))
+            var.set(f"{value:g}")
+
+    def _sync_audio_state(self):
+        self.custom_silence_check.set_enabled(self.add_silence_var.get())
+        self.silence_spinner.set_enabled(self.add_silence_var.get() and self.custom_silence_var.get())
+        state = "normal" if self.volume_enabled_var.get() else "disabled"
+        self.gain_spinner.set_enabled(self.volume_enabled_var.get())
+        self.volume_preview_btn.configure(state=state)
+
+    def _close_volume_preview(self):
+        win = getattr(self, "_volume_preview_win", None)
+        if win is not None and win.winfo_exists():
+            win.close()
+
+    def on_hidden(self):
+        self._close_volume_preview()
+
+    def open_volume_preview(self):
+        existing = getattr(self, "_volume_preview_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+        if not self.require_map():
+            return
+        folder, _ = self.app.get_diff_files()
+        filename = logic.get_audio_filename(folder)
+        if not filename or not os.path.isfile(os.path.join(folder, filename)):
+            _show_alert(self, "Audio unavailable", "No audio file found for this map.")
+            return
+        if not logic.bass_available():
+            if _ask_choice_dialog(self, "BASS required", "Audio preview needs the BASS audio libraries.",
+                    [("Install automatically", "install"), ("Cancel", "cancel")]) != "install":
+                return
+            self.app.run_cancellable_job("Installing BASS audio libraries...",
+                lambda _cancel: logic.install_bass_bundled(),
+                on_success=lambda _result: self.open_volume_preview(),
+                on_error=lambda err: _show_alert(self, "Preview unavailable", err))
+            return
+        if not logic.ffmpeg_available():
+            if _ask_ffmpeg_required_choice(self, "Waveform preview") == "cancel":
+                return
+            self.app.run_cancellable_job("Installing audio tools...",
+                lambda _cancel: logic.install_ffmpeg_suite_bundled(),
+                on_success=lambda _result: self.open_volume_preview(),
+                on_error=lambda err: _show_alert(self, "Preview unavailable", err))
+            return
+        self._clamp_audio_values()
+        try:
+            self._volume_preview_win = AudioVolumePreviewWindow(
+                self, os.path.join(folder, filename), float(self.gain_db_var.get()),
+                lambda db: self.gain_db_var.set(f"{db:g}"))
+        except Exception as exc:
+            _show_alert(self, "Preview unavailable", str(exc))
 
     def on_shown(self):
         self.refresh()
 
     def on_map_changed(self):
+        self._close_volume_preview()
         self.refresh()
 
     def _sync_reencode_source_state(self):
@@ -3667,44 +3897,6 @@ class OffsetShifterFrame(BaseToolFrame):
         # grows/shrinks, producing a visible seam (see CopySection.refresh
         # for the same pattern).
         self.card1.redraw()
-        folder, diffs = self.app.get_diff_files()
-        if diffs:
-            bm = osu_parser.Beatmap(os.path.join(folder, diffs[0]))
-            tp = sorted(bm.timing_points, key=lambda t: t.time)
-            self.base_offset = int(tp[0].time) if tp else 0
-        else:
-            self.base_offset = 0
-        self.current_entry.configure(state="normal")
-        self.current_entry.delete(0, "end")
-        self.current_entry.insert(0, str(self.base_offset))
-        self.current_entry.configure(state="readonly")
-        self._updating = True
-        self.new_var.set(str(self.base_offset))
-        self.change_var.set("0")
-        self._updating = False
-
-    def _on_new_changed(self, *args):
-        if self._updating:
-            return
-        try:
-            new_val = int(float(self.new_var.get()))
-        except ValueError:
-            return
-        self._updating = True
-        self.change_var.set(str(new_val - self.base_offset))
-        self._updating = False
-
-    def _on_change_changed(self, *args):
-        if self._updating:
-            return
-        try:
-            change = int(float(self.change_var.get()))
-        except ValueError:
-            return
-        self._updating = True
-        self.new_var.set(str(self.base_offset + change))
-        self._updating = False
-
     def apply(self):
         if not self.require_map():
             return
@@ -3713,14 +3905,12 @@ class OffsetShifterFrame(BaseToolFrame):
         if not targets:
             _show_alert(self, "Nothing selected", "Tick at least one difficulty.")
             return
-        try:
-            delta = int(float(self.change_var.get()))
-        except ValueError:
-            _show_alert(self, "Invalid value", "Change must be a number.")
-            return
+        self._clamp_audio_values()
         add_silence = self.add_silence_var.get()
-        if delta == 0 and not add_silence:
-            _show_alert(self, "No change", "Change is 0 — nothing to apply.")
+        gain = float(self.gain_db_var.get()) if self.volume_enabled_var.get() else 0
+        duration = int(float(self.silence_duration_var.get())) if self.custom_silence_var.get() else 1000
+        if not add_silence and gain == 0:
+            _show_alert(self, "No change", "Select Add silence or set a non-zero audio gain.")
             return
 
         install_first = False
@@ -3728,60 +3918,37 @@ class OffsetShifterFrame(BaseToolFrame):
             choice = _ask_silence_quality_choice(self)
             if choice == "cancel":
                 return
-            install_first = (choice == "install")
+            install_first = choice == "install"
+        if gain and not install_first and not logic.ffmpeg_available():
+            if _ask_ffmpeg_required_choice(self, "Audio Volume Settings") == "cancel":
+                return
+            install_first = True
+        self._close_volume_preview()
+        self._start_apply_thread(folder, targets, add_silence, duration, gain, install_first)
 
-        self._start_apply_thread(folder, targets, delta, add_silence, install_first)
-
-    def _start_apply_thread(self, folder, targets, delta, add_silence, install_first):
-        def finish_ok():
-            total = delta + (logic.SILENCE_LEAD_IN_MS if add_silence else 0)
-            msg = f"Shifted {len(targets)} difficulty file(s) by {total} ms."
-            if add_silence:
-                msg += " Added 1000ms of silence to the audio."
-            self.notify_done(msg)
-            self.refresh()
-
-        need_busy = install_first or add_silence
-        if not need_busy:
-            # Plain metadata-only shift — no ffmpeg install, no audio
-            # encode, nothing worth a busy banner (let alone a Cancel
-            # button) over.
-            def work():
-                try:
-                    logic.apply_offset(folder, targets, delta, add_silence)
-                except Exception as e:
-                    # See the matching comment on the cancellable path
-                    # below re: capturing `e` as a string before deferring.
-                    err_msg = str(e)
-                    self.after(0, lambda: _show_alert(self, "Error", err_msg))
-                    return
-                self.after(0, finish_ok)
-
-            threading.Thread(target=work, daemon=True).start()
-            return
-
+    def _start_apply_thread(self, folder, targets, add_silence, duration, gain, install_first):
         def work(cancel_event):
             if install_first:
                 logic.install_ffmpeg_suite_bundled()
-                if cancel_event.is_set():
-                    return
-                self.after(0, lambda: self.notify_done(
-                    "ffmpeg + ffprobe installed — continuing with full quality."))
-            logic.apply_offset(folder, targets, delta, add_silence)
+            if cancel_event.is_set():
+                return
+            if gain:
+                logic.adjust_audio_volume(folder, gain)
+            if add_silence:
+                logic.apply_offset(folder, targets, 0, True, silence_ms=duration)
 
-        busy_msg = ("Installing ffmpeg + ffprobe (may take a few minutes)... Please wait..."
-                     if install_first else "Processing... Please wait...")
+        def finish(_result):
+            messages = []
+            if add_silence:
+                messages.append(f"Added {duration} ms of silence; shifted {len(targets)} difficulties.")
+            if gain:
+                messages.append(f"Adjusted shared audio by {gain:+g} dB.")
+            self.notify_done(" ".join(messages))
+            self.refresh()
 
-        def on_error(err_msg):
-            # Capture the message as a plain str now — `e` itself is
-            # implicitly deleted the moment its except block exits (PEP
-            # 3110), but this callback only runs later, once Tkinter gets
-            # around to it — run_cancellable_job already does this
-            # capture for us before calling on_error.
-            _show_alert(self, "Error", err_msg)
-
-        self.app.run_cancellable_job(busy_msg, work, on_success=lambda _r: finish_ok(),
-                                      on_error=on_error)
+        self.app.run_cancellable_job(
+            "Installing audio tools..." if install_first else "Processing audio...",
+            work, on_success=finish, on_error=lambda err: _show_alert(self, "Error", err))
 
     def apply_reencode(self):
         bitrate = int(self.reencode_bitrate_var.get())
@@ -3808,6 +3975,7 @@ class OffsetShifterFrame(BaseToolFrame):
                                      install_first=install_first)
 
     def _start_reencode_thread(self, bitrate, folder=None, external_path=None, install_first=False):
+        self._close_volume_preview()
         def do_reencode():
             if external_path:
                 return logic.apply_audio_reencode_external(external_path, bitrate)
@@ -3839,6 +4007,313 @@ class OffsetShifterFrame(BaseToolFrame):
                      if install_first else "Re-encoding audio... Please wait...")
         self.app.run_cancellable_job(busy_msg, work, on_success=on_success, on_error=on_error,
                                       cancelled_toast="Re-encode Cancelled!")
+
+
+class AudioVolumePreviewWindow(tk.Toplevel):
+    """Audition relative gain without editing the song until the page's Apply."""
+
+    PLAYHEAD_FRACTION = .2
+
+    def __init__(self, master, audio_path, gain_db, on_apply):
+        super().__init__(master)
+        self.withdraw()
+        self.configure(bg=FRONT_BG)
+        self.title("Audio Volume Preview")
+        self.minsize(680, 360)
+        self._player = None
+        self._job = None
+        self._closed = False
+        self._playing = False
+        self._position = 0.0
+        self._view_start = 0.0
+        self._span = 10000.0
+        self._wave_drag = None
+        self._peaks = []
+        self._decoded = []
+        self._on_apply = on_apply
+        try:
+            self._player = BassPlayer(audio_path)
+            self._duration = self._player.duration_ms
+            self.gain_var = tk.DoubleVar(value=gain_db)
+            self.monitor_var = tk.DoubleVar(value=70)
+            self.gain_label = tk.StringVar()
+            self.time_var = tk.StringVar(value=_fmt_ms_timestamp(0))
+            outer = tk.Frame(self, bg=FRONT_BG)
+            outer.pack(fill="both", expand=True, padx=20, pady=18)
+            header = tk.Frame(outer, bg=FRONT_BG)
+            header.pack(fill="x")
+            tk.Label(header, text="Audio Volume Preview", bg=FRONT_BG, fg=FRONT_TEXT,
+                     font=("Segoe UI", 14, "bold")).pack(side="left")
+            preview_info = InfoIcon(header,
+                "Adjust the volume/loudness of the audio itself.\n"
+                "Use the volume visualisation to manage the volume\n"
+                "Alt+scroll to zoom and Space to play/pause")
+            preview_info.configure(bg=FRONT_BG)
+            preview_info.pack(side="left", padx=(6, 0))
+            _make_accent_button(header, "Apply", self._apply).pack(side="right")
+            tk.Label(outer, text=os.path.basename(audio_path), bg=FRONT_BG,
+                     fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 12))
+
+            controls = tk.Frame(outer, bg=FRONT_BG)
+            controls.pack(fill="x", pady=(0, 12))
+            gain_box = tk.Frame(controls, bg=FRONT_BG)
+            gain_box.pack(side="left")
+            ttk.Style().configure("Light.Horizontal.TScale", background=FRONT_BG,
+                                  troughcolor=FRONT_BORDER)
+            tk.Label(gain_box, textvariable=self.gain_label, bg=FRONT_BG,
+                     fg=LIGHT_ACCENT, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+            self.gain_scale = ttk.Scale(gain_box, from_=-15, to=15, orient="horizontal",
+                     variable=self.gain_var, command=self._gain_changed, length=180,
+                     style="Light.Horizontal.TScale")
+            self.gain_scale.pack()
+            self._bind_jump_slider(self.gain_scale)
+            self.meter = tk.Canvas(controls, width=280, height=54, bg=FRONT_BG, highlightthickness=0)
+            self.meter.pack(side="left", fill="x", expand=True, padx=20)
+            self.meter.bind("<Configure>", lambda _e: self._draw_meters((0, 0)))
+
+            self.wave = tk.Canvas(outer, height=170, bg=LIGHT_ACCENT_SOFT,
+                                  highlightthickness=0, cursor="hand2")
+            self.wave.pack(fill="both", expand=True)
+            self.wave.bind("<Configure>", lambda _e: self._draw_wave())
+            self.wave.bind("<Button-1>", self._wave_press)
+            self.wave.bind("<B1-Motion>", self._wave_motion)
+            self.wave.bind("<ButtonRelease-1>", self._wave_release)
+            self.wave.bind("<MouseWheel>", self._wheel)
+            self.wave.bind("<Alt-MouseWheel>", self._zoom_wave)
+            self.seek_bar = AutoHideScrollbar(outer, orient="horizontal", command=self._scroll,
+                bg=FRONT_BG, target=self.wave, reveal_on_change=False)
+            self.seek_bar.pack(fill="x", pady=(4, 10))
+            bottom = tk.Frame(outer, bg=FRONT_BG)
+            bottom.pack(fill="x")
+            self.play_btn = _TransportButton(bottom, "play", self._toggle, size=32)
+            self.play_btn.pack(side="left")
+            tk.Label(bottom, textvariable=self.time_var, bg=FRONT_BG, fg=FRONT_TEXT,
+                     font=("Segoe UI", 10)).pack(side="left", padx=12)
+            tk.Label(bottom, text="Listening volume", bg=FRONT_BG,
+                     fg=FRONT_TEXT_MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(20, 4))
+            self.monitor_scale = ttk.Scale(bottom, from_=0, to=100, variable=self.monitor_var,
+                     command=self._gain_changed, orient="horizontal", length=120,
+                     style="Light.Horizontal.TScale")
+            self.monitor_scale.pack(side="left")
+            self._bind_jump_slider(self.monitor_scale)
+            self._gain_changed()
+            self.protocol("WM_DELETE_WINDOW", self.close)
+            self.bind("<Escape>", lambda _e: self.close())
+            self.bind("<space>", self._space)
+            self.bind("<Destroy>", self._destroyed, add="+")
+            self.transient(master.winfo_toplevel())
+            _position_over_window(self, master, 800, 440)
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+            # Workers never touch Tk; the UI timer picks up the decoded result.
+            result_slot = self._decoded
+            threading.Thread(target=lambda: result_slot.append(logic.decode_audio_peaks(audio_path)),
+                             daemon=True).start()
+            self._tick()
+        except Exception:
+            self.close()
+            raise
+
+    def _gain_changed(self, _value=None):
+        self.gain_label.set(f"Gain  {self.gain_var.get():+.1f} dB")
+        if self._player:
+            self._player.set_preview_gain(self.gain_var.get(), self.monitor_var.get())
+        if hasattr(self, "wave"):
+            self._draw_wave()
+
+    def _apply(self):
+        self._on_apply(self.gain_var.get())
+        self.close()
+
+    def _space(self, _event):
+        self._toggle()
+        return "break"
+
+    def _toggle(self):
+        try:
+            if self._playing:
+                self._player.pause()
+            else:
+                if self._position >= self._duration:
+                    self._player.seek(0)
+                self._player.play()
+            self._playing = not self._playing
+            self.play_btn.set_kind("pause" if self._playing else "play")
+        except Exception as exc:
+            self._fail(exc)
+
+    def _seek(self, event):
+        time_ms = self._view_start + event.x / max(1, self.wave.winfo_width()) * self._span
+        self._seek_time(time_ms)
+
+    def _seek_time(self, time_ms):
+        try:
+            target = max(0, min(self._duration, time_ms))
+            at_end = target >= self._duration
+            if at_end and self._playing:
+                self._player.pause()
+                self._playing = False
+                self.play_btn.set_kind("play")
+            # BASS rejects a seek exactly to EOF. Park just inside the
+            # stream while displaying the precise end; Play restarts at 0.
+            self._player.seek(min(target, max(0, self._duration - 1)))
+            self._position = target if at_end else self._player.get_time()
+            self.time_var.set(_fmt_ms_timestamp(self._position))
+            self._draw_wave()
+        except Exception as exc:
+            self._fail(exc)
+
+    def _wave_press(self, event):
+        resume = self._playing
+        if resume:
+            self._position = self._player.get_time()
+            self._toggle()
+        self._wave_drag = (event.x, self._view_start, self._position, resume)
+        return "break"
+
+    def _wave_motion(self, event):
+        if self._wave_drag is None:
+            return "break"
+        x, _start, position, _resume = self._wave_drag
+        delta = (x - event.x) / max(1, self.wave.winfo_width()) * self._span
+        target = max(0, min(self._duration, position + delta))
+        self._seek_time(target)
+        return "break"
+
+    def _wave_release(self, event):
+        if self._wave_drag is not None:
+            resume = self._wave_drag[3]
+            self._wave_motion(event)
+            self._wave_drag = None
+            if resume and not self._closed and self._position < self._duration:
+                self._toggle()
+        return "break"
+
+    def _zoom_wave(self, event):
+        if self._wave_drag is not None or not event.delta:
+            return "break"
+        steps = max(-8, min(8, event.delta / 120))
+        self._span = max(min(250, self._duration),
+                         min(max(250, self._duration), self._span * 1.25 ** -steps))
+        self._draw_wave()
+        return "break"
+
+    def _bind_jump_slider(self, scale):
+        def jump(event):
+            scale.set(_scale_value_at_x(scale, event.x))
+            self._gain_changed()
+            return "break"
+        scale.bind("<Button-1>", jump)
+        scale.bind("<B1-Motion>", jump)
+
+    def _scroll(self, *args):
+        if args[0] == "moveto":
+            target = float(args[1]) * (self._duration + self._span)
+        else:
+            target = self._position + int(args[1]) * self._span * (.8 if args[2] == "pages" else .1)
+        self._seek_time(target)
+
+    def _wheel(self, event):
+        self._scroll("scroll", -1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _draw_wave(self):
+        canvas = self.wave
+        canvas.delete("all")
+        w, h = canvas.winfo_width(), canvas.winfo_height()
+        if w < 2:
+            return
+        # Allow empty space before/after the song instead of pinning the
+        # viewport at its ends and making the playhead drift across it.
+        self._view_start = self._position - self._span * self.PLAYHEAD_FRACTION
+        middle = (h - 22) / 2
+        canvas.create_line(0, middle, w, middle, fill=FRONT_BORDER)
+        if self._peaks:
+            gain = 10 ** (self.gain_var.get() / 20)
+            for x in range(0, w, 2):
+                start = int((self._view_start + x / w * self._span) / 5)
+                end = max(start + 1, int((self._view_start + (x + 2) / w * self._span) / 5))
+                peak = max(self._peaks[max(0, start):max(0, end)], default=0) * gain
+                amp = min(1, peak) * max(1, middle - 12)
+                canvas.create_line(x, middle - amp, x, middle + amp,
+                                   fill="#ef4444" if peak > 1 else "#7266dd")
+        else:
+            canvas.create_text(w / 2, middle, text=self._wave_message if hasattr(self, "_wave_message")
+                               else "Loading waveform…", fill=FRONT_TEXT_MUTED)
+        for i in range(6):
+            x = i * w / 5
+            canvas.create_text(max(28, min(w - 28, x)), h - 10,
+                text=_fmt_ms_timestamp(self._view_start + i * self._span / 5),
+                fill=FRONT_TEXT_MUTED, font=("Segoe UI", 8))
+        cursor = self.PLAYHEAD_FRACTION * w
+        canvas.create_line(cursor, 0, cursor, h - 22, fill=FRONT_TEXT, width=2, tags="playhead")
+        extent = max(1, self._duration + self._span)
+        self.seek_bar.set(self._position / extent, (self._position + self._span) / extent)
+
+    def _draw_meters(self, levels):
+        self.meter.delete("all")
+        w = max(100, self.meter.winfo_width()) - 26
+        for row, (label, level) in enumerate(zip(("L", "R"), levels)):
+            y = 7 + row * 15
+            self.meter.create_text(5, y + 5, text=label, font=("Segoe UI", 8), fill=FRONT_TEXT_MUTED)
+            db = 20 * math.log10(max(1e-6, level))
+            for segment in range(30):
+                x = 16 + segment * w / 30
+                color = "#62ce76" if segment < 25 else ("#f5c84b" if segment < 29 else "#ef4444")
+                self.meter.create_rectangle(x, y, x + w / 30 - 1, y + 10,
+                    fill=color if -60 + segment * 2 <= db else FRONT_BORDER, outline="")
+        for db in (-60, -48, -36, -24, -12, 0):
+            self.meter.create_text(16 + (db + 60) / 60 * w, 47, text=str(db),
+                                   font=("Segoe UI", 8), fill=FRONT_TEXT_MUTED)
+
+    def _tick(self):
+        if self._closed:
+            return
+        self._job = None
+        if self._decoded:
+            self._peaks, _duration = self._decoded.pop()
+            self._wave_message = "Waveform unavailable — install ffmpeg or check the audio file."
+            self._draw_wave()
+        try:
+            levels = (0, 0)
+            if self._playing:
+                self._position = self._player.get_time()
+                levels = self._player.get_levels()
+                if self._player.ended():
+                    self._playing = False
+                    self.play_btn.set_kind("play")
+                self.time_var.set(_fmt_ms_timestamp(self._position))
+                self._draw_wave()
+            self._draw_meters(levels)
+        except Exception as exc:
+            self._fail(exc)
+            return
+        self._job = self.after(40, self._tick)
+
+    def _fail(self, error):
+        owner = self.master
+        self.close()
+        _show_alert(owner, "Preview error", str(error))
+
+    def _destroyed(self, event):
+        if event.widget is self:
+            self._release()
+
+    def _release(self):
+        self._closed = True
+        if self._job is not None:
+            self.after_cancel(self._job)
+            self._job = None
+        if self._player is not None:
+            self._player.close()
+            self._player = None
+
+    def close(self):
+        self._release()
+        self.destroy()
+
 
 
 def _fmt_ms_timestamp(ms) -> str:
@@ -3875,17 +4350,17 @@ def _parse_ms_timestamp(s):
 
 # =============================================================================
 class TimingEditorFrame(BaseToolFrame):
-    """"Timing Editor" sidebar tool — a per-red-line timing editor with a
+    """"Offset/Timing Editor" sidebar tool — a per-red-line timing editor with a
     scrollable/zoomable timeline and a song waveform strip underneath.
 
     Table: one row per red line — a selection checkbox (bulk edit / Delete),
-    read-only Old offset / BPM, editable Change (Δoffset ±1ms, ΔBPM ±0.1)
-    and New Offset / New BPM columns kept in sync two ways (edit either
-    side), plus BL (omit first barline) and Time sig. Tick some Sel boxes
+    editable BPM / Offset, Change (Δoffset ±1ms, ΔBPM ±0.1) columns kept
+    in sync two ways (edit either side), plus BL (omit first barline)
+    and Time sig. Tick some Sel boxes
     and a red "Delete selected" button (also the Del key) removes those
     red lines.
 
-    Timeline: red lines drawn from the *current New* values with a live
+    Timeline: red lines drawn from the current edited values with a live
     beat grid at the chosen divisor; barlines shown as thick black bars;
     drag a red line to snap it, left-drag empty space to scroll, wheel =
     scroll by one tick, Alt+wheel = zoom, Ctrl+wheel = change divisor.
@@ -3911,7 +4386,7 @@ class TimingEditorFrame(BaseToolFrame):
     WAVE_H = 66
     LEFT_PAD = 8
     BUCKETS_PER_SEC = 200
-    TABLE_COLS = 9
+    TABLE_COLS = 7
     CURSOR_FRAC = 0.30           # the fixed "current time" line sits this far from the left
     # Tk/canvas work at 240fps saturated the event loop and made the apparent
     # scroll rate uneven. BASS schedules song and clicks together, so visual
@@ -3933,8 +4408,8 @@ class TimingEditorFrame(BaseToolFrame):
     TICK_STYLES = {2: ("#e8462e", 34), 4: ("#4a90d9", 27),
                    8: ("#d4b106", 19), 12: ("#999999", 15)}
 
-    ROW_COLS = ("sel_chk", "oe", "be", "doff_spin", "dbpm_spin", "bl_chk",
-                 "noff_spin", "nbpm_spin", "ts_spin")   # grid column order within a row frame
+    ROW_COLS = ("sel_chk", "nbpm_spin", "noff_spin", "doff_spin", "dbpm_spin",
+                 "bl_chk", "ts_spin")   # grid column order within a row frame
 
     def __init__(self, master, app):
         super().__init__(master, app)
@@ -4012,22 +4487,39 @@ class TimingEditorFrame(BaseToolFrame):
         # when set, the mouse can only seek on the timeline/waveform — red-line
         # drag-to-move is disabled (see _tl_press)
         self.timeline_locked_var = tk.BooleanVar(value=False)
-        # when set, Apply also remaps hit objects onto the new grid and rescales
-        # green-line SV so visible scroll speed is unchanged (the old default
-        # behaviour). Off by default: Apply then only rewrites the red lines.
-        self.resnap_equalise_var = tk.BooleanVar(value=False)
+        # Uniform offset edits move the notes too by default. Timing edits
+        # refresh this default; the checkbox can still be overridden manually.
+        self.resnap_equalise_var = tk.BooleanVar(value=True)
 
         body = self.body
 
         # ---- header ----
         head = tk.Frame(body, bg=FRONT_BG)
         head.pack(fill="x", padx=24, pady=(20, 4))
-        tk.Label(head, text="Timing Editor", bg=FRONT_BG, fg=FRONT_TEXT,
+        tk.Label(head, text="Offset/Timing Editor", bg=FRONT_BG, fg=FRONT_TEXT,
                  font=("Segoe UI", 20, "bold")).pack(side="left")
         _hinfo = InfoIcon(head, "Time and refine the timing of the map with waveform. "
                         "THIS FEATURE IS EXPERIMENTAL!")
         _hinfo.configure(bg=FRONT_BG)
         _hinfo.pack(side="left", padx=(6, 0))
+
+        self.advanced_timing_var = tk.BooleanVar(value=False)
+        self._timing_mode_advanced = False
+        self._advanced_offset_delta = 0
+        mode_row = tk.Frame(body, bg=FRONT_BG)
+        mode_row.pack(fill="x", padx=24, pady=(6, 8))
+        mode_toggle = tk.Frame(mode_row, bg=FRONT_BG)
+        mode_toggle.pack(side="right")
+        tk.Label(mode_toggle, text="Advanced Timing Mode", bg=FRONT_BG,
+                 fg=FRONT_TEXT_MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(0, 8))
+        self.advanced_timing_switch = LightSwitch(
+            mode_toggle, self.advanced_timing_var, command=self._sync_timing_mode)
+        self.advanced_timing_switch.pack(side="left")
+        self.timing_controls = tk.Frame(body, bg=FRONT_BG)
+        self.timing_controls.pack(fill="x")
+        self.offset_controls = TimingOffsetControls(
+            self.timing_controls, app, on_change=self._on_offset_preview_changed)
+        self.advanced_controls = tk.Frame(self.timing_controls, bg=FRONT_BG)
 
         # ---- input validators (reject anything that isn't a number;
         #      offset fields additionally allow ':' for mm:ss:mmm) ----
@@ -4037,11 +4529,11 @@ class TimingEditorFrame(BaseToolFrame):
         self._vc_offset = (self.register(self._valid_offset), "%P")
 
         # ---- table (scrollable both ways, frozen header) ----
-        # tbl_wrap is a 2x4 grid: the header canvas and body canvas share
+        # tbl_wrap is a 2x5 grid: the header canvas and body canvas share
         # column 0 (so they are EXACTLY the same width — that's what keeps
         # their columns aligned while scrolled sideways), the vertical
-        # scrollbar spans column 1, the horizontal scrollbar is the last row.
-        tbl_wrap = tk.Frame(body, bg=FRONT_BG, highlightthickness=1,
+        # scrollbar spans column 1, followed by horizontal scroll and resize rows.
+        tbl_wrap = tk.Frame(self.advanced_controls, bg=FRONT_BG, highlightthickness=1,
                              highlightbackground=FRONT_BORDER, highlightcolor=FRONT_BORDER)
         tbl_wrap.pack(fill="x", padx=24, pady=(8, 6))
         tbl_wrap.grid_columnconfigure(0, weight=1)
@@ -4051,8 +4543,7 @@ class TimingEditorFrame(BaseToolFrame):
         self.hdr_canvas.grid(row=0, column=0, sticky="ew")
         self.hdr_frame = tk.Frame(self.hdr_canvas, bg=FRONT_BG)
         self.hdr_canvas.create_window((0, 0), window=self.hdr_frame, anchor="nw")
-        headers = ["Sel", "Old Offset", "BPM", "Δ Offset", "Δ BPM", "Omit BL",
-                   "New Offset", "New BPM", "Time sig"]
+        headers = ["Sel", "BPM", "Offset", "Δ Offset", "Δ BPM", "Omit BL", "Time sig"]
         for col, txt in enumerate(headers):
             if col == 0:
                 self.select_all_var = tk.BooleanVar(value=False)
@@ -4075,6 +4566,16 @@ class TimingEditorFrame(BaseToolFrame):
         x_scroll = AutoHideScrollbar(tbl_wrap, orient="horizontal", command=self._table_xview, target=self.table_canvas)
         x_scroll.grid(row=3, column=0, sticky="ew")
         self.table_canvas.configure(yscrollcommand=tbl_scroll.set, xscrollcommand=x_scroll.set)
+        self.table_resize_handle = tk.Canvas(
+            tbl_wrap, height=10, bg=FRONT_BG, highlightthickness=0,
+            cursor="sb_v_double_arrow")
+        self.table_resize_handle.grid(row=4, column=0, columnspan=2, sticky="ew")
+        self.table_resize_handle.bind("<Configure>", self._draw_table_resize_handle)
+        self.table_resize_handle.bind("<Button-1>", self._start_table_resize)
+        self.table_resize_handle.bind("<B1-Motion>", self._resize_table)
+        self.table_resize_handle.bind("<ButtonRelease-1>", self._finish_table_resize)
+        self._table_resize_start = None
+        self._table_resize_guide = tk.Frame(self.advanced_controls, bg=LIGHT_ACCENT, height=2)
         self.table_inner = tk.Frame(self.table_canvas, bg=FRONT_BG)
         self.table_canvas.create_window((0, 0), window=self.table_inner, anchor="nw")
         self.table_inner.bind("<Configure>", lambda _e: self._sync_scrollregions())
@@ -4088,7 +4589,7 @@ class TimingEditorFrame(BaseToolFrame):
                                    bg=FRONT_BG, fg=FRONT_TEXT_MUTED, font=("Segoe UI", 10))
         self.empty_lbl.grid(row=0, column=0, padx=10, pady=10, sticky="w")
 
-        self.add_row = add_row = tk.Frame(body, bg=FRONT_BG)
+        self.add_row = add_row = tk.Frame(self.advanced_controls, bg=FRONT_BG)
         add_row.pack(fill="x", padx=24, pady=(0, 6))
         _make_ghost_button(add_row, "+ Add new redline", self._add_redline).pack(side="left")
         self.revert_btn = _make_ghost_button(add_row, "⟲ Revert all", self._revert)
@@ -4105,6 +4606,16 @@ class TimingEditorFrame(BaseToolFrame):
                                     bg="#fdecec", activebackground="#fbdcdc")
 
         self._sync_delete_button()
+
+        resnap_row = tk.Frame(self.advanced_controls, bg=FRONT_BG)
+        resnap_row.pack(fill="x", padx=24, pady=(0, 12))
+        LightCheckbox(resnap_row, "Resnap notes and compensate SV",
+                       self.resnap_equalise_var, bg=FRONT_BG).pack(side="left")
+        InfoIcon(resnap_row,
+                 "EXPERIMENTAL! Works best on single BPM, and/or double/half BPM "
+                 "change. May not work well with multiple timing points. "
+                 "Automatically checked when all redlines have the same offset change "
+                 "and no BPM change. Offset-only edits move notes by that same amount.").pack(side="left", padx=(6, 0))
 
         # ---- timeline nav + divisor selector ----
         div_row = tk.Frame(body, bg=FRONT_BG)
@@ -4205,14 +4716,6 @@ class TimingEditorFrame(BaseToolFrame):
         self.diff_list = DiffCheckList(body, app, light=True)
         self.diff_list.pack(fill="x", padx=24, pady=(0, 12))
 
-        resnap_row = tk.Frame(body, bg=FRONT_BG)
-        resnap_row.pack(fill="x", padx=24, pady=(0, 12))
-        LightCheckbox(resnap_row, "Resnap notes and compensate SV",
-                       self.resnap_equalise_var, bg=FRONT_BG).pack(side="left")
-        InfoIcon(resnap_row,
-                 "EXPERIMENTAL! Works best on single BPM, and/or double/half BPM "
-                 "change. May not work well with multiple timing points.").pack(side="left", padx=(6, 0))
-
         foot = tk.Frame(body, bg=FRONT_BG)
         foot.pack(fill="x", padx=24, pady=(0, 20))
         self.status_var = tk.StringVar(value="")
@@ -4220,6 +4723,68 @@ class TimingEditorFrame(BaseToolFrame):
                  font=("Segoe UI", 9)).pack(side="left")
         self.apply_btn = _make_accent_button(foot, "Apply", self._apply)
         self.apply_btn.pack(side="right")
+
+        self._sync_timing_mode()
+
+    def _on_offset_preview_changed(self):
+        if not self.advanced_timing_var.get():
+            self._redraw_timeline()
+
+    def _sync_timing_mode(self):
+        advanced = self.advanced_timing_var.get()
+        if advanced != self._timing_mode_advanced:
+            self._transfer_mode_offset(advanced)
+            self._timing_mode_advanced = advanced
+        if advanced:
+            self.offset_controls.pack_forget()
+            self.advanced_controls.pack(fill="x")
+        else:
+            self.advanced_controls.pack_forget()
+            self.offset_controls.pack(fill="x", padx=24, pady=(0, 12))
+        self._drag_red = None
+        self._redraw_timeline()
+
+    def _transfer_mode_offset(self, advanced):
+        """Carry the overall shift across modes without flattening timing edits."""
+        self._flush_commit()
+        controls = self.offset_controls
+        if advanced:
+            try:
+                delta = int(float(controls.change_var.get()))
+            except (ValueError, OverflowError):
+                return
+            shift = delta - self._advanced_offset_delta
+            if shift:
+                self._updating = True
+                try:
+                    for row in self.rows:
+                        time = self._f_off(row["noff_var"])
+                        if time is not None:
+                            row["noff_var"].set(_fmt_ms_timestamp(time + shift))
+                            self._sync_delta_from_new(row)
+                finally:
+                    self._updating = False
+                self._sync_resnap_default()
+                self._commit_state()
+            self._advanced_offset_delta = delta
+        else:
+            originals = sorted(
+                (row for row in self._visible_rows() if not row["is_new"]),
+                key=lambda row: row["old_time"])
+            if not originals:
+                return
+            first = originals[0]
+            time = self._f_off(first["noff_var"])
+            if time is None:
+                return
+            delta = osu_parser.stable_round(time - first["old_time"])
+            self._advanced_offset_delta = delta
+            controls._updating = True
+            try:
+                controls.change_var.set(str(delta))
+                controls.new_var.set(str(controls.base_offset + delta))
+            finally:
+                controls._updating = False
 
     # ------------------------------------------------------------------
     # Lifecycle — (re)load the map's red lines
@@ -4255,17 +4820,17 @@ class TimingEditorFrame(BaseToolFrame):
         return self.app.frames.get(getattr(self.app, "_current_frame_name", None)) is self
 
     def _on_undo_key(self, _event=None):
-        if self._is_current():
+        if self._is_current() and self.advanced_timing_var.get():
             self._undo()
             return "break"
 
     def _on_redo_key(self, _event=None):
-        if self._is_current():
+        if self._is_current() and self.advanced_timing_var.get():
             self._redo()
             return "break"
 
     def _on_delete_key(self, _event=None):
-        if not self._is_current():
+        if not self._is_current() or not self.advanced_timing_var.get():
             return
         w = self.focus_get()
         if isinstance(w, (tk.Entry, tk.Spinbox, tk.Text)):
@@ -4316,6 +4881,8 @@ class TimingEditorFrame(BaseToolFrame):
         self._stop_audio()
         self._rate_audio_cache.clear()
         self._loaded_src = key
+        self._advanced_offset_delta = 0
+        self.offset_controls.refresh()
         # fresh undo history per map load (can't undo past the map's own state)
         self._committed_state = None
         self._undo_stack.clear()
@@ -4330,6 +4897,7 @@ class TimingEditorFrame(BaseToolFrame):
         for r in self.rows:
             r["frame"].destroy()   # destroys all 9 child widgets with it
         self.rows = []
+        self._sync_resnap_default()
         self._sync_delete_button()
         self.divisor_var.set("1/1")
 
@@ -4366,6 +4934,7 @@ class TimingEditorFrame(BaseToolFrame):
         self.cursor_ms = float(reds[0].time)
         self._committed_state = self._capture_state()
         self._initial_state = self._committed_state
+        self._sync_resnap_default()
         self._update_undo_buttons()
         self._sync_delete_button()
 
@@ -4414,7 +4983,7 @@ class TimingEditorFrame(BaseToolFrame):
 
         cbg = FRONT_BG
         # Each row lives in its own Frame — hiding a row (delete / undo)
-        # then only reflows N frames instead of 9·N nested widgets, and the
+        # then only reflows N frames instead of 7·N nested widgets, and the
         # widgets inside a hidden frame get no <Configure> at all. That's
         # what keeps delete-undo fast on a heavily-timed map.
         rf = row["frame"] = tk.Frame(self.table_inner, bg=cbg)
@@ -4423,16 +4992,6 @@ class TimingEditorFrame(BaseToolFrame):
         row["sel_chk"] = LightCheckbox(rf, "", row["sel_var"], bg=cbg,
                                         command=self._on_selection_changed)
         row["sel_chk"].grid(row=0, column=0, padx=6, pady=3)
-
-        old_lbl = _fmt_ms_timestamp(old_time)
-        oe = _make_light_entry(rf, width=11, state="readonly", bg=FRONT_BG)
-        oe.configure(state="normal"); oe.insert(0, old_lbl); oe.configure(state="readonly")
-        oe.grid(row=0, column=1, padx=6, pady=3)
-        row["oe"] = oe
-        be = _make_light_entry(rf, width=8, state="readonly", bg=FRONT_BG)
-        be.configure(state="normal"); be.insert(0, self._fmt_bpm(old_bpm)); be.configure(state="readonly")
-        be.grid(row=0, column=2, padx=6, pady=3)
-        row["be"] = be
 
         row["doff_spin"] = LightSpinner(rf, row["doff_var"], from_=-10_000_000,
                                          to=10_000_000, increment=1, width=6, fmt="%d",
@@ -4448,22 +5007,22 @@ class TimingEditorFrame(BaseToolFrame):
                                          to=10_000_000, increment=1, width=10,
                                          fmt=_fmt_ms_timestamp, parse=_parse_ms_timestamp,
                                          validate=("key", self._vc_offset), bg=FRONT_BG)
-        row["noff_spin"].grid(row=0, column=6, padx=6, pady=3)
+        row["noff_spin"].grid(row=0, column=2, padx=6, pady=3)
         row["nbpm_spin"] = LightSpinner(rf, row["nbpm_var"], from_=1, to=100000,
                                          increment=0.1, width=7,
                                          validate=("key", self._vc_snum), bg=FRONT_BG)
-        row["nbpm_spin"].grid(row=0, column=7, padx=6, pady=3)
+        row["nbpm_spin"].grid(row=0, column=1, padx=6, pady=3)
         row["ts_spin"] = LightSpinner(rf, row["ts_var"], from_=2, to=10, increment=1,
                                        width=4, fmt="%d", validate=("key", self._vc_uint), bg=FRONT_BG)
-        row["ts_spin"].grid(row=0, column=8, padx=6, pady=3)
+        row["ts_spin"].grid(row=0, column=6, padx=6, pady=3)
 
         row["noff_spin"].entry.bind("<FocusOut>", lambda _e, rr=row: self._normalize_offset(rr), add="+")
         row["noff_spin"].entry.bind("<Return>", lambda _e, rr=row: self._normalize_offset(rr), add="+")
         row["ts_spin"].entry.bind("<FocusOut>", lambda _e, rr=row: self._clamp_ts(rr), add="+")
 
-        # Double-clicking ANY of the row's fields (editable or not) jumps
+        # Double-clicking any of the row's fields jumps
         # the timeline to that red line's timestamp.
-        for w in (oe, be, row["doff_spin"], row["dbpm_spin"], row["noff_spin"],
+        for w in (row["doff_spin"], row["dbpm_spin"], row["noff_spin"],
                    row["nbpm_spin"], row["ts_spin"]):
             ent = getattr(w, "entry", None) or w
             ent.bind("<Double-Button-1>", lambda _e, rr=row: self._jump_to_row(rr), add="+")
@@ -4637,7 +5196,7 @@ class TimingEditorFrame(BaseToolFrame):
                 self._paint_row(row)
 
     def _align_columns(self):
-        """Each row is its own Frame with its own 9-column grid; keep those
+        """Each row is its own Frame with its own 7-column grid; keep those
         columns lined up with each other and with the frozen header by
         pushing the widest measured width per column onto every row frame +
         the header frame as a `minsize`."""
@@ -4658,6 +5217,44 @@ class TimingEditorFrame(BaseToolFrame):
                     r["frame"].grid_columnconfigure(cidx, minsize=w)
         self.table_inner.update_idletasks()   # so _sync_scrollregions sees settled reqwidth
         self._sync_scrollregions()
+
+    def _draw_table_resize_handle(self, event):
+        handle = self.table_resize_handle
+        handle.delete("all")
+        center = event.width / 2
+        for y in (3, 6):
+            handle.create_line(center - 18, y, center + 18, y,
+                               fill=FRONT_TEXT_MUTED)
+
+    def _start_table_resize(self, event):
+        self._table_resize_start = (
+            event.y_root, self.table_canvas.winfo_height(),
+            self.table_resize_handle.winfo_rooty() - self.advanced_controls.winfo_rooty())
+        self._table_resize_height = self.table_canvas.winfo_height()
+
+    def _resize_table(self, event):
+        if self._table_resize_start is None:
+            return
+        start_y, start_height, guide_y = self._table_resize_start
+        height = max(72, min(self.winfo_screenheight(),
+                             start_height + event.y_root - start_y))
+        self._table_resize_height = height
+        # Moving embedded native windows on every mouse event can leave stale
+        # clipped child widgets on Windows. Preview with a placed guide; only
+        # resize the scrolling page once the mouse is released.
+        self._table_resize_guide.place(
+            x=24, y=guide_y + height - start_height,
+            relwidth=1, width=-48, height=2)
+        self._table_resize_guide.lift()
+
+    def _finish_table_resize(self, event):
+        if self._table_resize_start is None:
+            return
+        self._resize_table(event)
+        height = self._table_resize_height
+        self._table_resize_start = None
+        self._table_resize_guide.place_forget()
+        self.table_canvas.configure(height=height)
 
     def _sync_scrollregions(self):
         """Pin both canvases to the SAME scroll width so an equal xview
@@ -4689,7 +5286,7 @@ class TimingEditorFrame(BaseToolFrame):
         self.hdr_canvas.xview_moveto(self.table_canvas.xview()[0])
 
     def _normalize_offset(self, row):
-        """On focus-out / Return, redisplay the New Offset field in canonical
+        """On focus-out / Return, redisplay the Offset field in canonical
         `mm:ss:mmm` form (accepting either a raw ms number or a timestamp as
         input). If it's unparseable, fall back to whatever the Δ implies."""
         v = _parse_ms_timestamp(row["noff_var"].get())
@@ -4805,8 +5402,35 @@ class TimingEditorFrame(BaseToolFrame):
     def _after_row_edit(self, row):
         if self._restoring:
             return
+        self._sync_resnap_default()
         self._redraw_timeline()
         self._schedule_commit()
+
+    def _sync_resnap_default(self):
+        """Default to moving notes only for a uniform offset-only edit.
+
+        Compare actual edited values against the loaded timing, rather than
+        the rounded delta fields. The displayed BPM has three decimals, so
+        its unchanged representation must count as no BPM edit.
+        """
+        rows = self._visible_rows()
+        uniform = bool(rows)
+        offset = None
+        for row in rows:
+            nt = self._f_off(row["noff_var"])
+            nb = self._f(row["nbpm_var"])
+            if (nt is None or nb is None or not math.isfinite(nt)
+                    or not math.isfinite(nb) or nb <= 0
+                    or nb != float(self._fmt_bpm(60000.0 / row["old_bl"]))):
+                uniform = False
+                break
+            delta = nt - row["old_time"]
+            if offset is None:
+                offset = delta
+            elif not math.isclose(delta, offset, rel_tol=0.0, abs_tol=1e-6):
+                uniform = False
+                break
+        self.resnap_equalise_var.set(uniform)
 
     def _on_toggle_var(self):
         """bl_var / ts_var trace — redraw the timeline and record an undo step."""
@@ -4958,6 +5582,7 @@ class TimingEditorFrame(BaseToolFrame):
         for r in sel:
             r["sel_var"].set(False)
             self._set_row_visible(r, False)
+        self._sync_resnap_default()
         self._sync_delete_button()
         self._sync_scrollregions()
         self._commit_state()
@@ -4982,6 +5607,7 @@ class TimingEditorFrame(BaseToolFrame):
         vol = src_row["volume"] if src_row else 100
         new_row = self._make_row(old_time=t, old_bl=src_bl, is_new=True, meter=meter,
                                   sample_set=s_set, sample_index=s_idx, volume=vol, effects=0)
+        self._sync_resnap_default()
         self._regrid_rows()
         # Select just the new row so it's easy to spot in the panel (Sel isn't
         # part of undo history, so this doesn't affect the commit below).
@@ -5150,6 +5776,7 @@ class TimingEditorFrame(BaseToolFrame):
             self._restoring = False
 
         self.empty_lbl.grid_remove() if self._visible_rows() else self.empty_lbl.grid()
+        self._sync_resnap_default()
         self._sync_scrollregions()
         self._sync_delete_button()
         for r in self.rows:
@@ -5224,11 +5851,18 @@ class TimingEditorFrame(BaseToolFrame):
 
     def _new_redlines(self, exclude=None):
         res = []
+        advanced = self.advanced_timing_var.get()
+        delta = 0
+        if not advanced:
+            try:
+                delta = int(float(self.offset_controls.change_var.get()))
+            except (ValueError, OverflowError):
+                pass
         for r in self.rows:
-            if r is exclude or r["_deleted"]:
+            if r is exclude or (r["_deleted"] if advanced else r["is_new"]):
                 continue
-            t = self._f_off(r["noff_var"])
-            bpm = self._f(r["nbpm_var"])
+            t = self._f_off(r["noff_var"]) if advanced else r["old_time"] + delta
+            bpm = self._f(r["nbpm_var"]) if advanced else 60000.0 / r["old_bl"]
             if t is None or not bpm or bpm <= 0:
                 continue
             res.append({"t": t, "bl": 60000.0 / bpm, "row": r})
@@ -5751,7 +6385,7 @@ class TimingEditorFrame(BaseToolFrame):
             self._start_audio()
             return
         if _ask_choice_dialog(self, "BASS required",
-                "Timing Editor playback needs the BASS audio libraries.",
+                "Offset/Timing Editor playback needs the BASS audio libraries.",
                 [("Install automatically", "install"), ("Cancel", "cancel")]) != "install":
             return
         self.app.run_cancellable_job(
@@ -5990,7 +6624,7 @@ class TimingEditorFrame(BaseToolFrame):
     #
     # The "current time" line is pinned at _cursor_x(); every scroll moves
     # cursor_ms and the visible window follows. Dragging a red line still
-    # edits its New Offset; dragging empty space scrolls; a plain click
+    # edits its Offset; dragging empty space scrolls; a plain click
     # brings the clicked instant onto the current-time line.
     def _tl_press(self, e):
         self.timeline.focus_set()   # so ← → arrow keys step the timeline
@@ -6001,7 +6635,7 @@ class TimingEditorFrame(BaseToolFrame):
         self._drag_in_wave = e.y >= self.TIMELINE_H
         if self._drag_in_wave:
             return  # waveform drags seek; they never grab timing markers
-        if self.timeline_locked_var.get():
+        if self.timeline_locked_var.get() or not self.advanced_timing_var.get():
             return   # locked: mouse can only seek, never grab a red line
         for r in self._new_redlines():
             if abs(self._t_to_x(r["t"]) - e.x) <= 5:
@@ -6042,6 +6676,8 @@ class TimingEditorFrame(BaseToolFrame):
     def _tl_double(self, e):
         """Double-click a barline/section → scroll that timing point's row
         to the top of the table."""
+        if not self.advanced_timing_var.get():
+            return
         self._suppress_release = True
         reds = self._new_redlines()
         if not reds:
@@ -6148,6 +6784,9 @@ class TimingEditorFrame(BaseToolFrame):
     # Apply
     # ------------------------------------------------------------------
     def _apply(self):
+        if not self.advanced_timing_var.get():
+            self._apply_offset()
+            return
         if not self.require_map():
             return
         folder, _diffs = self.app.get_diff_files()
@@ -6170,12 +6809,14 @@ class TimingEditorFrame(BaseToolFrame):
             nb = self._f(r["nbpm_var"])
             if nt is None or nb is None or nb <= 0:
                 _show_alert(self, "Invalid value",
-                            "Every row needs a valid New Offset and a positive New BPM.")
+                            "Every row needs a valid Offset and a positive BPM.")
                 return
             segments.append({
                 "old_time": None if r["is_new"] else r["old_time"],
                 "old_beat_length": None if r["is_new"] else r["old_bl"],
-                "new_time": nt, "new_beat_length": 60000.0 / nb,
+                "new_time": nt, "new_beat_length": (
+                    r["old_bl"] if nb == float(self._fmt_bpm(60000.0 / r["old_bl"]))
+                    else 60000.0 / nb),
                 "omit_barline": bool(r["bl_var"].get()), "is_new": r["is_new"],
                 "meter": self._row_meter(r), "sample_set": r["sample_set"],
                 "sample_index": r["sample_index"], "volume": r["volume"],
@@ -6202,6 +6843,43 @@ class TimingEditorFrame(BaseToolFrame):
             self.after(0, self._apply_done)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _apply_offset(self):
+        if not self.require_map():
+            return
+        folder, _ = self.app.get_diff_files()
+        targets = self.diff_list.selected()
+        if not targets:
+            _show_alert(self, "Nothing selected", "Tick at least one difficulty.")
+            return
+        try:
+            delta = int(float(self.offset_controls.change_var.get()))
+        except (ValueError, OverflowError):
+            _show_alert(self, "Invalid value", "Change must be a number.")
+            return
+        if delta == 0:
+            _show_alert(self, "No change", "Change is 0 — nothing to apply.")
+            return
+        self.apply_btn.configure(state="disabled")
+        self.status_var.set("Shifting offset...")
+
+        def work():
+            try:
+                logic.apply_offset(folder, targets, delta)
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda: self._apply_failed(err))
+                return
+            self.after(0, lambda: self._offset_apply_done(len(targets), delta))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _offset_apply_done(self, count, delta):
+        self.status_var.set("")
+        self.apply_btn.configure(state="normal")
+        self.notify_done(f"Shifted {count} difficulty file(s) by {delta} ms.")
+        self._loaded_src = None
+        self._load_map()
 
     def _apply_failed(self, err):
         self.apply_btn.configure(state="normal")
@@ -6805,7 +7483,7 @@ class _TransportButton(tk.Canvas):
 
 class VideoPreviewWindow(tk.Toplevel):
     """480x270 live preview: plays the song's audio and the chosen video at
-    the same time via VLC, with a seeker and quick offset buttons
+    the same time via mpv, with a seeker and quick offset buttons
     (-1000/-500/-200/-100/-50/-20/-10/-5/-1/+1/+5/+10/+20/+50/+100/+200/
     +500/+1000 ms). Each button nudges a running offset total and restarts
     playback with that offset applied; Apply writes the total back into
@@ -6816,7 +7494,7 @@ class VideoPreviewWindow(tk.Toplevel):
 
     def __init__(self, parent_frame, folder, video_file, audio_file, initial_offset, on_apply):
         super().__init__(parent_frame)
-        import vlc
+        from mpv_video import MpvPlayer, PreviewPlayback
 
         self.title("Video Sync Offset Preview")
         self.configure(bg=FRONT_BG)
@@ -6827,7 +7505,6 @@ class VideoPreviewWindow(tk.Toplevel):
         self.audio_file = audio_file
         self.offset = initial_offset
         self.on_apply = on_apply
-        self._video_delay_job = None
         self._poll_job = None
         self._seeking = False
 
@@ -6922,118 +7599,72 @@ class VideoPreviewWindow(tk.Toplevel):
         self.bind("<Right>", lambda e: self._seek_relative(5000))
         self.bind("<Escape>", lambda e: self._on_close())
 
-        self.video_surface = tk.Frame(self, width=960, height=540, bg="black")
-        self.video_surface.pack(side="top", fill="both", expand=True)
-        self.video_surface.pack_propagate(False)
-
-        self.vlc_instance = vlc.Instance("--no-xlib") if os.name != "nt" else vlc.Instance()
-        self.video_player = self.vlc_instance.media_player_new()
-        self.audio_player = self.vlc_instance.media_player_new() if audio_file else None
-
+        self.video_container = tk.Frame(self, width=960, height=540, bg="black")
+        self.video_container.pack(side="top", fill="both", expand=True)
+        self.video_container.pack_propagate(False)
+        self.video_surface = tk.Frame(self.video_container, bg="black")
+        self.video_surface.place(x=0, y=0, relwidth=1, relheight=1)
         self.update_idletasks()
-        self._embed_video_output()
-
+        video = audio = None
+        try:
+            audio_path = os.path.join(folder, audio_file) if audio_file else None
+            if audio_path and not os.path.isfile(audio_path):
+                audio_path = None
+            video = MpvPlayer(os.path.join(folder, video_file), self.video_surface.winfo_id(), muted=bool(audio_path))
+            if audio_path:
+                audio = MpvPlayer(audio_path)
+            self.playback = PreviewPlayback(video, audio, initial_offset)
+            self._apply_volume()
+        except Exception:
+            if video:
+                video.close()
+            if audio:
+                audio.close()
+            self.destroy()
+            raise
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._load_media_and_play()
-        self._poll_job = self.after(200, self._poll_position)
+        self._poll_job = self.after(25, self._poll_position)
         self.transient(parent_frame)
         self.lift()
         self.focus_force()
         self.grab_set()
 
-    def _embed_video_output(self):
-        handle = self.video_surface.winfo_id()
-        if sys.platform.startswith("linux"):
-            self.video_player.set_xwindow(handle)
-        elif sys.platform == "win32":
-            self.video_player.set_hwnd(handle)
-        elif sys.platform == "darwin":
-            self.video_player.set_nsobject(handle)
-
-    def _load_media_and_play(self):
-        video_path = os.path.join(self.folder, self.video_file)
-        self.video_player.set_media(self.vlc_instance.media_new(video_path))
-        if self.audio_player and self.audio_file:
-            audio_path = os.path.join(self.folder, self.audio_file)
-            if os.path.exists(audio_path):
-                self.audio_player.set_media(self.vlc_instance.media_new(audio_path))
-            else:
-                self.audio_player = None
-        self._apply_volume()
-        self._restart_playback()
-
     def _apply_volume(self):
-        vol = int(self.volume_scale.get())
-        try:
-            self.video_player.audio_set_volume(0 if self.audio_player else vol)
-            if self.audio_player:
-                self.audio_player.audio_set_volume(vol)
-        except Exception:
-            pass
-
-    def _apply_volume_soon(self):
-        """libVLC only actually creates a player's audio output once it
-        reaches the Playing state — calling audio_set_volume() right after
-        play()/set_time() can land before that happens and get silently
-        dropped, which is why sound sometimes stayed muted until something
-        else (dragging the seek bar or volume slider) reapplied it later.
-        Reapplying a few more times over the following second closes that
-        race without needing to guess a single "safe" delay."""
-        self._apply_volume()
-        for delay in (100, 300, 600, 1000):
-            self.after(delay, self._apply_volume)
+        self.playback.set_volume(int(self.volume_scale.get()))
 
     def _on_volume_change(self, _value):
-        self._apply_volume()
+        if hasattr(self, "playback"):
+            self._apply_volume()
 
     def _on_volume_click(self, event):
-        # Same reasoning as the seek bar's press handler: jump exactly to
-        # the clicked position instead of ttk.Scale's default tiny step.
-        value = _scale_value_at_x(self.volume_scale, event.x)
-        self.volume_scale.set(value)  # triggers _on_volume_change via `command=`
+        self.volume_scale.set(_scale_value_at_x(self.volume_scale, event.x))
         return "break"
-
-    def _restart_playback(self):
-        if self._video_delay_job:
-            self.after_cancel(self._video_delay_job)
-            self._video_delay_job = None
-        self.video_player.stop()
-        if self.audio_player:
-            self.audio_player.stop()
-
-        if self.audio_player:
-            self.audio_player.play()
-
-        if self.offset >= 0:
-            # Video starts `offset` ms after the audio does.
-            self._video_delay_job = self.after(max(0, int(self.offset)), self.video_player.play)
-        else:
-            # Video started earlier than the audio: start it now, already
-            # partway through, so audio (starting "now" too) stays in sync.
-            self.video_player.play()
-            self.after(80, lambda: self.video_player.set_time(int(-self.offset)))
-        self._apply_volume_soon()
-        self._paused = False
-        self.play_pause_button.set_kind("pause")
 
     def _nudge(self, delta):
         self.offset += delta
         self.offset_label.configure(text=f"Current Video Offset: {self.offset}")
-        self._restart_playback()
+        self.playback.restart(self.offset)
+        self.play_pause_button.set_kind("pause")
 
     def _poll_position(self):
+        self._poll_job = None
         try:
-            ref_player = self.audio_player or self.video_player
-            length = ref_player.get_length()
-            pos = ref_player.get_time()
-            if length and length > 0 and not self._seeking:
-                self.seek_scale.configure(to=length)
-                self.seek_scale.set(max(0, pos))
-            secs = max(0, pos) // 1000
+            self.playback.tick()
+            if self.playback.video_visible:
+                self.video_surface.place(x=0, y=0, relwidth=1, relheight=1)
+            else:
+                self.video_surface.place_forget()
+            if self.playback.duration and not self._seeking:
+                self.seek_scale.configure(to=self.playback.duration)
+                self.seek_scale.set(self.playback.position)
+            secs = max(0, int(self.playback.position)) // 1000
             self.time_label.configure(text=f"{secs // 60:02d}:{secs % 60:02d}")
-        except Exception:
-            pass
-        self._poll_job = self.after(200, self._poll_position)
+            self.play_pause_button.set_kind("play" if self.playback.paused else "pause")
+        except Exception as exc:
+            self._on_close()
+            _show_alert(self.master, "Video preview error", str(exc))
+            return
+        self._poll_job = self.after(25, self._poll_position)
 
     def _on_seek_press(self, event):
         # ttk.Scale's own trough-click behavior only steps by a tiny
@@ -7054,65 +7685,14 @@ class VideoPreviewWindow(tk.Toplevel):
         self._seeking = False
 
     def _seek_relative(self, delta_ms: int):
-        """Rewind/forward by `delta_ms` from the current playback position
-        (used by the ⏪/⏩ buttons and the Left/Right arrow keys)."""
-        ref_player = self.audio_player or self.video_player
-        try:
-            current = ref_player.get_time()
-        except Exception:
-            current = 0
-        self._seek_to(max(0, current) + delta_ms)
+        self._seek_to(self.playback.position + delta_ms)
 
     def _toggle_play_pause(self):
-        """Play/pause both players together (bound to the button and the
-        Space key)."""
-        self._paused = not self._paused
-        try:
-            if self._paused:
-                self.video_player.set_pause(1)
-                if self.audio_player:
-                    self.audio_player.set_pause(1)
-            else:
-                self.video_player.set_pause(0)
-                if self.audio_player:
-                    self.audio_player.set_pause(0)
-        except Exception:
-            pass
-        self.play_pause_button.set_kind("play" if self._paused else "pause")
+        self.playback.toggle_pause()
+        self.play_pause_button.set_kind("play" if self.playback.paused else "pause")
 
     def _seek_to(self, audio_time_ms: int):
-        """Moves playback to `audio_time_ms` on the audio timeline while
-        preserving the current offset — recomputed fresh each time, so it
-        works correctly whether or not the video has started playing yet
-        (e.g. it's still waiting out its initial delay for a positive
-        offset). This replaces relying on a possibly-still-pending delayed
-        play() call, which was the cause of seeks appearing to reset the
-        offset."""
-        audio_time_ms = max(0, int(audio_time_ms))
-
-        # Any previously scheduled "start video after N ms" call is now
-        # stale — we're taking direct control of playback position.
-        if self._video_delay_job:
-            self.after_cancel(self._video_delay_job)
-            self._video_delay_job = None
-
-        if self.audio_player:
-            if not self.audio_player.is_playing():
-                self.audio_player.play()
-            self.audio_player.set_time(audio_time_ms)
-
-        video_time_ms = audio_time_ms - self.offset
-        if video_time_ms < 0:
-            # At this point on the timeline the video hasn't started yet
-            # (still within its initial offset delay) — pause it and
-            # schedule it to begin after the remaining delay.
-            self.video_player.stop()
-            self._video_delay_job = self.after(int(-video_time_ms), self.video_player.play)
-        else:
-            if not self.video_player.is_playing():
-                self.video_player.play()
-            self.video_player.set_time(int(video_time_ms))
-        self._apply_volume_soon()
+        self.playback.seek(audio_time_ms)
 
     def _apply(self):
         self.on_apply(self.offset)
@@ -7121,15 +7701,11 @@ class VideoPreviewWindow(tk.Toplevel):
     def _on_close(self):
         if self._poll_job:
             self.after_cancel(self._poll_job)
-        if self._video_delay_job:
-            self.after_cancel(self._video_delay_job)
+            self._poll_job = None
         try:
-            self.video_player.stop()
-            if self.audio_player:
-                self.audio_player.stop()
-        except Exception:
-            pass
-        self.destroy()
+            self.playback.close()
+        finally:
+            self.destroy()
 
 
 # =============================================================================
@@ -7308,26 +7884,26 @@ class VideoOffsetShifterFrame(BaseToolFrame):
             _show_alert(self, "No video", "Pick a video file first.")
             return
 
-        if logic.vlc_available():
+        if logic.mpv_available():
             self._launch_preview_window(folder)
             return
 
-        choice = _ask_vlc_required_choice(self)
+        choice = _ask_mpv_required_choice(self)
         if choice == "cancel":
             return
 
         def work(cancel_event):
-            logic.install_vlc_bundled()
+            logic.install_mpv_bundled()
 
         def on_success(_result):
-            self.notify_done("VLC installed — opening preview.")
+            self.notify_done("mpv installed — opening preview.")
             self._launch_preview_window(folder)
 
         def on_error(err_msg):
             _show_alert(self, "Error", err_msg)
 
         self.app.run_cancellable_job(
-            "Installing VLC (may take a few minutes)... Please wait...",
+            "Installing mpv (may take a few minutes)... Please wait...",
             work, on_success=on_success, on_error=on_error,
             cancelled_toast="Installation Cancelled!",
         )
@@ -7339,8 +7915,16 @@ class VideoOffsetShifterFrame(BaseToolFrame):
         except ValueError:
             initial_offset = 0
 
-        self._preview_win = VideoPreviewWindow(self, folder, self.video_var.get(), audio_file,
-                                                initial_offset, self._set_offset)
+        existing = getattr(self, "_preview_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+        try:
+            self._preview_win = VideoPreviewWindow(self, folder, self.video_var.get(), audio_file,
+                                                  initial_offset, self._set_offset)
+        except Exception as exc:
+            _show_alert(self, "Video preview error", str(exc))
 
     def _set_offset(self, value):
         self.offset_var.set(str(value))
@@ -7918,6 +8502,9 @@ class ManualPatternWindow(tk.Toplevel):
 
     def __init__(self, master, gallery, existing_name=None):
         super().__init__(master)
+        # Hide the default-sized Toplevel until its contents and final
+        # position are ready, so layout updates cannot flash a ghost window.
+        self.withdraw()
         self.gallery = gallery
         # Set when opened via a PatternCard's "Edit" context-menu action —
         # _save() then overwrites this pattern in place (same list position
@@ -8074,18 +8661,19 @@ class ManualPatternWindow(tk.Toplevel):
         self._update_status()
         self._redraw()
 
+        _position_over_window(self, master)
+        self.transient(master)
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
         if load_truncated:
             _show_alert(self,
                 "Pattern truncated",
                 f'"{existing_entry["name"]}" had notes beyond this editor\'s '
                 f"{self.BEATS_SHOWN}-beat timeline — they've been removed so "
                 f"everything loaded fits on the grid.")
-
-        _position_over_window(self, master)
-        self.transient(master)
-        self.lift()
-        self.focus_force()
-        self.grab_set()
 
     # ------------------------------------------------------------------
     # Loading an existing pattern for editing (PatternCard's "Edit" action)

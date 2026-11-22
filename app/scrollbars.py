@@ -7,7 +7,8 @@ from tkinter import ttk
 class AutoHideScrollbar(tk.Canvas):
     """A quiet rounded thumb with a permanent, narrow mouse target."""
 
-    def __init__(self, master, command, orient="vertical", bg=None, target=None):
+    def __init__(self, master, command, orient="vertical", bg=None, target=None,
+                 reveal_on_change=True):
         if bg is None and target is not None:
             bg = target.cget("bg")
         if bg is None:
@@ -16,6 +17,7 @@ class AutoHideScrollbar(tk.Canvas):
             except tk.TclError:
                 bg = ttk.Style(master).lookup("TFrame", "background") or "#fbfbfe"
         self.orient = orient
+        self.reveal_on_change = reveal_on_change
         # Let the viewport determine length; Canvas defaults would otherwise
         # force compact fields to be hundreds of pixels tall (or wide).
         dimensions = ({"width": 12, "height": 1} if orient == "vertical"
@@ -116,7 +118,7 @@ class AutoHideScrollbar(tk.Canvas):
             self._set_visible(False)
         elif self._hovered or self._edge_hover:
             self._set_visible(True)
-        if moved and self.can_scroll:
+        if moved and self.can_scroll and self.reveal_on_change:
             self.reveal()
         self._draw()
 

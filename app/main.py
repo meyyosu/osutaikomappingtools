@@ -61,7 +61,7 @@ def _relaunch_process():
                  # root window could otherwise get stuck on
 
 APP_TITLE = "osu!taiko Mapping Tools"
-APP_VERSION = "1.18"
+APP_VERSION = "2.0"
 UPDATE_REPO = "meyyosu/osutaikomappingtools"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 
@@ -439,10 +439,9 @@ def _add_tooltip(widget, text, align: str = "left"):
 
 SIDEBAR_CATEGORIES = [
     ("Mapset", ("Metadata Manager", "Filename Checker", "Map Cleaner")),
-    ("Timing & Effects", ("Timing Editor", "Kiai Editor", "Volume Editor",
-                          "Audio/Offset Settings")),
+    ("Timing & Effects", ("Offset/Timing Editor", "Kiai Editor", "Volume Editor")),
     ("Objects", ("Pattern Gallery",)),
-    ("Assets", ("Background Settings", "Video Settings")),
+    ("Assets", ("Audio Settings", "Background Settings", "Video Settings")),
 ]
 SIDEBAR_ITEMS = [item for _, items in SIDEBAR_CATEGORIES for item in items]
 
@@ -972,9 +971,9 @@ class App(tk.Tk):
                              on_cancel=None, cancelled_toast: str = "Cancelled!"):
         """Runs `work_fn(cancel_event)` on a worker thread under the shared
         busy overlay with a Cancel button — the common shape behind every
-        "install ffmpeg/VLC" and long-running ffmpeg-encode flow in this
+        "install ffmpeg/mpv" and long-running ffmpeg-encode flow in this
         app (first-time setup, Settings, Add Silence, Audio Re-encode,
-        the Taiko Video Resizer, the video preview's VLC install).
+        the Taiko Video Resizer, the video preview's mpv install).
 
         Clicking Cancel *always* gives the user their UI back immediately
         — overlay hidden, a red/white toast shown — even though most of
@@ -1742,7 +1741,7 @@ class App(tk.Tk):
                          "Including\n\n"
                          "- ffmpeg + ffprobe\n"
                          "- BASS audio engine\n"
-                         "- VLC Player\n"
+                         "- mpv video playback\n"
                          "- waifu2x")
 
         tk.Label(download_card.body, text="They are required to use certain tools.",
@@ -1762,12 +1761,12 @@ class App(tk.Tk):
             # get short-circuited by treating the pair as one unit.
             need_ffmpeg_bin = not logic.ffmpeg_available()
             need_ffprobe_bin = not logic.ffprobe_available()
-            need_vlc = not logic.vlc_available()
+            need_mpv = not logic.mpv_available()
             need_bass = not logic.bass_available()
             need_waifu2x = not logic.waifu2x_available()
-            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc and not need_bass and not need_waifu2x:
+            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_mpv and not need_bass and not need_waifu2x:
                 _show_alert(win, "Download resources",
-                            "ffmpeg, ffprobe, BASS, VLC and waifu2x are already installed.")
+                            "ffmpeg, ffprobe, BASS, mpv and waifu2x are already installed.")
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
@@ -1789,12 +1788,12 @@ class App(tk.Tk):
                         installed.append("BASS")
                     except Exception as e:
                         errors.append(f"BASS: {e}")
-                if need_vlc and not cancel_event.is_set():
+                if need_mpv and not cancel_event.is_set():
                     try:
-                        logic.install_vlc_bundled()
-                        installed.append("VLC")
+                        logic.install_mpv_bundled()
+                        installed.append("mpv")
                     except Exception as e:
-                        errors.append(f"VLC: {e}")
+                        errors.append(f"mpv: {e}")
                 if need_waifu2x and not cancel_event.is_set():
                     try:
                         logic.install_waifu2x_bundled()
@@ -1823,7 +1822,7 @@ class App(tk.Tk):
                     _show_alert(win, "Download resources", err_msg)
 
             self.run_cancellable_job(
-                "Installing ffmpeg + ffprobe, BASS, VLC and waifu2x (may take a few minutes)... Please wait...",
+                "Installing ffmpeg + ffprobe, BASS, mpv and waifu2x (may take a few minutes)... Please wait...",
                 work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
                 cancelled_toast="Installation Cancelled!",
             )
@@ -2094,7 +2093,7 @@ class App(tk.Tk):
                          "Including:\n\n"
                          "- ffmpeg + ffprobe\n"
                          "- BASS audio engine\n"
-                         "- VLC Player\n"
+                         "- mpv video playback\n"
                          "- waifu2x")
 
         tk.Label(download_card.body, text="These are required to run certain features in this tool. "
@@ -2116,12 +2115,12 @@ class App(tk.Tk):
             # get short-circuited by treating the pair as one unit.
             need_ffmpeg_bin = not logic.ffmpeg_available()
             need_ffprobe_bin = not logic.ffprobe_available()
-            need_vlc = not logic.vlc_available()
+            need_mpv = not logic.mpv_available()
             need_bass = not logic.bass_available()
             need_waifu2x = not logic.waifu2x_available()
-            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_vlc and not need_bass and not need_waifu2x:
+            if not need_ffmpeg_bin and not need_ffprobe_bin and not need_mpv and not need_bass and not need_waifu2x:
                 _show_alert(win, "Download resources",
-                            "ffmpeg, ffprobe, BASS, VLC and waifu2x are already installed.")
+                            "ffmpeg, ffprobe, BASS, mpv and waifu2x are already installed.")
                 return
 
             download_btn.configure(state="disabled", text="Installing...")
@@ -2143,12 +2142,12 @@ class App(tk.Tk):
                         installed.append("BASS")
                     except Exception as e:
                         errors.append(f"BASS: {e}")
-                if need_vlc and not cancel_event.is_set():
+                if need_mpv and not cancel_event.is_set():
                     try:
-                        logic.install_vlc_bundled()
-                        installed.append("VLC")
+                        logic.install_mpv_bundled()
+                        installed.append("mpv")
                     except Exception as e:
-                        errors.append(f"VLC: {e}")
+                        errors.append(f"mpv: {e}")
                 if need_waifu2x and not cancel_event.is_set():
                     try:
                         logic.install_waifu2x_bundled()
@@ -2177,7 +2176,7 @@ class App(tk.Tk):
                     _show_alert(win, "Download resources", err_msg)
 
             self.run_cancellable_job(
-                "Installing ffmpeg + ffprobe, BASS, VLC and waifu2x (may take a few minutes)... Please wait...",
+                "Installing ffmpeg + ffprobe, BASS, mpv and waifu2x (may take a few minutes)... Please wait...",
                 work, on_success=on_success, on_error=on_error, on_cancel=reset_button,
                 cancelled_toast="Installation Cancelled!",
             )
@@ -2998,8 +2997,8 @@ class App(tk.Tk):
             ("Kiai Editor", KiaiEditorFrame),
             ("Volume Editor", VolumeEditorFrame),
             ("Map Cleaner", MapCleanerFrame),
-            ("Audio/Offset Settings", OffsetShifterFrame),
-            ("Timing Editor", TimingEditorFrame),
+            ("Audio Settings", OffsetShifterFrame),
+            ("Offset/Timing Editor", TimingEditorFrame),
             ("Background Settings", BgOffsetShifterFrame),
             ("Video Settings", VideoOffsetShifterFrame),
             ("Pattern Gallery", PatternGalleryFrame),

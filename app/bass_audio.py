@@ -68,6 +68,7 @@ class BassApi:
             (self.bass, "BASS_ChannelStop", b, [u]),
             (self.bass, "BASS_ChannelIsActive", u, [u]),
             (self.bass, "BASS_ChannelGetData", u, [u, p, u]),
+            (self.bass, "BASS_ChannelGetLevel", u, [u]),
             (self.mix, "BASS_Mixer_StreamCreate", u, [u, u, u]),
             (self.mix, "BASS_Mixer_StreamAddChannel", b, [u, u, u]),
             (self.mix, "BASS_Mixer_ChannelSetPosition", b, [u, q, u]),
@@ -200,6 +201,22 @@ class BassPlayer:
         gain = .45
         self._output_gain = gain
         self.api.check(self.api.BASS_ChannelSetAttribute(self.output, ATTRIB_VOL, gain), "Reserving mix headroom")
+
+    def set_preview_gain(self, gain_db, monitor_percent=100):
+        """Independent file gain and listening volume for the audio preview."""
+        gain = 10 ** (max(-15, min(15, float(gain_db))) / 20)
+        self.api.check(self.api.BASS_ChannelSetAttribute(self.tempo, ATTRIB_VOL, gain), "Changing preview gain")
+        self.api.check(self.api.BASS_ChannelSetAttribute(self.output, ATTRIB_VOL,
+                       max(0, min(100, float(monitor_percent))) / 100), "Changing preview volume")
+
+    def get_levels(self):
+        """Stereo peaks after song gain, before the monitor volume."""
+        if self._decode:
+            return (0.0, 0.0)  # Inspecting a decoder would consume its samples.
+        level = self.api.BASS_ChannelGetLevel(self.output)
+        if level == 0xffffffff:
+            return (0.0, 0.0)
+        return ((level & 0xffff) / 32768, (level >> 16) / 32768)
 
     def set_metronome(self, enabled):
         self._metro_enabled = bool(enabled)

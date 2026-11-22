@@ -400,225 +400,75 @@ def install_ffmpeg_suite_bundled(need_ffmpeg: bool = True, need_ffprobe: bool = 
 
 
 # =============================================================================
-# VLC (video offset live preview)
-#
-# Resolve Windows DLLs explicitly before importing python-vlc. Its registry
-# fallback changes cwd and relies on the process DLL search path, which is
-# unreliable in frozen builds and with newer Python versions.
+# mpv (video offset live preview)
 # =============================================================================
-VLC_MANUAL_DOWNLOAD_URL = "https://www.videolan.org/vlc/"
-
-# VideoLAN's own "always current" directory listing for the Windows
-# 64-bit build — the actual filename inside is version-named (e.g.
-# vlc-3.0.23-win64.zip) and changes on every release, so this is scraped
-# for the current filename rather than hardcoded (see
-# `_find_latest_vlc_zip_url`).
-_VLC_ZIP_LISTING_URL = "https://get.videolan.org/vlc/last/win64/"
+MPV_MANUAL_DOWNLOAD_URL = "https://mpv.io/installation/"
+_MPV_RELEASES_API = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
 
 
-def _find_latest_vlc_zip_url() -> str:
-    req = urllib.request.Request(_VLC_ZIP_LISTING_URL, headers={"User-Agent": "Mozilla/5.0"})
+def mpv_available() -> bool:
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            html = resp.read().decode("utf-8", "ignore")
-    except (OSError, urllib.error.URLError) as e:
-        raise RuntimeError(f"Couldn't reach {_VLC_ZIP_LISTING_URL} ({e}).")
-    m = re.search(r'href="(vlc-[0-9][^"]*-win64\.zip)"', html)
-    if not m:
-        raise RuntimeError("Couldn't find a current VLC build on VideoLAN's download page — "
-                            "its page layout may have changed.")
-    return _VLC_ZIP_LISTING_URL + m.group(1)
-
-
-def _download_and_extract_vlc_zip(dest_dir: str):
-    """Downloads the current official VLC portable win64 zip build and
-    extracts libvlc.dll/libvlccore.dll plus the entire plugins/ folder
-    into `dest_dir` — exactly what `configure_bundled_vlc_env` points
-    python-vlc at. Verified end-to-end during development: downloaded a
-    real build, extracted it, then loaded it via python-vlc purely
-    through the env-var override with no system VLC install present at
-    all. Raises RuntimeError with a user-facing message on any failure."""
-    url = _find_latest_vlc_zip_url()
-    tmp_zip = None
-    try:
-        fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
-        os.close(fd)
-        _download_to_file(url, tmp_zip, timeout=60)
-
-        with zipfile.ZipFile(tmp_zip) as zf:
-            names = zf.namelist()
-            dll_entries = [n for n in names if n.lower().endswith("/libvlc.dll")]
-            if not dll_entries:
-                raise RuntimeError(f"Downloaded VLC build from {url} didn't contain libvlc.dll — "
-                                    "the build layout may have changed.")
-            root = dll_entries[0].rsplit("/", 1)[0]  # e.g. "vlc-3.0.23"
-
-            wanted = {"libvlc.dll": None, "libvlccore.dll": None}
-            for n in names:
-                parent, _, base = n.rpartition("/")
-                if parent == root and base in wanted:
-                    wanted[base] = n
-            missing = [k for k, v in wanted.items() if v is None]
-            if missing:
-                raise RuntimeError(f"Downloaded VLC build from {url} didn't contain {', '.join(missing)}.")
-            for base, member in wanted.items():
-                with zf.open(member) as src_f, open(os.path.join(dest_dir, base), "wb") as out_f:
-                    shutil.copyfileobj(src_f, out_f)
-
-            plugins_prefix = root + "/plugins/"
-            plugins_dest = os.path.join(dest_dir, "plugins")
-            for n in names:
-                if n.startswith(plugins_prefix) and not n.endswith("/"):
-                    rel_parts = n[len(plugins_prefix):].split("/")
-                    out_path = os.path.join(plugins_dest, *rel_parts)
-                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                    with zf.open(n) as src_f, open(out_path, "wb") as out_f:
-                        shutil.copyfileobj(src_f, out_f)
-    except (OSError, urllib.error.URLError, zipfile.BadZipFile) as e:
-        raise RuntimeError(f"Couldn't download/extract VLC ({e}). Install it manually from "
-                            f"{VLC_MANUAL_DOWNLOAD_URL} instead.")
-    finally:
-        if tmp_zip and os.path.exists(tmp_zip):
-            os.remove(tmp_zip)
-
-
-# Keep DLL directory cookies and loaded libraries alive for delayed plugin loads.
-_vlc_dll_handles = {}
-
-
-def _vlc_install_dirs():
-    """Bundled, registered (both registry views), standard and PATH installs."""
-    yield _bundled_dir()
-    if getattr(sys, "_MEIPASS", None):
-        yield sys._MEIPASS
-    try:
-        import winreg
-        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
-                try:
-                    with winreg.OpenKey(hive, r"Software\VideoLAN\VLC", 0,
-                                        winreg.KEY_READ | view) as key:
-                        yield winreg.QueryValueEx(key, "InstallDir")[0]
-                except OSError:
-                    pass
-    except ImportError:
-        pass
-    for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
-        base = os.environ.get(name)
-        if base:
-            yield os.path.join(base, "VideoLAN", "VLC")
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        yield os.path.join(local, "Programs", "VideoLAN", "VLC")
-    for name in ("vlc.exe", "libvlc.dll"):
-        path = shutil.which(name)
-        if path:
-            yield os.path.dirname(path)
-
-
-def configure_bundled_vlc_env():
-    """Prepare a usable Windows VLC installation before python-vlc imports.
-
-    Explicit PYTHON_VLC_* overrides take precedence. Try the next installation
-    if a bundled copy is incomplete or has the wrong architecture. Never change
-    cwd: background jobs may be using relative paths at the same time.
-    """
-    if os.name != "nt":
-        return
-    import ctypes
-
-    explicit = os.environ.get("PYTHON_VLC_LIB_PATH")
-    candidates = (os.path.dirname(os.path.abspath(explicit)),) if explicit else _vlc_install_dirs()
-    seen = set()
-    for directory in candidates:
-        directory = os.path.abspath(directory)
-        if os.path.normcase(directory) in seen:
-            continue
-        seen.add(os.path.normcase(directory))
-        dll = explicit or os.path.join(directory, "libvlc.dll")
-        plugins = os.path.join(directory, "plugins")
-        if not os.path.isfile(dll):
-            continue
-        if not explicit and not os.path.isdir(plugins):
-            continue
-        if directory not in _vlc_dll_handles:
-            cookie = None
-            try:
-                if hasattr(os, "add_dll_directory"):
-                    cookie = os.add_dll_directory(directory)
-                # libvlc depends on libvlccore, which must be resolvable even
-                # when PyInstaller has installed its own DLL search directory.
-                core = ctypes.CDLL(os.path.join(directory, "libvlccore.dll"))
-                library = ctypes.CDLL(dll)
-            except OSError:
-                if cookie is not None:
-                    cookie.close()
-                continue
-            _vlc_dll_handles[directory] = (cookie, core, library)
-        os.environ.setdefault("PYTHON_VLC_LIB_PATH", dll)
-        if os.path.isdir(plugins):
-            os.environ.setdefault("PYTHON_VLC_MODULE_PATH", plugins)
-        return
-
-
-def vlc_available() -> bool:
-    """Check the binding, native DLLs and plugins needed by both playback UIs."""
-    try:
-        configure_bundled_vlc_env()
-        import vlc
-        instance = vlc.Instance() if os.name == "nt" else vlc.Instance("--no-xlib")
-        if instance is None:
+        from mpv_video import load_library
+        lib = load_library()
+        handle = lib.mpv_create()
+        if not handle:
             return False
-        instance.release()
-    except (Exception, SystemExit):
-        # python-vlc calls sys.exit() for invalid explicit DLL/plugin overrides.
-        # An optional playback dependency must never terminate the whole app.
+        lib.mpv_terminate_destroy(handle)
+        return True
+    except (OSError, RuntimeError):
         return False
-    return True
 
 
-def install_vlc_bundled() -> str:
-    """Gets a working VLC backend for the video preview by whatever means
-    is available. Meant to run on a worker thread — blocks for as long as
-    winget/the download takes. Unlike ffmpeg, a system-wide VLC install
-    (via winget) needs nothing copied afterward: python-vlc's own
-    find_lib() already checks the `Software\\VideoLAN\\VLC` registry key
-    fresh on every `import vlc`, which VLC's real installer (what winget
-    runs under the hood) always sets — so winget succeeding is already a
-    complete fix by itself. Only when winget isn't available, or a winget
-    install somehow still leaves VLC undetectable, does this fall back to
-    `_download_and_extract_vlc_zip` (a portable copy next to the app,
-    wired up via `configure_bundled_vlc_env`). Raises RuntimeError with a
-    user-facing message on failure."""
+def _find_mpv_archive_url() -> str:
+    import platform
+    import struct
+    arch = "i686" if struct.calcsize("P") == 4 else ("aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "x86_64")
+    req = urllib.request.Request(_MPV_RELEASES_API, headers={"User-Agent": "osu-taiko-helper"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        release = json.load(response)
+    for asset in release.get("assets", []):
+        # Baseline CPUs, never the optional x86_64-v3 build.
+        if re.match(r"mpv-dev-" + arch + r"-\d.*\.7z$", asset.get("name", "")):
+            return asset["browser_download_url"]
+    raise RuntimeError(f"No matching libmpv build found. See {MPV_MANUAL_DOWNLOAD_URL}")
+
+
+def install_mpv_bundled(force_bundle=False) -> str:
+    """Install the matching portable libmpv DLL and its original notices."""
+    if not force_bundle and mpv_available():
+        return "available"
     if os.name != "nt":
-        raise RuntimeError(f"Automatic install is only wired up for Windows. Get VLC from "
-                            f"{VLC_MANUAL_DOWNLOAD_URL} for your platform.")
-
-    if vlc_available():
-        return "system"
-
-    if shutil.which("winget") is not None:
-        try:
-            subprocess.run(
-                ["winget", "install", "-e", "--id", "VideoLAN.VLC",
-                 "--accept-package-agreements", "--accept-source-agreements", "--silent"],
-                check=True, capture_output=True, timeout=600, creationflags=_SUBPROCESS_FLAGS,
-            )
-        except subprocess.SubprocessError:
-            pass  # winget missing/failed — fall through to direct download below
-        else:
-            if vlc_available():
-                return "system"
-            # winget reported success but VLC still isn't discoverable —
-            # fall through to a direct download as a safety net rather
-            # than leaving the user stuck.
-
-    dest_dir = _bundled_dir()
-    _download_and_extract_vlc_zip(dest_dir)
-    if not vlc_available():
-        raise RuntimeError("VLC was downloaded but still couldn't be loaded. Try restarting the app, "
-                            f"or install it manually from {VLC_MANUAL_DOWNLOAD_URL}.")
-    return dest_dir
+        raise RuntimeError(f"Install libmpv using your package manager: {MPV_MANUAL_DOWNLOAD_URL}")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "mpv.7z")
+            _download_to_file(_find_mpv_archive_url(), archive, timeout=120)
+            # Official reduced 7-Zip extractor supports the BCJ2 filter used by
+            # libmpv builds; Python's py7zr and Windows tar do not.
+            extractor = os.path.join(tmp, "7zr.exe")
+            _download_to_file("https://www.7-zip.org/a/7zr.exe", extractor, timeout=60)
+            stage = os.path.join(tmp, "extracted")
+            os.makedirs(stage)
+            subprocess.run([extractor, "e", archive, "-o" + stage, "-y", "*.dll"],
+                           check=True, capture_output=True, timeout=120,
+                           creationflags=_SUBPROCESS_FLAGS)
+            if not os.path.isfile(os.path.join(stage, "libmpv-2.dll")):
+                raise RuntimeError("The downloaded archive has no libmpv DLL.")
+            # Retain upstream licensing and source information with the runtime.
+            _download_to_file("https://raw.githubusercontent.com/mpv-player/mpv/master/LICENSE.GPL",
+                              os.path.join(stage, "LICENSE.GPL"), timeout=30)
+            with open(os.path.join(stage, "SOURCE.txt"), "w", encoding="utf-8") as out:
+                out.write("mpv: https://mpv.io/\nSource: https://github.com/mpv-player/mpv\n"
+                          "Windows builds and build scripts: https://github.com/shinchiro/mpv-winbuild-cmake\n")
+            dest = os.path.join(_bundled_dir(), "mpv")
+            os.makedirs(dest, exist_ok=True)
+            for name in os.listdir(stage):
+                shutil.copy2(os.path.join(stage, name), os.path.join(dest, name))
+    except Exception as exc:
+        raise RuntimeError(f"Couldn't install mpv ({exc}). Manual download: {MPV_MANUAL_DOWNLOAD_URL}") from exc
+    if not mpv_available():
+        raise RuntimeError("mpv was downloaded but could not be loaded. Check that its architecture matches Python.")
+    return dest
 
 
 # =============================================================================
@@ -1456,16 +1306,55 @@ def apply_audio_reencode_external(src: str, bitrate_kbps: int) -> str:
     return out_path
 
 
-def apply_offset(folder: str, diff_files: List[str], delta_ms: float, add_silence: bool = False):
+def adjust_audio_volume(folder: str, gain_db: float) -> str:
+    """Apply a relative gain once to the shared song, preserving its format."""
+    if not -15 <= gain_db <= 15:
+        raise ValueError("Audio gain must be between -15 and +15 dB.")
+    if not ffmpeg_available():
+        raise RuntimeError("ffmpeg is required to change audio volume.")
+    filename = get_audio_filename(folder)
+    if not filename:
+        raise RuntimeError("No audio file found for this map.")
+    src = os.path.join(folder, filename)
+    base, ext = os.path.splitext(src)
+    # splitext(".mp3") returns (".mp3", ""). Extension-only audio names
+    # occur in real mapsets; keep a recognizable suffix on the encoded temp.
+    if not ext and os.path.basename(src).startswith("."):
+        ext = os.path.basename(src)
+    tmp = f"{base}.tmp_volume_{uuid.uuid4().hex}{ext}"
+    try:
+        cmd = [_resolve_binary("ffmpeg"), "-y", "-i", src, "-vn",
+               "-af", f"volume={gain_db}dB"]
+        bitrate = get_audio_bitrate_kbps(src)
+        if bitrate and ext.lower() in (".mp3", ".ogg", ".oga", ".m4a", ".aac", ".opus", ".wma"):
+            cmd += ["-b:a", f"{bitrate}k"]
+        _run_ffmpeg(cmd + [tmp])
+        _replace_locked_safe(tmp, src)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr or "FFmpeg could not process this audio file."
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        detail = "\n".join(detail.strip().splitlines()[-6:])
+        raise RuntimeError(f"Could not adjust audio volume.\n\n{detail}") from exc
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return filename
+
+
+def apply_offset(folder: str, diff_files: List[str], delta_ms: float, add_silence: bool = False,
+                 silence_ms: int = SILENCE_LEAD_IN_MS):
     """Shifts every selected diff's timing points, hit objects, break
     times, video event, and preview point by `delta_ms`. If `add_silence`
-    is set, `SILENCE_LEAD_IN_MS` of silence is first added to the audio
+    is set, `silence_ms` of silence is first added to the audio
     (once, regardless of how many diffs are selected — they all share the
     same audio file), and that same amount is folded into the shift so
     everything stays in sync with the now-longer audio."""
     if add_silence:
-        add_silence_to_audio(folder)
-        delta_ms += SILENCE_LEAD_IN_MS
+        if not 100 <= silence_ms <= 2000:
+            raise ValueError("Silence duration must be between 100 and 2000 ms.")
+        add_silence_to_audio(folder, silence_ms)
+        delta_ms += silence_ms
     for fname in diff_files:
         path = os.path.join(folder, fname)
         bm = Beatmap(path)
@@ -1720,7 +1609,7 @@ def downscale_bg_image(folder: str, bg_file: str) -> "tuple[str, bool]":
 # of model folders and a vulkan runtime DLL, no installer. There's no
 # winget package for it, so `install_waifu2x_bundled` only has the direct-
 # download path (the GitHub "latest" release's `*-windows.zip` asset,
-# located via the releases API the same way VLC's zip is scraped from a
+# located via the releases API via a
 # directory listing). Everything is unpacked into `<bundled>/waifu2x/`;
 # `resolve_waifu2x_exe` also accepts a copy sitting directly next to the
 # app or on PATH, same bundled-first-then-PATH spirit as ffmpeg.
@@ -2483,7 +2372,7 @@ def _build_retime_mapper(old_reds: list, new_reds: list):
         i = _retime_section_index(t, old_reds)
         old_t, old_bl = old_reds[i]
         new_t, new_bl = new_reds[i]
-        if not old_bl:
+        if not old_bl or new_bl == old_bl:
             return new_t + (t - old_t)
         beat = (t - old_t) / old_bl
         return new_t + beat * new_bl
@@ -3659,4 +3548,3 @@ def capture_pattern_from_osu_selection(name: str, clipboard_text: str, songs_fol
                                                               CAPTURED_PATTERN_MAX_BEATS)
     entry = add_pattern_to_gallery(name, hit_objects, bm.timing_points)
     return entry, truncated, had_concurrent
-
