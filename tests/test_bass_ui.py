@@ -53,7 +53,7 @@ class BassUITests(unittest.TestCase):
         def unexpected_alert(*args):
             raise AssertionError(args)
         with patch("screens._show_alert", side_effect=unexpected_alert), \
-                patch("screens.logic.vlc_available", side_effect=AssertionError("VLC was consulted")):
+                patch("screens.logic.mpv_available", side_effect=AssertionError("Video backend was consulted")):
             self.frame._toggle_play()
             self.assertIsInstance(self.frame._player, BassPlayer)
             self.assertTrue(self.frame._playing)
